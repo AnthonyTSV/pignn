@@ -17,6 +17,7 @@ test_rectangular/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
+.vscode/
 *.py[codz]
 *$py.class
 
