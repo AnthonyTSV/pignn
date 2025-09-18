@@ -62,7 +62,7 @@ class PIMGN(nn.Module):
             # IMPORTANT: No LayerNorm for final decoder to allow proper temperature scaling
             self.decoder = build_mlp(hidden_size, hidden_size, output_size, lay_norm=False)
         else:
-            # CNN decoder for temporal bundling (legacy)
+            # CNN decoder for temporal bundling
             self.decoder = nn.Sequential(
                 nn.Conv1d(hidden_size, hidden_size, kernel_size=1),
                 nn.ReLU(),

@@ -167,7 +167,7 @@ def main():
     parser.add_argument('--num_layers', type=int, default=12, help='Number of message passing layers')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=500, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size (problems per batch)')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu/auto)')

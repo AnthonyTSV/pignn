@@ -409,7 +409,7 @@ class PIGNNTrainer:
         
         if apply_ic_loss:
             # Use very strong IC weight for first step to ensure proper initialization
-            ic_weight = 1000.0 * self.config.lambda_ic  # Make IC loss dominant
+            ic_weight = self.config.lambda_ic  # Make IC loss dominant
             total_loss += ic_weight * losses['ic']
             
         # Debug: Print loss components occasionally
