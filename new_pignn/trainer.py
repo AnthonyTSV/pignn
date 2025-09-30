@@ -15,7 +15,7 @@ import random
 from abc import ABC, abstractmethod
 
 from graph_creator import GraphCreator
-from pignn import PossionNet
+from pignn import PIGNN
 from fem import FEMSolver
 from mesh_utils import build_graph_from_mesh, create_free_node_subgraph
 from containers import MeshProblem, TrainingConfig
@@ -50,17 +50,15 @@ class PIGNNTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Initialize model with strict BC enforcement
-        self.model = PossionNet(
-            nci=2,  # input channels
-            nco=1,  # output channels
-            kk=10   # Chebyshev polynomial order
+        self.model = PIGNN(
+            node_input_size=6,
+            edge_input_size=4,
+            global_input_size=2,
+            hidden_features=128,
+            message_passing_steps=12,
+            time_window=1,
+            device=self.device,
         ).to(self.device)
-
-        # Store free node mappings for each problem
-        self._free_node_mappings: Dict[int, Dict] = {}
-
-        # Initialize optimizer
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3, weight_decay=0)
 
         # Store free node mappings for each problem
         self._free_node_mappings: Dict[int, Dict] = {}
@@ -294,7 +292,7 @@ class PIGNNTrainer:
                 rollout = self.rollout(self.validation_problems[0], T_start=self.validation_problems[0].initial_condition)  # Test rollout on first validation problem
                 time_steps = self.config.time_config.time_steps_export
                 rollout = np.array(rollout)
-                self._fem_solvers[0].export_to_vtk(rollout, rollout, time_steps, f"checkpoints/rollout_epoch_{epoch}.vtk")
+                self._fem_solvers[0].export_to_vtk(rollout, rollout, time_steps,f"checkpoints/rollout_epoch_{epoch}.vtk")
             # TODO: Add early stopping based on validation loss
 
         print("Multi-mesh training completed!")

@@ -98,7 +98,7 @@ class PIGNN(nn.Module):
         self.device = torch.device(device)
         
         # Input embedding MLP - combines all input features
-        total_input_size = node_input_size + 2 + global_input_size + self.time_window  # node + pos + global
+        total_input_size = node_input_size + 2 + global_input_size  # node + pos + global
         self.embedding_mlp = nn.Sequential(
             nn.Linear(total_input_size, hidden_features),
             nn.ReLU(),
