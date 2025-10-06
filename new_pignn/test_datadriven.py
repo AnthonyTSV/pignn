@@ -1,0 +1,701 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from pathlib import Path
+import time
+from argparse import Namespace
+from typing import List
+
+# Import our modules
+from meshgraphnet import MeshGraphNet
+from fem import FEMSolver
+from mesh_utils import (
+    create_rectangular_mesh,
+    build_graph_from_mesh,
+    create_free_node_subgraph,
+    create_gaussian_initial_condition,
+)
+from graph_creator import GraphCreator
+from containers import TimeConfig, MeshConfig, MeshProblem
+from torch_geometric.data import Data
+
+
+class DataDrivenMGNTrainer:
+    """Trainer for data-driven MeshGraphNet baseline."""
+
+    def __init__(self, problems: List[MeshProblem], config: dict):
+        self.problems = problems
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.time_window = config.get("time_window", 5)
+
+        # Generate ground truth data using FEM for all problems
+        self.all_ground_truth = []
+        self.all_fem_solvers: List[FEMSolver] = []
+        
+        print(f"Generating ground truth data for {len(problems)} problems...")
+        for i, problem in enumerate(problems):
+            print(f"Solving problem {i+1}/{len(problems)}...")
+            fem_solver = FEMSolver(problem.mesh, problem=problem)
+            ground_truth = fem_solver.solve_transient_problem(problem)
+            self.all_ground_truth.append(ground_truth)
+            self.all_fem_solvers.append(fem_solver)
+            print(f"Problem {i+1}: Generated {len(ground_truth)} time steps")
+
+        # Prepare training data from all problems
+        self.training_data = self.prepare_training_data_all_problems()
+        print(f"Total training data: {len(self.training_data)} time step pairs")
+
+        if len(self.training_data) == 0:
+            raise ValueError("No training data generated! Check time steps.")
+
+        # Get dimensions from the first training sample
+        sample_data = self.training_data[0]["graph_data"]
+        input_dim_node = sample_data.x.shape[1]
+        input_dim_edge = sample_data.edge_attr.shape[1]
+        output_dim = self.time_window  # Predict multiple time steps
+
+        print(
+            f"Input dimensions - Node: {input_dim_node}, Edge: {input_dim_edge}, Output: {output_dim}"
+        )
+
+        # Create MeshGraphNet model
+        args = Namespace(num_layers=12, time_window=self.time_window)  # 12 message passing layers like PIGNN
+        self.model = MeshGraphNet(
+            input_dim_node=input_dim_node,
+            input_dim_edge=input_dim_edge,
+            hidden_dim=128,
+            output_dim=output_dim,
+            args=args,
+        ).to(self.device)
+
+        self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
+        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.995)
+
+        # Training history
+        self.losses = []
+        self.val_losses = []
+
+    def prepare_training_data_all_problems(self):
+        """Prepare training data for temporal bundling prediction from all problems."""
+        all_training_data = []
+        
+        for prob_idx, (problem, ground_truth) in enumerate(zip(self.problems, self.all_ground_truth)):
+            time_steps = self.config["time_config"].time_steps
+
+            graph_creator = GraphCreator(
+                mesh=problem.mesh,
+                n_neighbors=2,
+                dirichlet_names=problem.mesh_config.dirichlet_boundaries,
+                neumann_names=[],
+                connectivity_method="fem",
+            )
+
+            # Create training pairs for temporal bundling for this problem
+            for idx in range(len(time_steps) - self.time_window):  # Need n future steps
+                current_time = time_steps[idx]
+                input_state = ground_truth[idx]
+
+                # Collect next n time steps as targets
+                future_states = []
+                for future_idx in range(1, self.time_window + 1):
+                    if idx + future_idx < len(ground_truth):
+                        future_states.append(ground_truth[idx + future_idx])
+                    else:
+                        # Pad with last available state if needed
+                        future_states.append(ground_truth[-1])
+
+                # Stack future states: shape (n_nodes, time_window)
+                bundled_target = np.stack(future_states, axis=1)
+
+                # Build graph from current state
+                data, aux = graph_creator.create_graph(
+                    T_current=input_state, t_scalar=current_time
+                )
+
+                free_graph, node_mapping, free_aux = (
+                    graph_creator.create_free_node_subgraph(data, aux)
+                )
+                free_idx = node_mapping["free_to_original"]
+
+                # Extract free node targets: shape (n_free_nodes, time_window)
+                free_target = bundled_target[free_idx.cpu().numpy()]
+
+                all_training_data.append(
+                    {
+                        "graph_data": free_graph,
+                        "target": free_target,  # Now shape (n_free_nodes, time_window)
+                        "time": current_time,
+                        "aux_full": aux,
+                        "node_mapping": node_mapping,
+                        "problem_id": prob_idx,
+                    }
+                )
+
+        return all_training_data
+
+    def prepare_training_data(self):
+        """Prepare training data for temporal bundling prediction."""
+        training_data = []
+        time_steps = self.config["time_config"].time_steps
+
+        graph_creator = GraphCreator(
+            mesh=self.problem.mesh,
+            n_neighbors=2,
+            dirichlet_names=self.problem.mesh_config.dirichlet_boundaries,
+            neumann_names=[],
+            connectivity_method="fem",
+        )
+
+        # Create training pairs for temporal bundling
+        for idx in range(len(time_steps) - self.time_window):  # Need n future steps
+            current_time = time_steps[idx]
+            input_state = self.ground_truth[idx]
+
+            # Collect next n time steps as targets
+            future_states = []
+            for future_idx in range(1, self.time_window + 1):
+                if idx + future_idx < len(self.ground_truth):
+                    future_states.append(self.ground_truth[idx + future_idx])
+                else:
+                    # Pad with last available state if needed
+                    future_states.append(self.ground_truth[-1])
+
+            # Stack future states: shape (n_nodes, time_window)
+            bundled_target = np.stack(future_states, axis=1)
+
+            # Build graph from current state
+            data, aux = graph_creator.create_graph(
+                T_current=input_state, t_scalar=current_time
+            )
+
+            free_graph, node_mapping, free_aux = (
+                graph_creator.create_free_node_subgraph(data, aux)
+            )
+            free_idx = node_mapping["free_to_original"]
+
+            # Extract free node targets: shape (n_free_nodes, time_window)
+            free_target = bundled_target[free_idx.cpu().numpy()]
+
+            training_data.append(
+                {
+                    "graph_data": free_graph,
+                    "target": free_target,  # Now shape (n_free_nodes, time_window)
+                    "time": current_time,
+                    "aux_full": aux,
+                    "node_mapping": node_mapping,
+                }
+            )
+
+        return training_data
+
+    def split_train_validation(self, train_problems_indices, val_problems_indices):
+        """Split training data into train and validation sets based on problem indices."""
+        train_data = []
+        val_data = []
+        
+        for data_point in self.training_data:
+            problem_id = data_point["problem_id"]
+            if problem_id in train_problems_indices:
+                train_data.append(data_point)
+            elif problem_id in val_problems_indices:
+                val_data.append(data_point)
+        
+        return train_data, val_data
+
+    def validate(self, val_data):
+        """Evaluate model on validation data."""
+        self.model.eval()
+        total_loss = 0.0
+        
+        with torch.no_grad():
+            for data_point in val_data:
+                graph_data = data_point["graph_data"].to(self.device)
+                target_tensor = torch.tensor(data_point["target"], dtype=torch.float32, device=self.device)
+                
+                predictions = self.model.forward(graph_data)
+                loss = nn.MSELoss()(predictions, target_tensor)
+                total_loss += loss.item()
+        
+        return total_loss / len(val_data)
+
+    def train_step(self, graph_data, target):
+        """Single training step with temporal bundling."""
+        self.optimizer.zero_grad()
+
+        # Move data to device
+        graph_data = graph_data.to(self.device)
+        # target shape: (n_free_nodes, time_window)
+        target_tensor = torch.tensor(target, dtype=torch.float32, device=self.device)
+
+        # predictions shape: (n_free_nodes, time_window)
+        predictions = self.model.forward(graph_data)
+
+        # Compute MSE loss across all time steps
+        loss = nn.MSELoss()(predictions, target_tensor)
+
+        # Backward pass
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
+        return loss.item()
+
+    def train(self, train_problems_indices, val_problems_indices):
+        """Main training loop with validation."""
+        print(f"Starting data-driven MeshGraphNet training on {self.device}")
+        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters())}")
+
+        # Split data
+        train_data, val_data = self.split_train_validation(train_problems_indices, val_problems_indices)
+        print(f"Training samples: {len(train_data)}, Validation samples: {len(val_data)}")
+
+        self.model.train()
+
+        for epoch in range(self.config["epochs"]):
+            epoch_loss = 0.0
+            epoch_start = time.time()
+
+            # Shuffle training data
+            np.random.shuffle(train_data)
+
+            # Training
+            self.model.train()
+            for data_point in train_data:
+                loss = self.train_step(
+                    graph_data=data_point["graph_data"], target=data_point["target"]
+                )
+                epoch_loss += loss
+
+            # Average loss over all training steps
+            epoch_loss /= len(train_data)
+            self.losses.append(epoch_loss)
+
+            # Validation
+            val_loss = self.validate(val_data)
+            self.val_losses.append(val_loss)
+
+            # Update learning rate
+            self.scheduler.step()
+
+            # Log progress
+            if epoch % 10 == 0:
+                elapsed = time.time() - epoch_start
+                print(
+                    f"Epoch {epoch:4d} | Train Loss: {epoch_loss:.3e} | Val Loss: {val_loss:.3e} | Time: {elapsed:.2f}s | LR: {self.scheduler.get_last_lr()[0]:.3e}"
+                )
+
+        print("Data-driven MeshGraphNet training completed!")
+
+    def rollout(self, problem_idx=0, n_steps=None):
+        """Perform rollout prediction with temporal bundling for a specific problem."""
+        self.model.eval()
+        
+        problem = self.problems[problem_idx]
+        ground_truth = self.all_ground_truth[problem_idx]
+
+        if n_steps is None:
+            n_steps = len(ground_truth)
+
+        time_steps = self.config["time_config"].time_steps[:n_steps]
+
+        # Start with initial condition
+        T_current = problem.initial_condition.copy()
+        predictions = [T_current]
+
+        graph_creator = GraphCreator(
+            mesh=problem.mesh,
+            n_neighbors=2,
+            dirichlet_names=problem.mesh_config.dirichlet_boundaries,
+            neumann_names=[],
+            connectivity_method="fem",
+        )
+
+        with torch.no_grad():
+            step_idx = 0
+            while step_idx < len(time_steps) - 1:
+                current_time = time_steps[step_idx]
+
+                # Build graph
+                data, aux = graph_creator.create_graph(
+                    T_current=T_current, t_scalar=current_time
+                )
+                free_graph, node_mapping, free_aux = (
+                    graph_creator.create_free_node_subgraph(data, aux)
+                )
+                free_data = free_graph.to(self.device)
+
+                # Predict next 5 time steps
+                predictions_bundled = self.model.forward(free_data)
+                # Shape: (n_free_nodes, time_window)
+
+                # Extract predictions for each time step
+                free_idx = node_mapping["free_to_original"].detach().cpu().numpy()
+
+                # Add each predicted time step
+                for t_idx in range(self.time_window):
+                    if step_idx + 1 + t_idx >= n_steps:
+                        break
+
+                    next_full = np.zeros(problem.n_nodes, dtype=np.float32)
+                    pred_t = (
+                        predictions_bundled[:, t_idx].squeeze().detach().cpu().numpy()
+                    )
+                    next_full[free_idx] = pred_t
+                    next_full[aux["dirichlet_mask"].cpu().numpy()] = 0.0
+
+                    predictions.append(next_full)
+
+                # For next iteration, use the last predicted state
+                # Or use the first predicted state for overlapping windows
+                if len(predictions) > 1:
+                    T_current = predictions[-1]  # Use last prediction
+
+                # Move forward by time_window steps (non-overlapping)
+                # Or by 1 step for overlapping windows
+                step_idx += self.time_window  # Non-overlapping bundling
+                # step_idx += 1  # Uncomment for overlapping bundling
+
+        return predictions[:n_steps]
+
+    def evaluate(self, problem_indices=None):
+        """Evaluate the trained model on specified problems."""
+        print("Evaluating model...")
+        
+        if problem_indices is None:
+            problem_indices = range(len(self.problems))
+
+        all_errors = []
+        for prob_idx in problem_indices:
+            print(f"Evaluating problem {prob_idx + 1}...")
+            
+            # Get predictions for this problem
+            predictions = self.rollout(problem_idx=prob_idx)
+            ground_truth = self.all_ground_truth[prob_idx]
+
+            # Compute errors
+            errors = []
+            for i, (pred, true) in enumerate(zip(predictions, ground_truth)):
+                l2_error = np.linalg.norm(pred - true) / np.linalg.norm(true)
+                errors.append(l2_error)
+            
+            all_errors.append(errors)
+            print(f"Problem {prob_idx + 1} - Average L2 error: {np.mean(errors):.6f}, Final L2 error: {errors[-1]:.6f}")
+
+        # Overall statistics
+        avg_errors = np.mean([np.mean(errors) for errors in all_errors])
+        final_errors = np.mean([errors[-1] for errors in all_errors])
+        print(f"\nOverall - Average L2 error: {avg_errors:.6f}, Final L2 error: {final_errors:.6f}")
+
+        return all_errors
+
+
+def create_test_problem():
+    """Create a simple test problem."""
+    print("Creating test problem...")
+
+    # Time configuration
+    time_config = TimeConfig(dt=0.01, t_final=1.0)
+    maxh = 0.1  # Mesh element size
+    # Create rectangular mesh
+    mesh = create_rectangular_mesh(width=1.0, height=1.0, maxh=maxh)
+
+    # Mesh configuration
+    mesh_config = MeshConfig(
+        maxh=maxh,
+        order=1,
+        dim=2,
+        dirichlet_boundaries=["left", "right", "top", "bottom"],
+        mesh_type="rectangle",
+    )
+
+    # Create graph to get node positions
+    graph_creator = GraphCreator(
+        mesh=mesh,
+        n_neighbors=2,
+        dirichlet_names=["left", "right", "top", "bottom"],
+        neumann_names=[],
+        connectivity_method="fem",
+    )
+    temp_data, _ = graph_creator.create_graph()
+
+    # Create Gaussian initial condition
+    initial_condition = create_gaussian_initial_condition(
+        pos=temp_data.pos,
+        num_gaussians=1,
+        amplitude_range=(1.0, 1.0),
+        sigma_fraction_range=(0.2, 0.2),
+        seed=42,
+        centered=True,
+        enforce_boundary_conditions=True,
+    )
+
+    # Create problem
+    problem = MeshProblem(
+        mesh=mesh,
+        graph_data=temp_data,
+        initial_condition=initial_condition,
+        alpha=1.0,  # Thermal diffusivity
+        time_config=time_config,
+        mesh_config=mesh_config,
+        problem_id=0,
+    )
+
+    # Set boundary conditions (homogeneous Dirichlet)
+    problem.boundary_values = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
+
+    problem.source_function = None
+
+    print(f"Problem created with {problem.n_nodes} nodes and {problem.n_edges} edges")
+
+    return problem, time_config
+
+
+def generate_multiple_problems(n_problems=20, seed=42):
+    """Generate multiple problems with varying mesh sizes and Gaussian initial conditions."""
+    print(f"Generating {n_problems} problems with varying parameters...")
+    
+    np.random.seed(seed)
+    problems = []
+    
+    # Define parameter ranges
+    mesh_sizes = np.linspace(0.05, 0.15, 5)  # 5 different mesh sizes
+    num_gaussians_options = [1, 2, 3]  # 1-3 Gaussians
+    amplitude_ranges = [(0.5, 1.5), (1.0, 2.0), (0.8, 1.2)]  # Different amplitude ranges
+    sigma_fractions = [(0.1, 0.3), (0.15, 0.25), (0.2, 0.4)]  # Different width ranges
+    
+    # Time configuration (same for all problems)
+    time_config = TimeConfig(dt=0.01, t_final=1.0)
+    
+    for i in range(n_problems):
+        # Vary mesh size
+        maxh = np.random.choice(mesh_sizes)
+        
+        # Create rectangular mesh
+        mesh = create_rectangular_mesh(width=1.0, height=1.0, maxh=maxh)
+        
+        # Mesh configuration
+        mesh_config = MeshConfig(
+            maxh=maxh,
+            order=1,
+            dim=2,
+            dirichlet_boundaries=["left", "right", "top", "bottom"],
+            mesh_type="rectangle",
+        )
+        
+        # Create graph to get node positions
+        graph_creator = GraphCreator(
+            mesh=mesh,
+            n_neighbors=2,
+            dirichlet_names=["left", "right", "top", "bottom"],
+            neumann_names=[],
+            connectivity_method="fem",
+        )
+        temp_data, _ = graph_creator.create_graph()
+        
+        # Vary Gaussian initial condition parameters
+        num_gaussians = np.random.choice(num_gaussians_options)
+        amplitude_range = amplitude_ranges[i % len(amplitude_ranges)]
+        sigma_fraction_range = sigma_fractions[i % len(sigma_fractions)]
+        
+        # Create varied Gaussian initial condition
+        initial_condition = create_gaussian_initial_condition(
+            pos=temp_data.pos,
+            num_gaussians=num_gaussians,
+            amplitude_range=amplitude_range,
+            sigma_fraction_range=sigma_fraction_range,
+            seed=seed + i,  # Different seed for each problem
+            centered=np.random.choice([True, False]),  # Sometimes centered, sometimes not
+            enforce_boundary_conditions=True,
+        )
+        
+        # Create problem
+        problem = MeshProblem(
+            mesh=mesh,
+            graph_data=temp_data,
+            initial_condition=initial_condition,
+            alpha=1.0,  # Thermal diffusivity
+            time_config=time_config,
+            mesh_config=mesh_config,
+            problem_id=i,
+        )
+        
+        # Set boundary conditions (homogeneous Dirichlet)
+        problem.boundary_values = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
+        problem.source_function = None
+        
+        problems.append(problem)
+        
+        print(f"Problem {i+1}: {problem.n_nodes} nodes, {problem.n_edges} edges, "
+              f"mesh_size={maxh:.3f}, num_gaussians={num_gaussians}")
+    
+    print(f"Generated {len(problems)} problems successfully!")
+    return problems, time_config
+
+
+def plot_results(predictions, ground_truth, errors, losses, val_losses, save_path="results"):
+    """Plot training results."""
+    Path(save_path).mkdir(exist_ok=True)
+
+    # Plot results
+    plt.figure(figsize=(20, 4))
+
+    # Training and validation loss
+    plt.subplot(1, 4, 1)
+    plt.plot(losses, label='Training')
+    plt.plot(val_losses, label='Validation')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("MeshGraphNet Training/Validation Loss")
+    plt.yscale("log")
+    plt.legend()
+    plt.grid(True)
+
+    # L2 error over time for first problem
+    plt.subplot(1, 4, 2)
+    plt.plot(errors[0])
+    plt.xlabel("Time Step")
+    plt.ylabel("L2 Error")
+    plt.title("L2 Error over Time (Problem 1)")
+    plt.yscale("log")
+    plt.grid(True)
+
+    # Average L2 error across all test problems
+    plt.subplot(1, 4, 3)
+    avg_errors = [np.mean(error_list) for error_list in errors]
+    plt.bar(range(1, len(avg_errors) + 1), avg_errors)
+    plt.xlabel("Problem Index")
+    plt.ylabel("Average L2 Error")
+    plt.title("Average L2 Error per Problem")
+    plt.yscale("log")
+    plt.grid(True)
+
+    # Predictions vs ground truth for first problem, first few time steps
+    plt.subplot(1, 4, 4)
+    num_plots = min(4, len(predictions))
+    for i in range(1, num_plots):
+        plt.scatter(ground_truth[i], predictions[i], alpha=0.5, label=f"Time Step {i}")
+    max_overall = max(np.max(ground_truth[num_plots-1]), np.max(predictions[num_plots-1]))
+    plt.plot([0, max_overall], [0, max_overall], "k--", label="Ideal")
+    plt.title("Predictions vs Ground Truth (Problem 1)")
+    plt.xlabel("Ground Truth Temperature")
+    plt.ylabel("Predicted Temperature")
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(f"{save_path}/meshgraphnet_multiproblem_results.png", dpi=150)
+    plt.show()
+
+
+def main():
+    """Main function to run data-driven MeshGraphNet test with multiple problems."""
+    print("=" * 60)
+    print("DATA-DRIVEN MESHGRAPHNET MULTI-PROBLEM TEST")
+    print("=" * 60)
+
+    # Create results directory
+    Path("results").mkdir(exist_ok=True)
+    Path("results/data_driven").mkdir(exist_ok=True)
+
+    # Generate multiple problems (15 training + 5 validation)
+    all_problems, time_config = generate_multiple_problems(n_problems=3, seed=42)
+    
+    # Split problems into train and validation
+    train_indices = list(range(2))  # First 2 problems for training
+    val_indices = list(range(2, 3))  # Last 1 problem for validation
+
+    print(f"Training problems: {train_indices}")
+    print(f"Validation problems: {val_indices}")
+
+    # Training configuration
+    config = {
+        "epochs": 10,  # Reduced for testing
+        "lr": 1e-3,
+        "time_config": time_config,
+        "time_window": 20,
+    }
+
+    print(f"Training configuration:")
+    print(f"  Epochs: {config['epochs']}")
+    print(f"  Learning rate: {config['lr']}")
+    print(f"  Time steps: {time_config.num_steps}")
+    print(f"  Time window: {config['time_window']}")
+    print(f"  dt: {time_config.dt}")
+
+    # Create trainer with all problems
+    trainer = DataDrivenMGNTrainer(all_problems, config)
+
+    # Train model
+    trainer.train(train_indices, val_indices)
+
+    # Evaluate model on validation problems
+    print("\nEvaluating on validation problems:")
+    val_errors = trainer.evaluate(problem_indices=val_indices)
+
+    # Evaluate model on training problems (to check for overfitting)
+    print("\nEvaluating on training problems:")
+    train_errors = trainer.evaluate(problem_indices=train_indices[:3])  # Just first 3 for efficiency
+
+    # Get predictions for first validation problem for visualization
+    predictions_val = trainer.rollout(problem_idx=val_indices[0])
+    ground_truth_val = trainer.all_ground_truth[val_indices[0]]
+
+    # Plot results
+    plot_results(
+        predictions_val, 
+        ground_truth_val, 
+        val_errors, 
+        trainer.losses, 
+        trainer.val_losses
+    )
+
+    # Export results for first validation problem
+    print("Exporting results for first validation problem...")
+    fem_solver = trainer.all_fem_solvers[val_indices[0]]
+    
+    # Ensure all arrays have the same length for export
+    min_length = min(
+        len(ground_truth_val), 
+        len(predictions_val), 
+        len(time_config.time_steps_export)
+    )
+    
+    fem_solver.export_to_vtk(
+        ground_truth_val[:min_length],
+        predictions_val[:min_length],
+        time_config.time_steps_export[:min_length],
+        filename="results/data_driven/meshgraphnet_multiproblem_comparison.vtk",
+    )
+
+    # Save training summary
+    summary = {
+        "total_problems": len(all_problems),
+        "train_problems": len(train_indices),
+        "val_problems": len(val_indices),
+        "final_train_loss": trainer.losses[-1],
+        "final_val_loss": trainer.val_losses[-1],
+        "val_avg_errors": [np.mean(errors) for errors in val_errors],
+        "train_avg_errors": [np.mean(errors) for errors in train_errors],
+    }
+    
+    print("\n" + "="*60)
+    print("TRAINING SUMMARY")
+    print("="*60)
+    print(f"Total problems: {summary['total_problems']}")
+    print(f"Training problems: {summary['train_problems']}")
+    print(f"Validation problems: {summary['val_problems']}")
+    print(f"Final training loss: {summary['final_train_loss']:.6f}")
+    print(f"Final validation loss: {summary['final_val_loss']:.6f}")
+    print(f"Validation average L2 errors: {summary['val_avg_errors']}")
+    print(f"Training average L2 errors (sample): {summary['train_avg_errors']}")
+
+    print("Data-driven MeshGraphNet multi-problem test completed!")
+    print(f"Results saved to: results/data_driven/")
+
+
+if __name__ == "__main__":
+    main()

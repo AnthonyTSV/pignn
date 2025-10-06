@@ -86,15 +86,15 @@ def main():
     full_graph, aux = creator.create_graph(T_current=T_initial, t_scalar=0.0)
 
     # Create subgraph with only free (non-Dirichlet) nodes
-    free_graph, node_mapping = create_free_node_subgraph(full_graph, aux)
+    free_graph, node_mapping, new_aux = create_free_node_subgraph(full_graph, aux)
     # Visualize free node subgraph
     creator.visualize_graph(
         free_graph,
-        aux,
+        new_aux,
         figsize=(14, 6),
         node_size=30,
         save_path="graph_visualization_free_nodes.png",
-        only_free_nodes=True,
+        # only_free_nodes=True,
     )
 
     print("Demo completed! Check the generated visualization files:")

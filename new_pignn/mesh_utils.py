@@ -335,7 +335,7 @@ def build_graph_from_mesh(
     return data, aux
 
 
-def create_free_node_subgraph(data: Data, aux: Dict) -> Tuple[Data, Dict]:
+def create_free_node_subgraph(data: Data, aux: Dict) -> Tuple[Data, Dict, Dict]:
     """
     Create subgraph containing only free (non-Dirichlet) nodes for strict BC enforcement.
     
@@ -346,12 +346,19 @@ def create_free_node_subgraph(data: Data, aux: Dict) -> Tuple[Data, Dict]:
     Returns:
         free_data: Subgraph with only free nodes
         node_mapping: Mapping from subgraph node indices to original node indices
+        free_aux: Auxiliary data for the free node subgraph
     """
     free_mask = aux['free_mask']
     
     # Ensure all tensors are on the same device as the data
-    device = data.x.device if hasattr(data.x, 'device') else torch.device('cpu')
+    device = data.x.device if hasattr(data.x, 'device') else torch.device('gpu' if torch.cuda.is_available() else 'cpu')
     free_mask = free_mask.to(device)
+    
+    # Move all aux tensors to the same device
+    aux_tensors_to_move = ['node_types', 'dirichlet_mask', 'neumann_mask', 'interior_mask']
+    for key in aux_tensors_to_move:
+        if key in aux and hasattr(aux[key], 'to'):
+            aux[key] = aux[key].to(device)
     
     free_indices = torch.where(free_mask)[0]
     n_free = len(free_indices)
@@ -387,6 +394,17 @@ def create_free_node_subgraph(data: Data, aux: Dict) -> Tuple[Data, Dict]:
         global_attr=data.global_attr,
         num_nodes=n_free
     )
+
+    free_aux = {
+        'pnum_to_idx': {k: v for k, v in aux['pnum_to_idx'].items() if v in free_indices.tolist()},
+        'node_types': aux['node_types'][free_indices],
+        'dirichlet_mask': aux['dirichlet_mask'][free_indices],
+        'neumann_mask': aux['neumann_mask'][free_indices],
+        'interior_mask': aux['interior_mask'][free_indices],
+        'free_mask': torch.ones(n_free, dtype=torch.bool, device=device),  # All nodes in subgraph are free
+        'mesh': aux['mesh'],
+        'connectivity_method': aux['connectivity_method']
+    }
     
     # Node mapping for reconstruction
     node_mapping = {
@@ -396,7 +414,7 @@ def create_free_node_subgraph(data: Data, aux: Dict) -> Tuple[Data, Dict]:
         'n_free': n_free
     }
     
-    return free_data, node_mapping
+    return free_data, node_mapping, free_aux
 
 
 def _classify_node_types(

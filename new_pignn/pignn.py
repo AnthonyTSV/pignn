@@ -7,7 +7,7 @@ Uses message passing with temporal bundling for efficient time series prediction
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
-from torch_geometric.nn import MessagePassing, global_mean_pool
+from torch_geometric.nn import MessagePassing, global_mean_pool, InstanceNorm
 from torch_scatter import scatter
 
 
@@ -52,9 +52,13 @@ class PIGNN_Layer(MessagePassing):
             nn.ReLU()
         )
 
+        self.norm = InstanceNorm(in_features)
+
     def forward(self, x, edge_index, edge_attr):
         """Propagate messages along edges"""
-        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
+        out = self.propagate(edge_index, x=x, edge_attr=edge_attr)
+        out = self.norm(out)
+        return out
 
     def message(self, x_i, x_j, edge_attr):
         """Message update"""

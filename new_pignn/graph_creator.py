@@ -58,6 +58,21 @@ class GraphCreator:
             device=device
         )
     
+    def create_free_node_subgraph(self, full_graph: Data, aux: Dict) -> Tuple[Data, torch.Tensor, Dict]:
+        """
+        Create a subgraph containing only free (non-Dirichlet) nodes.
+        
+        Args:
+            full_graph: Full PyTorch Geometric Data object
+            aux: Auxiliary data dictionary from create_graph
+            
+        Returns:
+            free_graph: Subgraph with only free nodes
+            node_mapping: Tensor mapping free node indices to original graph indices
+            new_aux: Updated auxiliary data for the subgraph
+        """
+        return create_free_node_subgraph(full_graph, aux)
+
     def visualize_graph(self, data: Data, aux: Dict, figsize: Tuple[int, int] = (12, 5),
                        node_size: int = 50, edge_alpha: float = 0.6, save_path: Optional[str] = None, only_free_nodes: bool = False):
         """
