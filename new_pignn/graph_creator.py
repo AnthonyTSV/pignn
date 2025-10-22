@@ -7,7 +7,10 @@ import matplotlib.patches as mpatches
 from typing import Optional, List, Dict, Tuple
 from torch_geometric.data import Data
 
-from mesh_utils import build_graph_from_mesh, create_free_node_subgraph
+try:
+    from mesh_utils import build_graph_from_mesh, create_free_node_subgraph, create_neumann_values, create_dirichlet_values
+except ModuleNotFoundError:
+    from .mesh_utils import build_graph_from_mesh, create_free_node_subgraph, create_neumann_values, create_dirichlet_values
 
 class GraphCreator:
     def __init__(self, mesh: ng.Mesh, n_neighbors: int = 8, dirichlet_names: List[str] = None, 
@@ -29,8 +32,9 @@ class GraphCreator:
         self.connectivity_method = connectivity_method
 
     def create_graph(self, T_current: Optional[np.ndarray] = None, t_scalar: float = 0.0,
-                   material_node_field: Optional[np.ndarray] = None, add_self_loops: bool = True,
-                   device: Optional[torch.device] = None) -> Tuple[Data, Dict]:
+                   material_node_field: Optional[np.ndarray] = None, neumann_values: Optional[np.ndarray] = None,
+                   dirichlet_values: Optional[np.ndarray] = None,
+                   add_self_loops: bool = True, device: Optional[torch.device] = None) -> Tuple[Data, Dict]:
         """
         Create PI-MGN graph from mesh according to the paper's methodology.
         
@@ -38,6 +42,8 @@ class GraphCreator:
             T_current: Current temperature field (N,) - optional
             t_scalar: Current time scalar
             material_node_field: Per-node material properties (N,) - optional  
+            neumann_values: Per-node Neumann boundary values (N,) - optional, h_N values for flux BC
+            dirichlet_values: Per-node Dirichlet boundary values (N,) - optional, prescribed values for Dirichlet BC
             add_self_loops: Whether to add self-loops to all nodes
             device: Target device for tensors (CPU if None)
             
@@ -52,6 +58,8 @@ class GraphCreator:
             T_current=T_current,
             t_scalar=t_scalar,
             material_node_field=material_node_field,
+            neumann_values=neumann_values,
+            dirichlet_values=dirichlet_values,
             connectivity_method=self.connectivity_method,
             n_neighbors=self.n_neighbors,
             add_self_loops=add_self_loops,
@@ -73,7 +81,36 @@ class GraphCreator:
         """
         return create_free_node_subgraph(full_graph, aux)
 
-    def visualize_graph(self, data: Data, aux: Dict, figsize: Tuple[int, int] = (12, 5),
+    def create_neumann_values(self, pos, aux_data, neumann_names, flux_values=None, flux_magnitude=1.0, seed=None):
+        return create_neumann_values(pos, aux_data, neumann_names, flux_values, flux_magnitude, seed)
+
+    def create_dirichlet_values(self, pos, aux_data, dirichlet_names, boundary_values=None,
+                               temperature_function=None, homogeneous_value=0.0, 
+                               inhomogeneous_type="constant", seed=None):
+        """
+        Create Dirichlet boundary values according to PI-MGN methodology.
+        
+        For nodes that belong to multiple Dirichlet boundaries, higher values take priority
+        over lower values. This ensures consistent boundary condition enforcement when
+        boundaries intersect at corners or edges.
+        
+        Args:
+            pos: Node positions (N, 2) - can be torch tensor or numpy array
+            aux_data: Auxiliary data containing node type information
+            dirichlet_names: List of Dirichlet boundary names or single boundary name
+            boundary_values: Dict mapping boundary names to constant values, or single value for all boundaries
+            temperature_function: Custom function f(x, y) -> temperature (optional)
+            homogeneous_value: Default value if boundary_values not provided (backward compatibility)
+            inhomogeneous_type: Type of BC - "constant" (use boundary_values), or legacy types
+            seed: Random seed for reproducible values
+            
+        Returns:
+            dirichlet_values: Per-node Dirichlet boundary values (N,) with higher values prioritized at corner nodes
+        """
+        return create_dirichlet_values(pos, aux_data, dirichlet_names, boundary_values,
+                                     temperature_function, homogeneous_value, inhomogeneous_type, seed)
+
+    def visualize_graph(self, data: Data, aux: Dict, figsize: Tuple[int, int] = (24, 6),
                        node_size: int = 50, edge_alpha: float = 0.6, save_path: Optional[str] = None, only_free_nodes: bool = False):
         """
         Visualize the graph using NetworkX and matplotlib.
@@ -90,8 +127,8 @@ class GraphCreator:
         # Convert to NetworkX graph
         G = self._pyg_to_networkx(data)
         
-        # Create figure with subplots
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+        # Create figure with subplots - add fourth subplot for Dirichlet values
+        fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=figsize)
         
         # Get positions from data
         pos_dict = {i: data.pos[i].numpy() for i in range(data.num_nodes)}
@@ -161,6 +198,76 @@ class GraphCreator:
         ax2.set_aspect('equal')
         ax2.axis('off')
         
+        # Plot 3: Neumann values visualization (if available)
+        if data.x.shape[1] > 6:  # Has Neumann data (7th feature)
+            neumann_values = data.x[:, 6].numpy()  # Neumann values are 7th feature (index 6)
+            neumann_mask = aux['neumann_mask']
+            
+            # Only show non-zero Neumann values or Neumann boundary nodes
+            if neumann_mask.any() or (neumann_values != 0).any():
+                # Create scatter plot colored by Neumann values
+                scatter = ax3.scatter(data.pos[:, 0].numpy(), data.pos[:, 1].numpy(), 
+                                    c=neumann_values, cmap='viridis', s=node_size, alpha=0.8)
+                
+                # Add colorbar
+                cbar = plt.colorbar(scatter, ax=ax3)
+                cbar.set_label('Neumann Values, ($h_N$)')
+                
+                # Highlight Neumann boundary nodes with red circles
+                if neumann_mask.any():
+                    neumann_indices = torch.where(neumann_mask)[0]
+                    neumann_pos = data.pos[neumann_indices].numpy()
+                    ax3.scatter(neumann_pos[:, 0], neumann_pos[:, 1], 
+                               s=node_size*2, facecolors='none', edgecolors='red', linewidth=2)
+                
+                ax3.set_title(f'Neumann Values\\nRange: [{neumann_values.min():.3f}, {neumann_values.max():.3f}]')
+            else:
+                ax3.text(0.5, 0.5, 'No Neumann values\\navailable', 
+                        ha='center', va='center', transform=ax3.transAxes, fontsize=12)
+                ax3.set_title('Neumann Values (N/A)')
+        else:
+            ax3.text(0.5, 0.5, 'No Neumann data\\navailable', 
+                    ha='center', va='center', transform=ax3.transAxes, fontsize=12)
+            ax3.set_title('Neumann Values (N/A)')
+        
+        ax3.set_aspect('equal')
+        ax3.axis('off')
+        
+        # Plot 4: Dirichlet values visualization (if available)
+        if data.x.shape[1] > 7:  # Has Dirichlet data (8th feature)
+            dirichlet_values = data.x[:, 7].numpy()  # Dirichlet values are 8th feature (index 7)
+            dirichlet_mask = aux['dirichlet_mask']
+            
+            # Only show non-zero Dirichlet values or Dirichlet boundary nodes
+            if dirichlet_mask.any() or (dirichlet_values != 0).any():
+                # Create scatter plot colored by Dirichlet values
+                scatter = ax4.scatter(data.pos[:, 0].numpy(), data.pos[:, 1].numpy(), 
+                                    c=dirichlet_values, cmap='plasma', s=node_size, alpha=0.8)
+                
+                # Add colorbar
+                cbar = plt.colorbar(scatter, ax=ax4)
+                cbar.set_label('Dirichlet Values')
+                
+                # Highlight Dirichlet boundary nodes with blue circles
+                if dirichlet_mask.any():
+                    dirichlet_indices = torch.where(dirichlet_mask)[0]
+                    dirichlet_pos = data.pos[dirichlet_indices].numpy()
+                    ax4.scatter(dirichlet_pos[:, 0], dirichlet_pos[:, 1], 
+                               s=node_size*2, facecolors='none', edgecolors='blue', linewidth=2)
+                
+                ax4.set_title(f'Dirichlet Values\\nRange: [{dirichlet_values.min():.3f}, {dirichlet_values.max():.3f}]')
+            else:
+                ax4.text(0.5, 0.5, 'No Dirichlet values\\navailable', 
+                        ha='center', va='center', transform=ax4.transAxes, fontsize=12)
+                ax4.set_title('Dirichlet Values (N/A)')
+        else:
+            ax4.text(0.5, 0.5, 'No Dirichlet data\\navailable', 
+                    ha='center', va='center', transform=ax4.transAxes, fontsize=12)
+            ax4.set_title('Dirichlet Values (N/A)')
+        
+        ax4.set_aspect('equal')
+        ax4.axis('off')
+        
         plt.tight_layout()
         
         if save_path:
@@ -192,6 +299,7 @@ class GraphCreator:
         
         print(f"\\nFeature Dimensions:")
         print(f"  Node features: {data.x.shape}")
+        print(f"  Feature breakdown: [one_hot(3), T(1), t(1), material(1), neumann(1), dirichlet(1)] = 8 total")
         print(f"  Edge features: {data.edge_attr.shape}")
         print(f"  Global features: {data.global_attr.shape}")
         print(f"  Positions: {data.pos.shape}")
@@ -201,6 +309,28 @@ class GraphCreator:
             print(f"\\nTemperature Field:")
             print(f"  Range: [{temp_values.min():.4f}, {temp_values.max():.4f}]")
             print(f"  Mean: {temp_values.mean():.4f} ± {temp_values.std():.4f}")
+        
+        if data.x.shape[1] > 6:  # Has Neumann data
+            neumann_values = data.x[:, 6]  # Neumann values are at index 6
+            neumann_mask = aux['neumann_mask']
+            print(f"\\nNeumann Values:")
+            print(f"  Range: [{neumann_values.min():.4f}, {neumann_values.max():.4f}]")
+            print(f"  Mean: {neumann_values.mean():.4f} ± {neumann_values.std():.4f}")
+            print(f"  Non-zero values: {(neumann_values != 0).sum().item()}/{len(neumann_values)}")
+            if neumann_mask.any():
+                neumann_node_values = neumann_values[neumann_mask]
+                print(f"  Neumann nodes range: [{neumann_node_values.min():.4f}, {neumann_node_values.max():.4f}]")
+        
+        if data.x.shape[1] > 7:  # Has Dirichlet data
+            dirichlet_values = data.x[:, 7]  # Dirichlet values are at index 7
+            dirichlet_mask = aux['dirichlet_mask']
+            print(f"\\nDirichlet Values:")
+            print(f"  Range: [{dirichlet_values.min():.4f}, {dirichlet_values.max():.4f}]")
+            print(f"  Mean: {dirichlet_values.mean():.4f} ± {dirichlet_values.std():.4f}")
+            print(f"  Non-zero values: {(dirichlet_values != 0).sum().item()}/{len(dirichlet_values)}")
+            if dirichlet_mask.any():
+                dirichlet_node_values = dirichlet_values[dirichlet_mask]
+                print(f"  Dirichlet nodes range: [{dirichlet_node_values.min():.4f}, {dirichlet_node_values.max():.4f}]")
     
     def _pyg_to_networkx(self, data: Data) -> nx.Graph:
         """

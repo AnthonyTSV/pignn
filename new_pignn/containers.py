@@ -20,9 +20,33 @@ class MeshProblem:
         self.n_nodes = graph_data.num_nodes
         self.n_edges = graph_data.num_edges
 
-        self.boundary_values = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}  # Default BCs
+        self.boundary_values = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}  # Default Dirichlet BCs
+        self.dirichlet_values_array = None  # To be set
+        self.neumann_values = {}  # Neumann boundary conditions: {boundary_name: flux_value}
+        self.neumann_values_array = None  # To be set
 
         self.source_function = None  # Default: no source term
+    
+    def set_dirichlet_values(self, boundary_values: dict):
+        """Set Dirichlet boundary conditions."""
+        self.boundary_values = boundary_values
+
+    def set_neumann_values(self, neumann_values: dict):
+        """Set Neumann boundary conditions."""
+        # example: {"top": 5.0} for a flux of 5.0 on the "top" boundary
+        self.neumann_values = neumann_values
+    
+    def set_neumann_values_array(self, neumann_values_array: np.ndarray):
+        """Set Neumann values array for all nodes."""
+        self.neumann_values_array = neumann_values_array
+    
+    def set_dirichlet_values_array(self, dirichlet_values_array: np.ndarray):
+        """Set Dirichlet values array for all nodes."""
+        self.dirichlet_values_array = dirichlet_values_array
+    
+    def set_source_function(self, source_function):
+        """Set source function."""
+        self.source_function = source_function
 
 @dataclass
 class TimeConfig:
@@ -72,5 +96,14 @@ class MeshConfig:
     order: int = 1     # Finite element order
     dim: int = 2       # Spatial dimension (2D or 3D)
     dirichlet_boundaries: Optional[List[str]] = None  # Names of boundaries with Dirichlet BCs
+    neumann_boundaries: Optional[List[str]] = None    # Names of boundaries with Neumann BCs
+    dirichlet_pipe: Optional[str] = None
+    neumann_pipe: Optional[str] = None
 
     mesh_type: str = "rectangle"  # Type of mesh: rectangle, circle, etc.
+
+    def __post_init__(self):
+        if self.dirichlet_boundaries:
+            self.dirichlet_pipe = "|".join(self.dirichlet_boundaries)
+        if self.neumann_boundaries:
+            self.neumann_pipe = "|".join(self.neumann_boundaries)

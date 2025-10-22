@@ -16,6 +16,7 @@ from mesh_utils import (
     build_graph_from_mesh,
     create_free_node_subgraph,
     create_gaussian_initial_condition,
+    create_dirichlet_values,
 )
 from graph_creator import GraphCreator
 from containers import TimeConfig, MeshConfig, MeshProblem
@@ -79,6 +80,47 @@ class DataDrivenMGNTrainer:
         self.losses = []
         self.val_losses = []
 
+    def create_dirichlet_values_for_problem(self, problem, graph_creator):
+        """Create Dirichlet values array based on problem's boundary conditions."""
+        # Create a temporary graph to get positions and auxiliary data
+        temp_data, temp_aux = graph_creator.create_graph()
+        
+        # Define a custom function based on problem's Dirichlet boundary values
+        def dirichlet_function(x, y):
+            # Get the boundary values from the problem
+            boundary_values = getattr(problem, 'boundary_values', {})
+            
+            # Determine which boundary the point (x, y) is on based on position
+            # For a rectangular domain, check which boundary is closest
+            pos_array = temp_data.pos.numpy()
+            x_min, x_max = pos_array[:, 0].min(), pos_array[:, 0].max()
+            y_min, y_max = pos_array[:, 1].min(), pos_array[:, 1].max()
+            
+            tolerance = 1e-6
+            
+            # Check boundaries in order of priority (left, right, bottom, top)
+            if abs(x - x_min) < tolerance:  # Left boundary
+                return boundary_values.get("left", 0.0)
+            elif abs(x - x_max) < tolerance:  # Right boundary  
+                return boundary_values.get("right", 0.0)
+            elif abs(y - y_min) < tolerance:  # Bottom boundary
+                return boundary_values.get("bottom", 0.0)
+            elif abs(y - y_max) < tolerance:  # Top boundary
+                return boundary_values.get("top", 0.0)
+            else:
+                # Interior point - should not have Dirichlet BC, but default to 0
+                return 0.0
+        
+        # Create Dirichlet values using the custom function
+        dirichlet_vals = create_dirichlet_values(
+            pos=temp_data.pos,
+            aux_data=temp_aux,
+            dirichlet_names=problem.mesh_config.dirichlet_boundaries,
+            temperature_function=dirichlet_function
+        )
+        
+        return dirichlet_vals
+
     def prepare_training_data_all_problems(self):
         """Prepare training data for temporal bundling prediction from all problems."""
         all_training_data = []
@@ -90,9 +132,16 @@ class DataDrivenMGNTrainer:
                 mesh=problem.mesh,
                 n_neighbors=2,
                 dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-                neumann_names=[],
+                neumann_names=problem.mesh_config.neumann_boundaries,
                 connectivity_method="fem",
             )
+
+            # Get the Neumann values for this problem
+            neumann_vals = getattr(problem, 'neumann_values_array', None)
+
+            
+            # Get the Dirichlet values for this problem
+            dirichlet_vals = getattr(problem, 'dirichlet_values_array', None)
 
             # Create training pairs for temporal bundling for this problem
             for idx in range(len(time_steps) - self.time_window):  # Need n future steps
@@ -113,7 +162,7 @@ class DataDrivenMGNTrainer:
 
                 # Build graph from current state
                 data, aux = graph_creator.create_graph(
-                    T_current=input_state, t_scalar=current_time
+                    T_current=input_state, t_scalar=current_time, neumann_values=neumann_vals, dirichlet_values=dirichlet_vals
                 )
 
                 free_graph, node_mapping, free_aux = (
@@ -146,9 +195,14 @@ class DataDrivenMGNTrainer:
             mesh=self.problem.mesh,
             n_neighbors=2,
             dirichlet_names=self.problem.mesh_config.dirichlet_boundaries,
-            neumann_names=[],
+            neumann_names=self.problem.mesh_config.neumann_boundaries,
             connectivity_method="fem",
         )
+
+        # Get the Neumann values for this problem
+        neumann_vals = getattr(self.problem, 'neumann_values_array', None)
+        dirichlet_vals = getattr(self.problem, 'dirichlet_values_array', None)
+    
 
         # Create training pairs for temporal bundling
         for idx in range(len(time_steps) - self.time_window):  # Need n future steps
@@ -169,7 +223,7 @@ class DataDrivenMGNTrainer:
 
             # Build graph from current state
             data, aux = graph_creator.create_graph(
-                T_current=input_state, t_scalar=current_time
+                T_current=input_state, t_scalar=current_time, neumann_values=neumann_vals, dirichlet_values=dirichlet_vals
             )
 
             free_graph, node_mapping, free_aux = (
@@ -310,9 +364,15 @@ class DataDrivenMGNTrainer:
             mesh=problem.mesh,
             n_neighbors=2,
             dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-            neumann_names=[],
+            neumann_names=problem.mesh_config.neumann_boundaries,
             connectivity_method="fem",
         )
+
+        # Get the Neumann values for this problem
+        neumann_vals = getattr(problem, 'neumann_values_array', None)
+        
+        # Get the Dirichlet values for this problem
+        dirichlet_vals = getattr(problem, 'dirichlet_values_array', None)
 
         with torch.no_grad():
             step_idx = 0
@@ -321,16 +381,15 @@ class DataDrivenMGNTrainer:
 
                 # Build graph
                 data, aux = graph_creator.create_graph(
-                    T_current=T_current, t_scalar=current_time
+                    T_current=T_current, t_scalar=current_time, neumann_values=neumann_vals, dirichlet_values=dirichlet_vals
                 )
                 free_graph, node_mapping, free_aux = (
                     graph_creator.create_free_node_subgraph(data, aux)
                 )
                 free_data = free_graph.to(self.device)
 
-                # Predict next 5 time steps
-                predictions_bundled = self.model.forward(free_data)
-                # Shape: (n_free_nodes, time_window)
+                # Predict next n time steps
+                predictions_bundled = self.model.forward(free_data) # Shape: (n_free_nodes, time_window)
 
                 # Extract predictions for each time step
                 free_idx = node_mapping["free_to_original"].detach().cpu().numpy()
@@ -345,14 +404,20 @@ class DataDrivenMGNTrainer:
                         predictions_bundled[:, t_idx].squeeze().detach().cpu().numpy()
                     )
                     next_full[free_idx] = pred_t
-                    next_full[aux["dirichlet_mask"].cpu().numpy()] = 0.0
+                    # Apply Dirichlet boundary conditions with actual values
+                    dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
+                    next_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
 
                     predictions.append(next_full)
 
                 # For next iteration, use the last predicted state
                 # Or use the first predicted state for overlapping windows
                 if len(predictions) > 1:
-                    T_current = predictions[-1]  # Use last prediction
+                    T_to_use = predictions[-1]
+                    # enforce Dirichlet BCs
+                    dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
+                    T_to_use[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
+                    T_current = T_to_use
 
                 # Move forward by time_window steps (non-overlapping)
                 # Or by 1 step for overlapping windows
@@ -392,68 +457,6 @@ class DataDrivenMGNTrainer:
 
         return all_errors
 
-
-def create_test_problem():
-    """Create a simple test problem."""
-    print("Creating test problem...")
-
-    # Time configuration
-    time_config = TimeConfig(dt=0.01, t_final=1.0)
-    maxh = 0.1  # Mesh element size
-    # Create rectangular mesh
-    mesh = create_rectangular_mesh(width=1.0, height=1.0, maxh=maxh)
-
-    # Mesh configuration
-    mesh_config = MeshConfig(
-        maxh=maxh,
-        order=1,
-        dim=2,
-        dirichlet_boundaries=["left", "right", "top", "bottom"],
-        mesh_type="rectangle",
-    )
-
-    # Create graph to get node positions
-    graph_creator = GraphCreator(
-        mesh=mesh,
-        n_neighbors=2,
-        dirichlet_names=["left", "right", "top", "bottom"],
-        neumann_names=[],
-        connectivity_method="fem",
-    )
-    temp_data, _ = graph_creator.create_graph()
-
-    # Create Gaussian initial condition
-    initial_condition = create_gaussian_initial_condition(
-        pos=temp_data.pos,
-        num_gaussians=1,
-        amplitude_range=(1.0, 1.0),
-        sigma_fraction_range=(0.2, 0.2),
-        seed=42,
-        centered=True,
-        enforce_boundary_conditions=True,
-    )
-
-    # Create problem
-    problem = MeshProblem(
-        mesh=mesh,
-        graph_data=temp_data,
-        initial_condition=initial_condition,
-        alpha=1.0,  # Thermal diffusivity
-        time_config=time_config,
-        mesh_config=mesh_config,
-        problem_id=0,
-    )
-
-    # Set boundary conditions (homogeneous Dirichlet)
-    problem.boundary_values = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
-
-    problem.source_function = None
-
-    print(f"Problem created with {problem.n_nodes} nodes and {problem.n_edges} edges")
-
-    return problem, time_config
-
-
 def generate_multiple_problems(n_problems=20, seed=42):
     """Generate multiple problems with varying mesh sizes and Gaussian initial conditions."""
     print(f"Generating {n_problems} problems with varying parameters...")
@@ -482,7 +485,8 @@ def generate_multiple_problems(n_problems=20, seed=42):
             maxh=maxh,
             order=1,
             dim=2,
-            dirichlet_boundaries=["left", "right", "top", "bottom"],
+            dirichlet_boundaries=["left", "right", "bottom"],
+            neumann_boundaries=["top"],
             mesh_type="rectangle",
         )
         
@@ -490,11 +494,32 @@ def generate_multiple_problems(n_problems=20, seed=42):
         graph_creator = GraphCreator(
             mesh=mesh,
             n_neighbors=2,
-            dirichlet_names=["left", "right", "top", "bottom"],
-            neumann_names=[],
+            dirichlet_names=["left", "right", "bottom"],
+            neumann_names=["top"],
             connectivity_method="fem",
         )
-        temp_data, _ = graph_creator.create_graph()
+        # First create a temporary graph to get positions and aux data
+        temp_data, temp_aux = graph_creator.create_graph()
+        
+        # Create Neumann values based on the temporary data
+        neumann_vals = graph_creator.create_neumann_values(
+            pos=temp_data.pos,
+            aux_data=temp_aux,
+            neumann_names=["top"],
+            flux_values={"top": 1},
+            seed=42
+        )
+        dirichlet_vals = create_dirichlet_values(
+            pos=temp_data.pos,
+            aux_data=temp_aux,
+            dirichlet_names=["left", "right", "bottom"],
+            boundary_values={"left": 5.0, "right": 5.0, "bottom": 0.0}
+        )
+        # Create the final graph with Neumann values
+        temp_data, _ = graph_creator.create_graph(neumann_values=neumann_vals, dirichlet_values=dirichlet_vals)
+        
+        # Store Neumann values array for later use
+        problem_neumann_vals = neumann_vals
         
         # Vary Gaussian initial condition parameters
         num_gaussians = np.random.choice(num_gaussians_options)
@@ -511,6 +536,7 @@ def generate_multiple_problems(n_problems=20, seed=42):
             centered=np.random.choice([True, False]),  # Sometimes centered, sometimes not
             enforce_boundary_conditions=True,
         )
+        initial_condition = np.zeros_like(initial_condition)
         
         # Create problem
         problem = MeshProblem(
@@ -523,10 +549,27 @@ def generate_multiple_problems(n_problems=20, seed=42):
             problem_id=i,
         )
         
-        # Set boundary conditions (homogeneous Dirichlet)
-        problem.boundary_values = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
-        problem.source_function = None
+        # Store the Neumann values array for use in training
+        problem.set_neumann_values_array(problem_neumann_vals)
+        problem.set_dirichlet_values_array(dirichlet_vals)
         
+        
+        # Set boundary conditions
+        problem.set_neumann_values({"top": 1})
+        problem.set_dirichlet_values({"left": 5.0, "right": 5.0, "bottom": 0.0})
+        problem.source_function = None
+
+        # fix initial condition by projecting to satisfy Dirichlet BCs
+        import ngsolve as ng
+        fes = ng.H1(mesh, order=1, dirichlet=problem.mesh_config.dirichlet_pipe)
+        gfu = ng.GridFunction(fes)
+
+        # Set dirichlet boundary conditions
+        boundary_cf = mesh.BoundaryCF(problem.boundary_values, default=0)
+
+        gfu.vec.FV().NumPy()[:] = problem.initial_condition
+        gfu.Set(boundary_cf, definedon=mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
+        problem.initial_condition = gfu.vec.FV().NumPy()
         problems.append(problem)
         
         print(f"Problem {i+1}: {problem.n_nodes} nodes, {problem.n_edges} edges, "
@@ -601,19 +644,18 @@ def main():
     Path("results").mkdir(exist_ok=True)
     Path("results/data_driven").mkdir(exist_ok=True)
 
-    # Generate multiple problems (15 training + 5 validation)
-    all_problems, time_config = generate_multiple_problems(n_problems=3, seed=42)
+    all_problems, time_config = generate_multiple_problems(n_problems=2, seed=42)
     
     # Split problems into train and validation
-    train_indices = list(range(2))  # First 2 problems for training
-    val_indices = list(range(2, 3))  # Last 1 problem for validation
+    train_indices = list(range(1))
+    val_indices = list(range(1, 2))
 
     print(f"Training problems: {train_indices}")
     print(f"Validation problems: {val_indices}")
 
     # Training configuration
     config = {
-        "epochs": 10,  # Reduced for testing
+        "epochs": 100,  # Reduced for testing
         "lr": 1e-3,
         "time_config": time_config,
         "time_window": 20,

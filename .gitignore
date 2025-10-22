@@ -12,6 +12,9 @@ results/
 evaluation_results/
 inference_results/
 
+# fem_tests
+fem_tests/
+
 test_ngsolve/
 test_rectangular/
 

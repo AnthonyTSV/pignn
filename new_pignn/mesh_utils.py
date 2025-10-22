@@ -1,16 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Mesh -> Graph (PI-MGN-ready) with NGSolve/Netgen -> PyTorch Geometric Data
-- Directed edges + self-loops
-- Node features: one-hot node type (Dirichlet / Neumann / Interior) + optional fields (T^n, t_n, material)
-- Edge features: relative vector (dx, dy, [dz]), Euclidean distance ||d||, and ΔT = T_v - T_u at current approx
-- Global features: e.g., time t_n (optional)
-
-Requires:
-  - ngsolve, netgen, numpy, torch, torch_geometric
-"""
-
-from __future__ import annotations
 from typing import Dict, Iterable, Optional, Tuple, List
 
 import numpy as np
@@ -128,7 +115,7 @@ def _normalize_ids_to_idx(
     if all((0 <= x < N) for x in nums):
         return nums
 
-    # Nothing matched — give a helpful error
+    # Nothing matched
     keys = sorted(pnum_to_idx.keys())
     raise KeyError(
         f"[{context}] Cannot map point numbers {nums} to indices.\n"
@@ -253,6 +240,8 @@ def build_graph_from_mesh(
     T_current: Optional[np.ndarray] = None,
     t_scalar: float = 0.0,
     material_node_field: Optional[np.ndarray] = None,
+    neumann_values: Optional[np.ndarray] = None,
+    dirichlet_values: Optional[np.ndarray] = None,
     connectivity_method: str = "fem",
     n_neighbors: int = 8,
     add_self_loops: bool = True,
@@ -268,6 +257,8 @@ def build_graph_from_mesh(
         T_current: Current temperature field (N,) - optional
         t_scalar: Current time scalar
         material_node_field: Per-node material properties (N,) - optional
+        neumann_values: Per-node Neumann boundary values (N,) - optional, h_N values for flux BC
+        dirichlet_values: Per-node Dirichlet boundary values (N,) - optional, prescribed values for Dirichlet BC
         connectivity_method: "fem" (mesh connectivity) or "knn" (k-nearest neighbors)
         n_neighbors: Number of neighbors for k-NN connectivity
         add_self_loops: Whether to add self-loops to all nodes
@@ -301,7 +292,7 @@ def build_graph_from_mesh(
         
     # 4. Build node features
     node_features = _build_node_features(
-        node_types, T_current, t_scalar, material_node_field, n_nodes, device
+        node_types, T_current, t_scalar, material_node_field, neumann_values, dirichlet_values, n_nodes, device
     )
     
     # 5. Build edge features
@@ -318,6 +309,8 @@ def build_graph_from_mesh(
         'neumann_mask': node_types == 1, 
         'interior_mask': node_types == 2,
         'free_mask': node_types != 0,  # Non-Dirichlet nodes
+        'neumann_values': neumann_values,
+        'dirichlet_values': dirichlet_values,
         'mesh': mesh,
         'connectivity_method': connectivity_method
     }
@@ -402,6 +395,8 @@ def create_free_node_subgraph(data: Data, aux: Dict) -> Tuple[Data, Dict, Dict]:
         'neumann_mask': aux['neumann_mask'][free_indices],
         'interior_mask': aux['interior_mask'][free_indices],
         'free_mask': torch.ones(n_free, dtype=torch.bool, device=device),  # All nodes in subgraph are free
+        'neumann_values': aux['neumann_values'][free_indices.cpu().numpy()] if aux['neumann_values'] is not None else None,
+        'dirichlet_values': aux['dirichlet_values'][free_indices.cpu().numpy()] if aux['dirichlet_values'] is not None else None,
         'mesh': aux['mesh'],
         'connectivity_method': aux['connectivity_method']
     }
@@ -425,6 +420,7 @@ def _classify_node_types(
 ) -> torch.Tensor:
     """
     Classify nodes as Dirichlet (0), Neumann (1), or Interior (2).
+    Dirichlet conditions take priority over Neumann at corner nodes.
     """
     n_nodes = len(pnum_to_idx)
     node_types = torch.full((n_nodes,), 2, dtype=torch.long)  # Default: interior
@@ -438,16 +434,21 @@ def _classify_node_types(
     dirichlet_bcnr = _resolve_boundary_names_to_bcnr(mesh, dirichlet_names)
     neumann_bcnr = _resolve_boundary_names_to_bcnr(mesh, neumann_names)
     
-    # Mark boundary nodes
+    # First pass: Mark Neumann nodes
     for seg in segments_1d:
         bc_code = int(getattr(seg, "bc", getattr(seg, "si", getattr(seg, "index", 0))))
-        vertices = seg.vertices
-        vertex_indices = _normalize_ids_to_idx(vertices, pnum_to_idx, n_nodes, context="boundary_segments")
-        
-        if bc_code in dirichlet_bcnr:
-            node_types[vertex_indices] = 0  # Dirichlet
-        elif bc_code in neumann_bcnr:
+        if bc_code in neumann_bcnr:
+            vertices = seg.vertices
+            vertex_indices = _normalize_ids_to_idx(vertices, pnum_to_idx, n_nodes, context="boundary_segments")
             node_types[vertex_indices] = 1  # Neumann
+    
+    # Second pass: Mark Dirichlet nodes (overrides Neumann at corners)
+    for seg in segments_1d:
+        bc_code = int(getattr(seg, "bc", getattr(seg, "si", getattr(seg, "index", 0))))
+        if bc_code in dirichlet_bcnr:
+            vertices = seg.vertices
+            vertex_indices = _normalize_ids_to_idx(vertices, pnum_to_idx, n_nodes, context="boundary_segments")
+            node_types[vertex_indices] = 0  # Dirichlet (takes priority)
     
     return node_types
 
@@ -547,12 +548,14 @@ def _build_node_features(
     T_current: Optional[np.ndarray],
     t_scalar: float,
     material_field: Optional[np.ndarray],
+    neumann_values: Optional[np.ndarray],
+    dirichlet_values: Optional[np.ndarray],
     n_nodes: int,
     device: torch.device = None
 ) -> torch.Tensor:
     """
     Build node feature matrix according to PI-MGN methodology.
-    Features: [one_hot_node_type(3), T_current(1), t_scalar(1), material(1)]
+    Features: [one_hot_node_type(3), T_current(1), t_scalar(1), material(1), neumann_value(1), dirichlet_value(1)]
     """
     if device is None:
         device = node_types.device
@@ -581,6 +584,20 @@ def _build_node_features(
     else:
         mat_tensor = torch.ones(n_nodes, 1, device=device)  # Default material
     features.append(mat_tensor)
+    
+    # Neumann boundary values (flux values h_N from paper)
+    if neumann_values is not None:
+        neumann_tensor = torch.tensor(neumann_values, dtype=torch.float32, device=device).unsqueeze(1)
+    else:
+        neumann_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no flux
+    features.append(neumann_tensor)
+    
+    # Dirichlet boundary values (prescribed values for Dirichlet BC)
+    if dirichlet_values is not None:
+        dirichlet_tensor = torch.tensor(dirichlet_values, dtype=torch.float32, device=device).unsqueeze(1)
+    else:
+        dirichlet_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: homogeneous Dirichlet
+    features.append(dirichlet_tensor)
     
     return torch.cat(features, dim=1)
 
@@ -648,116 +665,299 @@ def create_gaussian_initial_condition(pos, num_gaussians=4, amplitude_range=(0.4
         sigma_fraction_range: Range of sigma as fraction of domain size
         seed: Random seed
         centered: If True, place first Gaussian at domain center
-        enforce_boundary_conditions: If True, multiply by boundary factor to ensure zero at boundaries
-    
+        enforce_boundary_conditions: If True, enforce T=0 on boundaries
+        
     Returns:
-        T0: Initial temperature field (N,)
+        T_initial: Initial temperature field (N,)
     """
     if seed is not None:
         np.random.seed(seed)
     
+    pos = np.array(pos)
     n_nodes = pos.shape[0]
-    T0 = np.zeros(n_nodes)
-    pos = pos.cpu().numpy()
-    # Domain bounds for sigma scaling
-    x_min, y_min = pos.min(axis=0)
-    x_max, y_max = pos.max(axis=0)
-    width = x_max - x_min
-    height = y_max - y_min
     
-    # Center of the domain
-    center_x = (x_min + x_max) / 2
-    center_y = (y_min + y_max) / 2
+    # Get domain bounds
+    x_min, x_max = pos[:, 0].min(), pos[:, 0].max()
+    y_min, y_max = pos[:, 1].min(), pos[:, 1].max()
+    domain_size = max(x_max - x_min, y_max - y_min)
     
-    # Keep Gaussians away from boundaries if enforcing boundary conditions
-    if enforce_boundary_conditions:
-        # Use smaller domain for Gaussian centers to avoid boundary issues
-        margin = 0.1
-        gauss_x_min = x_min + margin * width
-        gauss_x_max = x_max - margin * width
-        gauss_y_min = y_min + margin * height
-        gauss_y_max = y_max - margin * height
-    else:
-        gauss_x_min, gauss_x_max = x_min, x_max
-        gauss_y_min, gauss_y_max = y_min, y_max
+    T_initial = np.zeros(n_nodes)
     
-    for _ in range(num_gaussians):
-        # Use center coordinates for all Gaussians (or just the first one)
-        if centered and _ == 0:
-            # First Gaussian at center
-            gauss_center_x = center_x
-            gauss_center_y = center_y
-        else:
-            # Additional Gaussians can still be random if desired
-            gauss_center_x = np.random.uniform(gauss_x_min, gauss_x_max)
-            gauss_center_y = np.random.uniform(gauss_y_min, gauss_y_max)
-        
+    for i in range(num_gaussians):
         # Random amplitude
         amplitude = np.random.uniform(*amplitude_range)
         
-        # Random sigma based on domain size
-        sigma_x = np.random.uniform(*sigma_fraction_range) * width
-        sigma_y = np.random.uniform(*sigma_fraction_range) * height
-
-        x = pos[:, 0].T
-        y = pos[:, 1].T
-        # Add Gaussian to initial condition
-        dx = x - gauss_center_x
-        dy = y - gauss_center_y
-        gaussian = amplitude * np.exp(-(dx**2 / (2 * sigma_x**2) + dy**2 / (2 * sigma_y**2)))
-        T0 += gaussian
+        # Random center
+        if i == 0 and centered:
+            center_x = (x_min + x_max) / 2
+            center_y = (y_min + y_max) / 2
+        else:
+            # Place Gaussians away from boundaries
+            margin = 0.1 * domain_size
+            center_x = np.random.uniform(x_min + margin, x_max - margin)
+            center_y = np.random.uniform(y_min + margin, y_max - margin)
+        
+        # Random sigma
+        sigma = np.random.uniform(*sigma_fraction_range) * domain_size
+        
+        # Add Gaussian
+        distances_sq = (pos[:, 0] - center_x)**2 + (pos[:, 1] - center_y)**2
+        gaussian = amplitude * np.exp(-distances_sq / (2 * sigma**2))
+        T_initial += gaussian
     
-    # Apply boundary condition enforcement
+    # Enforce boundary conditions if requested
     if enforce_boundary_conditions:
-        # Create boundary factor that goes to zero at domain boundaries
-        # This works for rectangular domains - for other shapes, you'd need different formulations
-        
-        # Normalize coordinates to [0, 1] domain
-        x_norm = (pos[:, 0] - x_min) / width
-        y_norm = (pos[:, 1] - y_min) / height
-        
-        # Boundary factor: x*(1-x)*y*(1-y) goes to zero at all boundaries
-        boundary_factor = x_norm * (1 - x_norm) * y_norm * (1 - y_norm)
-        
-        # Apply boundary factor
-        T0 = T0 * boundary_factor
+        # Find boundary nodes (nodes on domain boundary)
+        tolerance = 1e-10
+        boundary_mask = (
+            (np.abs(pos[:, 0] - x_min) < tolerance) |  # Left boundary
+            (np.abs(pos[:, 0] - x_max) < tolerance) |  # Right boundary
+            (np.abs(pos[:, 1] - y_min) < tolerance) |  # Bottom boundary
+            (np.abs(pos[:, 1] - y_max) < tolerance)    # Top boundary
+        )
+        T_initial[boundary_mask] = 0.0
     
-    return T0
+    return T_initial
 
-if __name__ == "__main__":
-    # 1) Build a simple rectangle with named boundaries
-    mesh = create_rectangular_mesh(width=1.0, height=0.6, maxh=0.08)
 
-    # 2) Define which boundaries are Dirichlet/Neumann by *names* used in geometry
-    dir_names = ["left", "right", "bottom", "top"] # example
-    neu_names = [] # example
+def _get_nodes_on_boundary(mesh: Mesh, boundary_name: str, pnum_to_idx: Dict[int, int]) -> List[int]:
+    """
+    Get list of node indices that lie on a specific boundary.
+    
+    Args:
+        mesh: NGSolve mesh
+        boundary_name: Name of the boundary
+        pnum_to_idx: Mapping from Netgen point numbers to indices
+        
+    Returns:
+        List of node indices on the specified boundary
+    """
+    n_nodes = len(pnum_to_idx)
+    boundary_nodes = set()
+    
+    # Get boundary segments
+    segments_1d = list(mesh.ngmesh.Elements1D())
+    if not segments_1d:
+        return []
+    
+    # Resolve boundary name to BC number
+    boundary_bcnr = _resolve_boundary_names_to_bcnr(mesh, [boundary_name])
+    
+    # Find all nodes on this boundary
+    for seg in segments_1d:
+        bc_code = int(getattr(seg, "bc", getattr(seg, "si", getattr(seg, "index", 0))))
+        if bc_code in boundary_bcnr:
+            vertices = seg.vertices
+            vertex_indices = _normalize_ids_to_idx(vertices, pnum_to_idx, n_nodes, context="boundary_segments")
+            boundary_nodes.update(vertex_indices)
+    
+    return list(boundary_nodes)
 
-    # 3) Provide an approximate current temperature field T^n, if available
-    # Here we just create a dummy field for demonstration
-    n_nodes = len(list(mesh.ngmesh.Points()))
-    Tn = np.random.randn(n_nodes).astype(np.float64) * 0.01
 
-    # 4) Optional global time scalar
-    t_n = 0.0
+def create_neumann_values(pos, aux_data, neumann_names, flux_values=None, flux_magnitude=1.0, seed=None):
+    """
+    Create Neumann boundary values (flux values h_N) according to PI-MGN methodology.
+    
+    Args:
+        pos: Node positions (N, 2) - can be torch tensor or numpy array
+        aux_data: Auxiliary data containing node type information
+        neumann_names: List of Neumann boundary names or single boundary name
+        flux_values: Dict mapping boundary names to flux values, or single value for constant flux
+        flux_magnitude: Default flux magnitude if flux_values not provided (backward compatibility)
+        seed: Random seed for reproducible values
+        
+    Returns:
+        neumann_values: Per-node Neumann flux values (N,)
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    # Convert pos to numpy if it's a torch tensor
+    if hasattr(pos, 'numpy'):
+        pos_np = pos.numpy()
+    else:
+        pos_np = np.array(pos)
+    
+    n_nodes = pos_np.shape[0]
+    neumann_values = np.zeros(n_nodes)
+    
+    # Get mesh from aux data
+    mesh = aux_data['mesh']
+    pnum_to_idx = aux_data['pnum_to_idx']
+    
+    # Handle different input formats for neumann_names
+    if isinstance(neumann_names, str):
+        neumann_names = [neumann_names]
+    
+    # Handle different input formats for flux_values
+    if flux_values is None:
+        # Use default flux_magnitude for all boundaries
+        flux_values = {name: flux_magnitude for name in neumann_names}
+    elif isinstance(flux_values, (int, float)):
+        # Single constant value for all boundaries
+        flux_values = {name: flux_values for name in neumann_names}
+    elif not isinstance(flux_values, dict):
+        raise ValueError("flux_values must be None, a number, or a dict mapping boundary names to values")
+    
+    # Assign flux values based on boundary names
+    for boundary_name in neumann_names:
+        if boundary_name not in flux_values:
+            raise ValueError(f"No flux value specified for boundary '{boundary_name}'")
+        
+        # Get nodes on this specific boundary
+        boundary_nodes = _get_nodes_on_boundary(mesh, boundary_name, pnum_to_idx)
+        flux_value = flux_values[boundary_name]
+        
+        for node_idx in boundary_nodes:
+            neumann_values[node_idx] = flux_value
+    
+    return neumann_values
 
-    # 5) Build graph (PI-MGN-ready)
-    data, aux = build_graph_from_mesh(
-        mesh,
-        dirichlet_names=dir_names,
-        neumann_names=neu_names,
-        T_current=Tn,
-        t_scalar=t_n,
-        material_node_field=None,  # or per-node values if needed
-    )
 
-    # 6) Create subgraph with only free nodes (strict BC enforcement)
-    data, mapping = create_free_node_subgraph(data, aux)
+def create_dirichlet_values(pos, aux_data, dirichlet_names, boundary_values=None, 
+                           temperature_function=None, homogeneous_value=0.0, 
+                           inhomogeneous_type="constant", seed=None):
+    """
+    Create Dirichlet boundary values according to PI-MGN methodology.
+    
+    For nodes that belong to multiple Dirichlet boundaries, higher values take priority
+    over lower values. This ensures consistent boundary condition enforcement when
+    boundaries intersect at corners or edges.
+    
+    Args:
+        pos: Node positions (N, 2) - can be torch tensor or numpy array
+        aux_data: Auxiliary data containing node type information
+        dirichlet_names: List of Dirichlet boundary names or single boundary name
+        boundary_values: Dict mapping boundary names to constant values, or single value for all boundaries
+        temperature_function: Custom function f(x, y) -> temperature (optional, overrides boundary_values)
+        homogeneous_value: Default value if boundary_values not provided (backward compatibility)
+        inhomogeneous_type: Type of BC - "constant" (use boundary_values), or legacy types for backward compatibility
+        seed: Random seed for reproducible values
+        
+    Returns:
+        dirichlet_values: Per-node Dirichlet boundary values (N,) with higher values prioritized at corner nodes
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    # Convert pos to numpy if it's a torch tensor
+    if hasattr(pos, 'numpy'):
+        pos_np = pos.numpy()
+    else:
+        pos_np = np.array(pos)
+    
+    n_nodes = pos_np.shape[0]
+    dirichlet_values = np.zeros(n_nodes)
+    
+    # Get mesh from aux data
+    mesh = aux_data['mesh']
+    pnum_to_idx = aux_data['pnum_to_idx']
+    
+    # Handle different input formats for dirichlet_names
+    if isinstance(dirichlet_names, str):
+        dirichlet_names = [dirichlet_names]
+    
+    # If temperature_function is provided, use it (legacy behavior)
+    if temperature_function is not None:
+        dirichlet_mask = aux_data['dirichlet_mask']
+        if hasattr(dirichlet_mask, 'numpy'):
+            dirichlet_mask_np = dirichlet_mask.numpy()
+        else:
+            dirichlet_mask_np = np.array(dirichlet_mask)
+        
+        if dirichlet_mask_np.any():
+            dirichlet_indices = np.where(dirichlet_mask_np)[0]
+            for idx in dirichlet_indices:
+                x, y = pos_np[idx]
+                dirichlet_values[idx] = temperature_function(x, y)
+        return dirichlet_values
+    
+    # Handle boundary-specific constant values
+    if inhomogeneous_type == "constant":
+        # Handle different input formats for boundary_values
+        if boundary_values is None:
+            # Use default homogeneous_value for all boundaries
+            boundary_values = {name: homogeneous_value for name in dirichlet_names}
+        elif isinstance(boundary_values, (int, float)):
+            # Single constant value for all boundaries
+            boundary_values = {name: boundary_values for name in dirichlet_names}
+        elif not isinstance(boundary_values, dict):
+            raise ValueError("boundary_values must be None, a number, or a dict mapping boundary names to values")
+        
+        # Assign values based on boundary names with priority (higher values override lower ones)
+        for boundary_name in dirichlet_names:
+            if boundary_name not in boundary_values:
+                raise ValueError(f"No value specified for boundary '{boundary_name}'")
+            
+            # Get nodes on this specific boundary
+            boundary_nodes = _get_nodes_on_boundary(mesh, boundary_name, pnum_to_idx)
+            boundary_value = boundary_values[boundary_name]
+            
+            for node_idx in boundary_nodes:
+                # Only assign if this value is higher than the current value
+                # This prioritizes higher Dirichlet values over lower ones
+                if boundary_value > dirichlet_values[node_idx]:
+                    dirichlet_values[node_idx] = boundary_value
+    
+    else:
+        # Legacy behavior - use old inhomogeneous types on all Dirichlet boundaries
+        dirichlet_mask = aux_data['dirichlet_mask']
+        if hasattr(dirichlet_mask, 'numpy'):
+            dirichlet_mask_np = dirichlet_mask.numpy()
+        else:
+            dirichlet_mask_np = np.array(dirichlet_mask)
+        
+        if dirichlet_mask_np.any():
+            dirichlet_indices = np.where(dirichlet_mask_np)[0]
+            
+            if inhomogeneous_type == "homogeneous":
+                # Homogeneous Dirichlet BC (constant value)
+                for idx in dirichlet_indices:
+                    dirichlet_values[idx] = homogeneous_value
+            
+            elif inhomogeneous_type == "sinusoidal":
+                # Sinusoidal variation along boundaries
+                for idx in dirichlet_indices:
+                    x, y = pos_np[idx]
+                    dirichlet_values[idx] = np.sin(np.pi * x) * np.cos(np.pi * y)
+            
+            elif inhomogeneous_type == "linear":
+                # Linear variation based on position
+                x_coords = pos_np[dirichlet_indices, 0]
+                y_coords = pos_np[dirichlet_indices, 1]
+                x_min, x_max = x_coords.min(), x_coords.max()
+                y_min, y_max = y_coords.min(), y_coords.max()
+                
+                for idx in dirichlet_indices:
+                    x, y = pos_np[idx]
+                    # Linear interpolation from 0 to 1 based on position
+                    if x_max > x_min:
+                        dirichlet_values[idx] = (x - x_min) / (x_max - x_min)
+                    else:
+                        dirichlet_values[idx] = (y - y_min) / (y_max - y_min) if y_max > y_min else 0.0
+            
+            elif inhomogeneous_type == "quadratic":
+                # Quadratic variation
+                for idx in dirichlet_indices:
+                    x, y = pos_np[idx]
+                    dirichlet_values[idx] = x**2 + y**2
+            
+            elif inhomogeneous_type == "gaussian":
+                # Gaussian profile centered at domain center
+                x_center = np.mean(pos_np[:, 0])
+                y_center = np.mean(pos_np[:, 1])
+                domain_size = max(pos_np[:, 0].max() - pos_np[:, 0].min(),
+                                 pos_np[:, 1].max() - pos_np[:, 1].min())
+                sigma = domain_size * 0.2  # 20% of domain size
+                
+                for idx in dirichlet_indices:
+                    x, y = pos_np[idx]
+                    r2 = (x - x_center)**2 + (y - y_center)**2
+                    dirichlet_values[idx] = np.exp(-r2 / (2 * sigma**2))
+            
+            else:
+                raise ValueError(f"Unknown inhomogeneous_type: {inhomogeneous_type}. "
+                               f"Available options: 'constant', 'homogeneous', 'sinusoidal', 'linear', 'quadratic', 'gaussian'")
+    
+    return dirichlet_values
 
-    # 6) Inspect shapes
-    print(data)
-    print("x shape:", tuple(data.x.shape))
-    print("edge_index shape:", tuple(data.edge_index.shape))
-    print("edge_attr shape:", tuple(data.edge_attr.shape))
-    print("global_attr shape:", tuple(data.global_attr.shape))
-    print("pos shape:", tuple(data.pos.shape))
-    print("Free nodes:", int(aux["free_mask"].sum()), "/", aux["free_mask"].size())
