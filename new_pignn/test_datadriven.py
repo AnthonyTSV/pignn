@@ -21,6 +21,7 @@ from mesh_utils import (
 from graph_creator import GraphCreator
 from containers import TimeConfig, MeshConfig, MeshProblem
 from torch_geometric.data import Data
+from new_pignn.train_problems import create_test_problem, generate_multiple_problems
 
 
 class DataDrivenMGNTrainer:
@@ -63,14 +64,12 @@ class DataDrivenMGNTrainer:
             f"Input dimensions - Node: {input_dim_node}, Edge: {input_dim_edge}, Output: {output_dim}"
         )
 
-        # Create MeshGraphNet model
-        args = Namespace(num_layers=12, time_window=self.time_window)  # 12 message passing layers like PIGNN
         self.model = MeshGraphNet(
             input_dim_node=input_dim_node,
             input_dim_edge=input_dim_edge,
             hidden_dim=128,
             output_dim=output_dim,
-            args=args,
+            num_layers=12,
         ).to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
@@ -457,127 +456,6 @@ class DataDrivenMGNTrainer:
 
         return all_errors
 
-def generate_multiple_problems(n_problems=20, seed=42):
-    """Generate multiple problems with varying mesh sizes and Gaussian initial conditions."""
-    print(f"Generating {n_problems} problems with varying parameters...")
-    
-    np.random.seed(seed)
-    problems = []
-    
-    # Define parameter ranges
-    mesh_sizes = np.linspace(0.05, 0.15, 5)  # 5 different mesh sizes
-    num_gaussians_options = [1, 2, 3]  # 1-3 Gaussians
-    amplitude_ranges = [(0.5, 1.5), (1.0, 2.0), (0.8, 1.2)]  # Different amplitude ranges
-    sigma_fractions = [(0.1, 0.3), (0.15, 0.25), (0.2, 0.4)]  # Different width ranges
-    
-    # Time configuration (same for all problems)
-    time_config = TimeConfig(dt=0.01, t_final=1.0)
-    
-    for i in range(n_problems):
-        # Vary mesh size
-        maxh = np.random.choice(mesh_sizes)
-        
-        # Create rectangular mesh
-        mesh = create_rectangular_mesh(width=1.0, height=1.0, maxh=maxh)
-        
-        # Mesh configuration
-        mesh_config = MeshConfig(
-            maxh=maxh,
-            order=1,
-            dim=2,
-            dirichlet_boundaries=["left", "right", "bottom"],
-            neumann_boundaries=["top"],
-            mesh_type="rectangle",
-        )
-        
-        # Create graph to get node positions
-        graph_creator = GraphCreator(
-            mesh=mesh,
-            n_neighbors=2,
-            dirichlet_names=["left", "right", "bottom"],
-            neumann_names=["top"],
-            connectivity_method="fem",
-        )
-        # First create a temporary graph to get positions and aux data
-        temp_data, temp_aux = graph_creator.create_graph()
-        
-        # Create Neumann values based on the temporary data
-        neumann_vals = graph_creator.create_neumann_values(
-            pos=temp_data.pos,
-            aux_data=temp_aux,
-            neumann_names=["top"],
-            flux_values={"top": 1},
-            seed=42
-        )
-        dirichlet_vals = create_dirichlet_values(
-            pos=temp_data.pos,
-            aux_data=temp_aux,
-            dirichlet_names=["left", "right", "bottom"],
-            boundary_values={"left": 5.0, "right": 5.0, "bottom": 0.0}
-        )
-        # Create the final graph with Neumann values
-        temp_data, _ = graph_creator.create_graph(neumann_values=neumann_vals, dirichlet_values=dirichlet_vals)
-        
-        # Store Neumann values array for later use
-        problem_neumann_vals = neumann_vals
-        
-        # Vary Gaussian initial condition parameters
-        num_gaussians = np.random.choice(num_gaussians_options)
-        amplitude_range = amplitude_ranges[i % len(amplitude_ranges)]
-        sigma_fraction_range = sigma_fractions[i % len(sigma_fractions)]
-        
-        # Create varied Gaussian initial condition
-        initial_condition = create_gaussian_initial_condition(
-            pos=temp_data.pos,
-            num_gaussians=num_gaussians,
-            amplitude_range=amplitude_range,
-            sigma_fraction_range=sigma_fraction_range,
-            seed=seed + i,  # Different seed for each problem
-            centered=np.random.choice([True, False]),  # Sometimes centered, sometimes not
-            enforce_boundary_conditions=True,
-        )
-        initial_condition = np.zeros_like(initial_condition)
-        
-        # Create problem
-        problem = MeshProblem(
-            mesh=mesh,
-            graph_data=temp_data,
-            initial_condition=initial_condition,
-            alpha=1.0,  # Thermal diffusivity
-            time_config=time_config,
-            mesh_config=mesh_config,
-            problem_id=i,
-        )
-        
-        # Store the Neumann values array for use in training
-        problem.set_neumann_values_array(problem_neumann_vals)
-        problem.set_dirichlet_values_array(dirichlet_vals)
-        
-        
-        # Set boundary conditions
-        problem.set_neumann_values({"top": 1})
-        problem.set_dirichlet_values({"left": 5.0, "right": 5.0, "bottom": 0.0})
-        problem.source_function = None
-
-        # fix initial condition by projecting to satisfy Dirichlet BCs
-        import ngsolve as ng
-        fes = ng.H1(mesh, order=1, dirichlet=problem.mesh_config.dirichlet_pipe)
-        gfu = ng.GridFunction(fes)
-
-        # Set dirichlet boundary conditions
-        boundary_cf = mesh.BoundaryCF(problem.boundary_values, default=0)
-
-        gfu.vec.FV().NumPy()[:] = problem.initial_condition
-        gfu.Set(boundary_cf, definedon=mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
-        problem.initial_condition = gfu.vec.FV().NumPy()
-        problems.append(problem)
-        
-        print(f"Problem {i+1}: {problem.n_nodes} nodes, {problem.n_edges} edges, "
-              f"mesh_size={maxh:.3f}, num_gaussians={num_gaussians}")
-    
-    print(f"Generated {len(problems)} problems successfully!")
-    return problems, time_config
-
 
 def plot_results(predictions, ground_truth, errors, losses, val_losses, save_path="results"):
     """Plot training results."""
@@ -644,7 +522,9 @@ def main():
     Path("results").mkdir(exist_ok=True)
     Path("results/data_driven").mkdir(exist_ok=True)
 
-    all_problems, time_config = generate_multiple_problems(n_problems=2, seed=42)
+    # all_problems, time_config = generate_multiple_problems(n_problems=2, seed=42)
+    mesh_problem, time_config = create_test_problem()
+    all_problems = [mesh_problem, mesh_problem]
     
     # Split problems into train and validation
     train_indices = list(range(1))
@@ -655,7 +535,7 @@ def main():
 
     # Training configuration
     config = {
-        "epochs": 100,  # Reduced for testing
+        "epochs": 500,  # Reduced for testing
         "lr": 1e-3,
         "time_config": time_config,
         "time_window": 20,

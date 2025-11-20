@@ -8,13 +8,13 @@ from typing import Optional, List, Dict, Tuple
 from torch_geometric.data import Data
 
 try:
-    from mesh_utils import build_graph_from_mesh, create_free_node_subgraph, create_neumann_values, create_dirichlet_values
+    from mesh_utils import build_graph_from_mesh, create_free_node_subgraph, create_neumann_values, create_dirichlet_values, create_robin_values
 except ModuleNotFoundError:
-    from .mesh_utils import build_graph_from_mesh, create_free_node_subgraph, create_neumann_values, create_dirichlet_values
+    from .mesh_utils import build_graph_from_mesh, create_free_node_subgraph, create_neumann_values, create_dirichlet_values, create_robin_values
 
 class GraphCreator:
     def __init__(self, mesh: ng.Mesh, n_neighbors: int = 8, dirichlet_names: List[str] = None, 
-                 neumann_names: List[str] = None, connectivity_method: str = "fem"):
+                 neumann_names: List[str] = None, robin_names: List[str] = None, connectivity_method: str = "fem"):
         """
         Initialize GraphCreator for PI-MGN graph construction.
         
@@ -23,17 +23,19 @@ class GraphCreator:
             n_neighbors: Number of neighbors for k-NN connectivity (ignored for FEM)
             dirichlet_names: List of Dirichlet boundary names
             neumann_names: List of Neumann boundary names
+            robin_names: List of Robin boundary names
             connectivity_method: "fem" (mesh connectivity) or "knn" (k-nearest neighbors)
         """
         self.mesh = mesh
         self.n_neighbors = n_neighbors
         self.dirichlet_names = dirichlet_names or []
         self.neumann_names = neumann_names or []
+        self.robin_names = robin_names or []
         self.connectivity_method = connectivity_method
 
     def create_graph(self, T_current: Optional[np.ndarray] = None, t_scalar: float = 0.0,
                    material_node_field: Optional[np.ndarray] = None, neumann_values: Optional[np.ndarray] = None,
-                   dirichlet_values: Optional[np.ndarray] = None,
+                   dirichlet_values: Optional[np.ndarray] = None, robin_values: Optional[Tuple[np.ndarray, np.ndarray]] = None,
                    add_self_loops: bool = True, device: Optional[torch.device] = None) -> Tuple[Data, Dict]:
         """
         Create PI-MGN graph from mesh according to the paper's methodology.
@@ -44,6 +46,7 @@ class GraphCreator:
             material_node_field: Per-node material properties (N,) - optional  
             neumann_values: Per-node Neumann boundary values (N,) - optional, h_N values for flux BC
             dirichlet_values: Per-node Dirichlet boundary values (N,) - optional, prescribed values for Dirichlet BC
+            robin_values: Tuple of (h_values, amb_values) for Robin BCs - optional
             add_self_loops: Whether to add self-loops to all nodes
             device: Target device for tensors (CPU if None)
             
@@ -55,11 +58,13 @@ class GraphCreator:
             mesh=self.mesh,
             dirichlet_names=self.dirichlet_names,
             neumann_names=self.neumann_names,
+            robin_names=self.robin_names,
             T_current=T_current,
             t_scalar=t_scalar,
             material_node_field=material_node_field,
             neumann_values=neumann_values,
             dirichlet_values=dirichlet_values,
+            robin_values=robin_values,
             connectivity_method=self.connectivity_method,
             n_neighbors=self.n_neighbors,
             add_self_loops=add_self_loops,
@@ -110,6 +115,9 @@ class GraphCreator:
         return create_dirichlet_values(pos, aux_data, dirichlet_names, boundary_values,
                                      temperature_function, homogeneous_value, inhomogeneous_type, seed)
 
+    def create_robin_values(self, pos, aux_data, robin_names, robin_values=None, h_default=1.0, amb_default=0.0, seed=None):
+        return create_robin_values(pos, aux_data, robin_names, robin_values, h_default, amb_default, seed)
+
     def visualize_graph(self, data: Data, aux: Dict, figsize: Tuple[int, int] = (24, 6),
                        node_size: int = 50, edge_alpha: float = 0.6, save_path: Optional[str] = None, only_free_nodes: bool = False):
         """
@@ -137,14 +145,14 @@ class GraphCreator:
         if only_free_nodes:
             # For free node subgraphs, all nodes are interior (green)
             node_colors = ['green'] * data.num_nodes
-            node_type_counts = {0: 0, 1: 0, 2: data.num_nodes}  # No Dirichlet/Neumann in free nodes
+            node_type_counts = {0: 0, 1: 0, 2: data.num_nodes, 3: 0}  # No Dirichlet/Neumann/Robin in free nodes
         else:
             # For full graphs, use the node types from aux
             node_types = aux['node_types'].numpy()
             # Ensure we only process as many node types as we have nodes in the graph
             node_types = node_types[:data.num_nodes]
             node_colors = []
-            node_type_counts = {0: 0, 1: 0, 2: 0}
+            node_type_counts = {0: 0, 1: 0, 2: 0, 3: 0}
             
             for node_type in node_types:
                 if node_type == 0:  # Dirichlet
@@ -153,6 +161,9 @@ class GraphCreator:
                 elif node_type == 1:  # Neumann
                     node_colors.append('blue')
                     node_type_counts[1] += 1
+                elif node_type == 3:  # Robin
+                    node_colors.append('orange')
+                    node_type_counts[3] += 1
                 else:  # Interior
                     node_colors.append('green')
                     node_type_counts[2] += 1
@@ -173,6 +184,7 @@ class GraphCreator:
         legend_elements = [
             mpatches.Patch(color='red', label=f'Dirichlet ({node_type_counts[0]})'),
             mpatches.Patch(color='blue', label=f'Neumann ({node_type_counts[1]})'),
+            mpatches.Patch(color='orange', label=f'Robin ({node_type_counts[3]})'),
             mpatches.Patch(color='green', label=f'Interior ({node_type_counts[2]})')
         ]
         ax1.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1, 1))
@@ -274,7 +286,7 @@ class GraphCreator:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"Graph visualization saved to: {save_path}")
         
-        plt.show()
+        # plt.show()
     
     def print_graph_stats(self, data: Data, aux: Dict):
         """
@@ -296,22 +308,23 @@ class GraphCreator:
         print(f"  Dirichlet: {(node_types == 0).sum().item()} ({100 * (node_types == 0).sum() / len(node_types):.1f}%)")
         print(f"  Neumann:   {(node_types == 1).sum().item()} ({100 * (node_types == 1).sum() / len(node_types):.1f}%)")
         print(f"  Interior:  {(node_types == 2).sum().item()} ({100 * (node_types == 2).sum() / len(node_types):.1f}%)")
+        print(f"  Robin:     {(node_types == 3).sum().item()} ({100 * (node_types == 3).sum() / len(node_types):.1f}%)")
         
         print(f"\\nFeature Dimensions:")
         print(f"  Node features: {data.x.shape}")
-        print(f"  Feature breakdown: [one_hot(3), T(1), t(1), material(1), neumann(1), dirichlet(1)] = 8 total")
+        print(f"  Feature breakdown: [one_hot(4), T(1), t(1), material(1), neumann(1), dirichlet(1), robin_h(1), robin_amb(1)] = 11 total")
         print(f"  Edge features: {data.edge_attr.shape}")
         print(f"  Global features: {data.global_attr.shape}")
         print(f"  Positions: {data.pos.shape}")
         
-        if data.x.shape[1] > 3:  # Has temperature data
-            temp_values = data.x[:, 3]
+        if data.x.shape[1] > 4:  # Has temperature data (index 4)
+            temp_values = data.x[:, 4]
             print(f"\\nTemperature Field:")
             print(f"  Range: [{temp_values.min():.4f}, {temp_values.max():.4f}]")
             print(f"  Mean: {temp_values.mean():.4f} ± {temp_values.std():.4f}")
         
-        if data.x.shape[1] > 6:  # Has Neumann data
-            neumann_values = data.x[:, 6]  # Neumann values are at index 6
+        if data.x.shape[1] > 7:  # Has Neumann data (index 7)
+            neumann_values = data.x[:, 7]
             neumann_mask = aux['neumann_mask']
             print(f"\\nNeumann Values:")
             print(f"  Range: [{neumann_values.min():.4f}, {neumann_values.max():.4f}]")
@@ -321,8 +334,8 @@ class GraphCreator:
                 neumann_node_values = neumann_values[neumann_mask]
                 print(f"  Neumann nodes range: [{neumann_node_values.min():.4f}, {neumann_node_values.max():.4f}]")
         
-        if data.x.shape[1] > 7:  # Has Dirichlet data
-            dirichlet_values = data.x[:, 7]  # Dirichlet values are at index 7
+        if data.x.shape[1] > 8:  # Has Dirichlet data (index 8)
+            dirichlet_values = data.x[:, 8]
             dirichlet_mask = aux['dirichlet_mask']
             print(f"\\nDirichlet Values:")
             print(f"  Range: [{dirichlet_values.min():.4f}, {dirichlet_values.max():.4f}]")
@@ -331,6 +344,19 @@ class GraphCreator:
             if dirichlet_mask.any():
                 dirichlet_node_values = dirichlet_values[dirichlet_mask]
                 print(f"  Dirichlet nodes range: [{dirichlet_node_values.min():.4f}, {dirichlet_node_values.max():.4f}]")
+
+        if data.x.shape[1] > 10:  # Has Robin data (indices 9, 10)
+            h_values = data.x[:, 9]
+            amb_values = data.x[:, 10]
+            robin_mask = aux.get('robin_mask', torch.zeros_like(node_types, dtype=torch.bool))
+            print(f"\\nRobin Values:")
+            print(f"  h Range: [{h_values.min():.4f}, {h_values.max():.4f}]")
+            print(f"  Amb Range: [{amb_values.min():.4f}, {amb_values.max():.4f}]")
+            if robin_mask.any():
+                h_node_values = h_values[robin_mask]
+                amb_node_values = amb_values[robin_mask]
+                print(f"  Robin nodes h range: [{h_node_values.min():.4f}, {h_node_values.max():.4f}]")
+                print(f"  Robin nodes amb range: [{amb_node_values.min():.4f}, {amb_node_values.max():.4f}]")
     
     def _pyg_to_networkx(self, data: Data) -> nx.Graph:
         """

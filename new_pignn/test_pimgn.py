@@ -9,12 +9,19 @@ from argparse import Namespace
 from typing import List
 
 # Import our modules
+from logger import TrainingLogger
 from meshgraphnet import MeshGraphNet
 from fem import FEMSolver
 from mesh_utils import create_dirichlet_values, create_rectangular_mesh, create_free_node_subgraph, create_gaussian_initial_condition
 from graph_creator import GraphCreator
 from containers import TimeConfig, MeshConfig, MeshProblem
 from torch_geometric.data import Data
+from train_problems import (
+    create_test_problem,
+    generate_multiple_problems,
+    create_lshaped_problem,
+    create_nonlinear_rectangular_problem,
+)
 
 class PIMGNTrainer:
     """Trainer for Physics-Informed MeshGraphNet (PIMGN)."""
@@ -25,7 +32,7 @@ class PIMGNTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Time bundling configuration
-        self.time_window = config.get('time_window', 5)
+        self.time_window = config.get('time_window', 20)
         
         # Create FEM solvers for physics-informed loss computation for all problems
         self.all_fem_solvers: List[FEMSolver] = []
@@ -44,9 +51,15 @@ class PIMGNTrainer:
         )
         
         # Create sample graph to get dimensions
+        material_field = getattr(first_problem, 'material_field', None)
+        neumann_vals = getattr(first_problem, 'neumann_values_array', None)
+        dirichlet_vals = getattr(first_problem, 'dirichlet_values_array', None)
         sample_data, aux = graph_creator.create_graph(
             T_current=first_problem.initial_condition,
-            t_scalar=0.0
+            t_scalar=0.0,
+            material_node_field=material_field,
+            neumann_values=neumann_vals,
+            dirichlet_values=dirichlet_vals
         )
 
         free_node_data, mapping, new_aux = graph_creator.create_free_node_subgraph(
@@ -77,6 +90,17 @@ class PIMGNTrainer:
         self.losses = []
         self.val_losses = []
 
+        # Initialize logger
+        save_dir = config.get("save_dir", "results")
+        log_filename = config.get("log_filename", "training_log.json")
+        save_interval = config.get("save_interval", None)
+        save_epoch_interval = config.get("save_epoch_interval", None)
+        
+        self.logger = TrainingLogger(save_dir=save_dir, filename=log_filename, save_interval=save_interval, save_epoch_interval=save_epoch_interval)
+        self.logger.log_config(config)
+        self.logger.set_device(self.device)
+        self.logger.log_problems(problems)
+
         # Generate ground truth for validation
         if config.get('generate_ground_truth_for_validation', False):
             print("Generating ground truth for validation...")
@@ -89,7 +113,7 @@ class PIMGNTrainer:
             self.all_ground_truth = None
     
     
-    def compute_physics_informed_loss(self, predictions_bundled_free, t_current, dt, problem_idx, aux=None, node_mapping=None):
+    def compute_physics_informed_loss(self, predictions_bundled_free, t_current, dt, problem_idx, aux=None, node_mapping=None, start_time: float = 0.0):
         """
         Compute FEM loss following the paper's methodology.
         
@@ -119,10 +143,12 @@ class PIMGNTrainer:
                 t_prev[free_to_original] = prev_prediction_free.to(dtype=torch.float64)
             
             # Compute FEM residual (element-wise errors)
+            time_for_step = start_time + t_idx * dt
             residual = fem_solver.compute_residual(
                 t_pred_next=prediction_full_t,
                 t_prev=t_prev,
-                problem=problem
+                problem=problem,
+                time_scalar=float(time_for_step)
             )
             
             all_residuals.append(residual)
@@ -132,7 +158,9 @@ class PIMGNTrainer:
         
         # Compute MSE over all (N_TB × N_free_dofs) values
         # Note: N_free_dofs corresponds to N_test_functions in the paper
-        fem_loss = torch.mean(all_residuals_stacked ** 2)
+        fem_loss = torch.mean(all_residuals_stacked)
+
+        self.last_residuals = all_residuals_stacked.detach().cpu().numpy()
         
         return fem_loss
     
@@ -155,12 +183,14 @@ class PIMGNTrainer:
         # Get the Neumann values for this problem
         neumann_vals = getattr(problem, 'neumann_values_array', None)
         dirichlet_vals = getattr(problem, 'dirichlet_values_array', None)
+        material_field = getattr(problem, 'material_field', None)
         
         self.optimizer.zero_grad()
         # Build full graph from current state
         data, aux = graph_creator.create_graph(
             T_current=t_current,
             t_scalar=current_time,
+            material_node_field=material_field,
             neumann_values=neumann_vals,
             dirichlet_values=dirichlet_vals
         )
@@ -185,7 +215,8 @@ class PIMGNTrainer:
             dt,
             problem_idx,
             aux,
-            node_mapping
+            node_mapping,
+            start_time=float(current_time)
         )
         physics_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -200,7 +231,9 @@ class PIMGNTrainer:
         next_state_full = np.zeros(problem.n_nodes, dtype=np.float32)
         free_to_original = node_mapping["free_to_original"].cpu().numpy()
         next_state_full[free_to_original] = next_state_free
-        # Dirichlet nodes remain zero
+        if dirichlet_vals is not None:
+            dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
+            next_state_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
 
         return physics_loss.item(), next_state_full, predictions_bundled_np
 
@@ -249,6 +282,9 @@ class PIMGNTrainer:
                 val_loss = self.validate(val_problems_indices)
                 self.val_losses.append(val_loss)
             
+            elapsed = time.time() - epoch_start
+            self.logger.log_epoch(epoch, avg_epoch_loss, val_loss, elapsed)
+            
             if epoch % 10 == 0:
                 elapsed = time.time() - epoch_start
                 val_str = f" | Val Loss: {val_loss:.3e}" if val_loss is not None else ""
@@ -292,7 +328,10 @@ class PIMGNTrainer:
                     # Build graph and make prediction
                     data, aux = graph_creator.create_graph(
                         T_current=t_current,
-                        t_scalar=current_time
+                        t_scalar=current_time,
+                        material_node_field=getattr(problem, 'material_field', None),
+                        neumann_values=getattr(problem, 'neumann_values_array', None),
+                        dirichlet_values=getattr(problem, 'dirichlet_values_array', None)
                     )
                     
                     free_data, node_mapping, free_aux = graph_creator.create_free_node_subgraph(
@@ -311,7 +350,8 @@ class PIMGNTrainer:
                         dt,
                         problem_idx,
                         aux,
-                        node_mapping
+                        node_mapping,
+                        start_time=float(current_time)
                     )
                     
                     total_loss += physics_loss.item()
@@ -330,6 +370,7 @@ class PIMGNTrainer:
             n_steps = len(problem.time_config.time_steps)
 
         time_steps = problem.time_config.time_steps
+        time_steps_bundled = np.array_split(time_steps, len(time_steps) // self.time_window)
 
         # Start with initial condition
         T_current = problem.initial_condition.copy()
@@ -346,15 +387,19 @@ class PIMGNTrainer:
         # Get the Neumann values for this problem
         neumann_vals = getattr(problem, 'neumann_values_array', None)
         dirichlet_vals = getattr(problem, 'dirichlet_values_array', None)
+        material_field = getattr(problem, 'material_field', None)
 
         with torch.no_grad():
             step_idx = 0
-            while step_idx < len(time_steps) - 1:
-                current_time = time_steps[step_idx]
-
+            for batch_idx, batch_times in enumerate(time_steps_bundled):
+                starting_time_step = 0 if step_idx == 0 else batch_times[0]
                 # Build graph
                 data, aux = graph_creator.create_graph(
-                    T_current=T_current, t_scalar=current_time, neumann_values=neumann_vals, dirichlet_values=dirichlet_vals
+                    T_current=T_current,
+                    t_scalar=batch_times[0],
+                    material_node_field=material_field,
+                    neumann_values=neumann_vals,
+                    dirichlet_values=dirichlet_vals
                 )
                 free_graph, node_mapping, free_aux = (
                     graph_creator.create_free_node_subgraph(data, aux)
@@ -369,14 +414,11 @@ class PIMGNTrainer:
                 free_idx = node_mapping["free_to_original"].detach().cpu().numpy()
                 dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
                 # Add each predicted time step
-                for t_idx in range(self.time_window):
-                    if step_idx + 1 + t_idx >= n_steps:
-                        print(f"Warning: Exceeded rollout steps at {step_idx + 1 + t_idx}")
-                        break
+                for time_idx, current_time in enumerate(batch_times):
 
                     next_full = np.zeros(problem.n_nodes, dtype=np.float32)
                     pred_t = (
-                        predictions_bundled[:, t_idx].squeeze().detach().cpu().numpy()
+                        predictions_bundled[:, time_idx].squeeze().detach().cpu().numpy()
                     )
                     next_full[free_idx] = pred_t
                     next_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
@@ -391,8 +433,8 @@ class PIMGNTrainer:
                     T_to_use[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
                     T_current = T_to_use
 
-                # Move forward by time_window steps
-                step_idx += self.time_window
+                # Move forward to the next batch
+                step_idx += 1
 
         return predictions[:n_steps]
     
@@ -445,6 +487,10 @@ class PIMGNTrainer:
             avg_errors = np.mean([np.mean(errors) for errors in all_errors])
             final_errors = np.mean([errors[-1] for errors in all_errors])
             print(f"\nOverall - Average L2 error: {avg_errors:.6f}, Final L2 error: {final_errors:.6f}")
+            
+            self.logger.log_evaluation(all_errors, "l2_errors_per_problem")
+            self.logger.log_evaluation(avg_errors, "mean_l2_error")
+            self.logger.log_evaluation(final_errors, "mean_final_l2_error")
         
         return all_predictions, all_ground_truth, all_errors
     
@@ -483,235 +529,24 @@ class PIMGNTrainer:
             final_errors = np.mean([errors[-1] for errors in all_errors])
             print(f"\nOverall - Average L2 error: {avg_errors:.6f}, Final L2 error: {final_errors:.6f}")
 
+            self.logger.log_evaluation(all_errors, "l2_errors_per_problem")
+            self.logger.log_evaluation(avg_errors, "mean_l2_error")
+            self.logger.log_evaluation(final_errors, "mean_final_l2_error")
+
         return all_errors
 
-def create_test_problem():
-    """Create a simple test problem for PIMGN training."""
-    print("Creating test problem for Physics-Informed training...")
-    
-    # Time configuration
-    time_config = TimeConfig(
-        dt=0.01,
-        t_final=1.0
-    )
-    maxh = 0.1  # Mesh element size
-    # Create rectangular mesh
-    mesh = create_rectangular_mesh(width=1.0, height=1.0, maxh=maxh)
+    def save_logs(self, filename="training_log.json"):
+        self.logger.save(filename)
 
-    dirichlet_boundaries = ["bottom", "right", "top", "left"]
-    neumann_boundaries = []
-    dirichlet_boundaries_dict = {"bottom": 0, "right": 0, "top": 0, "left": 0}
-    neumann_boundaries_dict = {}
-
-    # Mesh configuration
-    mesh_config = MeshConfig(
-        maxh=maxh,
-        order=1,
-        dim=2,
-        dirichlet_boundaries=dirichlet_boundaries,
-        neumann_boundaries=neumann_boundaries,
-        mesh_type="rectangle"
-    )
-    
-    # Create graph to get node positions
-    graph_creator = GraphCreator(
-        mesh=mesh,
-        n_neighbors=2,
-        dirichlet_names=dirichlet_boundaries,
-        neumann_names=neumann_boundaries,
-        connectivity_method="fem"
-    )
-    # First create a temporary graph to get positions and aux data
-    temp_data, temp_aux = graph_creator.create_graph()
-    
-    # Create Neumann values based on the temporary data
-    neumann_vals = graph_creator.create_neumann_values(
-        pos=temp_data.pos,
-        aux_data=temp_aux,
-        neumann_names=neumann_boundaries,
-        flux_values=neumann_boundaries_dict,
-        seed=42
-    )
-    dirichlet_vals = create_dirichlet_values(
-        pos=temp_data.pos,
-        aux_data=temp_aux,
-        dirichlet_names=dirichlet_boundaries,
-        boundary_values=dirichlet_boundaries_dict
-    )
-    
-    # Create the final graph with Neumann values
-    temp_data, _ = graph_creator.create_graph(neumann_values=neumann_vals, dirichlet_values=dirichlet_vals)
-    
-    # Create Gaussian initial condition
-    initial_condition = create_gaussian_initial_condition(
-        pos=temp_data.pos,
-        num_gaussians=1,
-        amplitude_range=(10.0, 10.0),
-        sigma_fraction_range=(0.2, 0.2),
-        seed=42,
-        centered=True,
-        enforce_boundary_conditions=True,
-    )
-    # initial_condition = np.zeros_like(initial_condition)
-    
-    # Create problem
-    problem = MeshProblem(
-        mesh=mesh,
-        graph_data=temp_data,
-        initial_condition=initial_condition,
-        alpha=1.0,  # Thermal diffusivity
-        time_config=time_config,
-        mesh_config=mesh_config,
-        problem_id=0
-    )
-    
-    # Store the Neumann values array for later use
-    problem.set_neumann_values_array(neumann_vals)
-    problem.set_dirichlet_values_array(dirichlet_vals)
-    
-    # Set boundary conditions
-    problem.set_neumann_values(neumann_boundaries_dict)
-    problem.set_dirichlet_values(dirichlet_boundaries_dict)
-    problem.source_function = None
-    # project initial condition onto FEM space to enforce Dirichlet BCs
-    import ngsolve as ng
-    fes = ng.H1(mesh, order=1, dirichlet=problem.mesh_config.dirichlet_pipe)
-    gfu = ng.GridFunction(fes)
-    gfu_initial = ng.GridFunction(fes)
-
-    # Set initial condition on the interior
-    gfu_initial.vec.FV().NumPy()[:] = problem.initial_condition
-
-    # Set Dirichlet boundary conditions
-    boundary_cf = mesh.BoundaryCF(problem.boundary_values, default=0)
-    gfu.Set(boundary_cf, definedon=mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
-
-    # Copy initial condition values for free DOFs only
-    free_dofs = fes.FreeDofs()
-    for dof in range(fes.ndof):
-        if free_dofs[dof]:
-            gfu.vec[dof] = gfu_initial.vec[dof]
-    problem.initial_condition = gfu.vec.FV().NumPy()
-    
-    print(f"Problem created with {problem.n_nodes} nodes and {problem.n_edges} edges")
-    print(f"Time steps: {len(time_config.time_steps)}, dt: {time_config.dt}")
-    
-    return problem, time_config
-
-
-def generate_multiple_problems(n_problems=15, seed=42):
-    """Generate multiple problems with varying mesh sizes and Gaussian initial conditions."""
-    print(f"Generating {n_problems} problems with varying parameters...")
-    
-    np.random.seed(seed)
-    problems = []
-    
-    # Define parameter ranges
-    mesh_sizes = np.linspace(0.05, 0.15, 5)  # 5 different mesh sizes
-    num_gaussians_options = [1, 2, 3]  # 1-3 Gaussians
-    amplitude_ranges = [(5, 15), (1.0, 2.0), (0.8, 1.2)]  # Different amplitude ranges
-    sigma_fractions = [(0.1, 0.3), (0.15, 0.25), (0.2, 0.4)]  # Different width ranges
-    
-    # Time configuration (same for all problems)
-    time_config = TimeConfig(dt=0.01, t_final=1.0)
-    
-    for i in range(n_problems):
-        # Vary mesh size
-        maxh = np.random.choice(mesh_sizes)
-        
-        # Create rectangular mesh
-        mesh = create_rectangular_mesh(width=1.0, height=1.0, maxh=maxh)
-        
-        # Mesh configuration
-        mesh_config = MeshConfig(
-            maxh=maxh,
-            order=1,
-            dim=2,
-            dirichlet_boundaries=["left", "right", "bottom"],
-            neumann_boundaries=["top"],
-            mesh_type="rectangle",
-        )
-        
-        # Create graph to get node positions
-        graph_creator = GraphCreator(
-            mesh=mesh,
-            n_neighbors=2,
-            dirichlet_names=["left", "right", "bottom"],
-            neumann_names=["top"],
-            connectivity_method="fem",
-        )
-        # First create a temporary graph to get positions and aux data
-        temp_data, temp_aux = graph_creator.create_graph()
-        
-        # Create Neumann values based on the temporary data
-        neumann_vals = graph_creator.create_neumann_values(
-            pos=temp_data.pos,
-            aux_data=temp_aux,
-            neumann_names=["top"],
-            flux_magnitude=1.0,
-            seed=42
-        )
-        
-        # Create the final graph with Neumann values
-        temp_data, _ = graph_creator.create_graph(neumann_values=neumann_vals)
-        
-        # Store Neumann values array for later use
-        problem_neumann_vals = neumann_vals
-        
-        # Vary Gaussian initial condition parameters
-        num_gaussians = np.random.choice(num_gaussians_options)
-        amplitude_range = amplitude_ranges[i % len(amplitude_ranges)]
-        sigma_fraction_range = sigma_fractions[i % len(sigma_fractions)]
-        
-        # Create varied Gaussian initial condition
-        initial_condition = create_gaussian_initial_condition(
-            pos=temp_data.pos,
-            num_gaussians=num_gaussians,
-            amplitude_range=amplitude_range,
-            sigma_fraction_range=sigma_fraction_range,
-            seed=seed + i,  # Different seed for each problem
-            centered=np.random.choice([True, False]),  # Sometimes centered, sometimes not
-            enforce_boundary_conditions=True,
-        )
-        # initial_condition = np.zeros_like(initial_condition)
-        
-        # Create problem
-        problem = MeshProblem(
-            mesh=mesh,
-            graph_data=temp_data,
-            initial_condition=initial_condition,
-            alpha=1.0,  # Thermal diffusivity
-            time_config=time_config,
-            mesh_config=mesh_config,
-            problem_id=i,
-        )
-        
-        # Store the Neumann values array for use in training
-        problem.set_neumann_values_array(problem_neumann_vals)
-        
-        # Set boundary conditions
-        problem.set_neumann_values({"top": 1})
-        problem.set_dirichlet_values({"left": 0.0, "right": 0.0, "bottom": 0.0})
-        problem.source_function = None
-        
-        problems.append(problem)
-        
-        print(f"Problem {i+1}: {problem.n_nodes} nodes, {problem.n_edges} edges, "
-              f"mesh_size={maxh:.3f}, num_gaussians={num_gaussians}")
-    
-    print(f"Generated {len(problems)} problems successfully!")
-    return problems, time_config
-
-
-def plot_results(predictions, ground_truth, errors, losses, val_losses, save_path="results"):
+def plot_results(errors, losses, val_losses, last_residuals, pos_data, save_path="results"):
     """Plot training results."""
     Path(save_path).mkdir(exist_ok=True)
 
     # Plot results
-    plt.figure(figsize=(20, 4))
+    plt.figure(figsize=(8, 6))
 
     # Training and validation loss
-    plt.subplot(1, 4, 1)
+    plt.subplot(2, 2, 1)
     plt.plot(losses, label='Training')
     if val_losses:
         plt.plot(val_losses, label='Validation')
@@ -723,7 +558,7 @@ def plot_results(predictions, ground_truth, errors, losses, val_losses, save_pat
     plt.grid(True)
 
     # L2 error over time for first problem (if errors exist)
-    plt.subplot(1, 4, 2)
+    plt.subplot(2, 2, 2)
     if errors and len(errors) > 0:
         plt.plot(errors[0])
         plt.xlabel("Time Step")
@@ -738,7 +573,7 @@ def plot_results(predictions, ground_truth, errors, losses, val_losses, save_pat
         plt.title("L2 Error over Time")
 
     # Average L2 error across all test problems (if errors exist)
-    plt.subplot(1, 4, 3)
+    plt.subplot(2, 2, 3)
     if errors and len(errors) > 0:
         avg_errors = [np.mean(error_list) for error_list in errors]
         plt.bar(range(1, len(avg_errors) + 1), avg_errors)
@@ -753,186 +588,309 @@ def plot_results(predictions, ground_truth, errors, losses, val_losses, save_pat
                 transform=plt.gca().transAxes)
         plt.title("Average L2 Error per Problem")
 
-    # Predictions vs ground truth for first problem, first few time steps (if available)
-    plt.subplot(1, 4, 4)
-    if predictions and ground_truth:
-        # Handle case where predictions/ground_truth might be lists
-        pred_data = predictions[0] if isinstance(predictions[0], list) else predictions
-        gt_data = ground_truth[0] if isinstance(ground_truth[0], list) else ground_truth
+    # Last residuals heatmap
+    plt.subplot(2, 2, 4)
+    if last_residuals is not None and last_residuals.size > 0:
+        from scipy.interpolate import griddata
         
-        num_plots = min(4, len(pred_data))
-        for i in range(1, num_plots):
-            plt.scatter(gt_data[i], pred_data[i], alpha=0.5, label=f"Time Step {i}")
+        # last_residuals has shape [N_TB, N_free_dofs]
+        # We need to get the positions of the free nodes only
+        # For now, let's take the last time step residuals and use absolute values
+        time_step_idx = min(1, last_residuals.shape[0] - 1)  # Use second time step if available, else first
+        residuals_to_plot = np.abs(last_residuals[time_step_idx])  # [N_free_dofs]
         
-        if num_plots > 1:
-            max_overall = max(np.max(gt_data[num_plots-1]), np.max(pred_data[num_plots-1]))
-            plt.plot([0, max_overall], [0, max_overall], "k--", label="Ideal")
+        # For this to work properly, we would need to know which nodes are free
+        # Since we don't have that mapping here, let's check if dimensions match
+        if len(residuals_to_plot) == len(pos_data):
+            # Dimensions match - use all positions
+            pos_to_use = pos_data
+            residuals_final = residuals_to_plot
+        elif len(residuals_to_plot) < len(pos_data):
+            # More positions than residuals - assume first N positions are free nodes
+            pos_to_use = pos_data[:len(residuals_to_plot)]
+            residuals_final = residuals_to_plot
+        else:
+            # More residuals than positions - shouldn't happen, but handle gracefully
+            print(f"Warning: Residuals shape {residuals_to_plot.shape} doesn't match pos_data shape {pos_data.shape}")
+            pos_to_use = pos_data
+            residuals_final = residuals_to_plot[:len(pos_data)]
         
-        plt.title("Predictions vs Ground Truth (Problem 1)")
-        plt.xlabel("Ground Truth Temperature")
-        plt.ylabel("Predicted Temperature")
-        plt.legend()
-        plt.grid(True)
-    else:
-        plt.text(0.5, 0.5, 'No prediction/ground truth data', 
+        x_min, x_max = pos_to_use[:, 0].min(), pos_to_use[:, 0].max()
+        y_min, y_max = pos_to_use[:, 1].min(), pos_to_use[:, 1].max()
+        
+        # Add small padding to avoid edge effects
+        padding = 0.05
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        x_min -= padding * x_range
+        x_max += padding * x_range
+        y_min -= padding * y_range
+        y_max += padding * y_range
+        
+        # Create grid
+        grid_resolution = 100
+        xi = np.linspace(x_min, x_max, grid_resolution)
+        yi = np.linspace(y_min, y_max, grid_resolution)
+        XI, YI = np.meshgrid(xi, yi)
+        
+        try:
+            ZI = griddata((pos_to_use[:, 0], pos_to_use[:, 1]), residuals_final, 
+                            (XI, YI), method='cubic', fill_value=0)
+            
+            # Create heatmap
+            im = plt.imshow(ZI, extent=[x_min, x_max, y_min, y_max], 
+                            origin='lower', cmap='viridis', aspect='equal')
+            plt.colorbar(im, label='|Residual|')
+            
+            # Overlay scatter points to show actual node locations
+            plt.scatter(pos_to_use[:, 0], pos_to_use[:, 1], 
+                        c='white', s=2, alpha=0.3, edgecolors='black', linewidths=0.1)
+            
+            plt.title(f"FEM Residuals (t_step={time_step_idx})")
+            plt.xlabel("X Position")
+            plt.ylabel("Y Position")
+            plt.axis('equal')
+            
+        except Exception as e:
+            print(f"Error creating residual heatmap: {e}")
+            plt.text(0.5, 0.5, f'Error plotting residuals:\n{str(e)}', 
+                    horizontalalignment='center', verticalalignment='center', 
+                    transform=plt.gca().transAxes)
+            plt.title("FEM Residuals (Error)")
+            
+    elif last_residuals is not None:
+        plt.text(0.5, 0.5, f'Empty residual data\nShape: {last_residuals.shape}', 
                 horizontalalignment='center', verticalalignment='center', 
                 transform=plt.gca().transAxes)
-        plt.title("Predictions vs Ground Truth")
+        plt.title("FEM Residuals (Empty)")
+    else:
+        plt.text(0.5, 0.5, 'No residual data available', 
+                horizontalalignment='center', verticalalignment='center', 
+                transform=plt.gca().transAxes)
+        plt.title("FEM Residuals (None)")
 
     plt.tight_layout()
     plt.savefig(f"{save_path}/pimgn_results.png", dpi=150)
-    plt.show()
+    # plt.show()
 
-
-def main():
-    """Main function to run Physics-Informed MeshGraphNet training and evaluation."""
+def train_pimgn_on_multiple_problems():
+    """Train Physics-Informed MeshGraphNet on multiple problems."""
     print("=" * 60)
-    print("PHYSICS-INFORMED MESHGRAPHNET (PIMGN) TEST")
+    print("PHYSICS-INFORMED MESHGRAPHNET (PIMGN) TRAINING ON MULTIPLE PROBLEMS")
     print("=" * 60)
     
     # Create results directory
     Path("results").mkdir(exist_ok=True)
     Path("results/physics_informed").mkdir(exist_ok=True)
     
-    # Configuration for training mode
-    use_multiple_problems = False  # Set to True for multi-problem training, False for single problem
+    print("=" * 40)
     
-    if use_multiple_problems:
-        print("MULTI-PROBLEM PHYSICS-INFORMED TRAINING")
-        print("=" * 40)
-        
-        # Generate multiple problems (12 training + 3 validation)
-        all_problems, time_config = generate_multiple_problems(n_problems=15, seed=42)
-        
-        # Split problems into train and validation
-        train_indices = list(range(1))  # First 12 problems for training
-        val_indices = list(range(1, 2))  # Last 3 problems for validation
-        
-        print(f"Training problems: {train_indices}")
-        print(f"Validation problems: {val_indices}")
-        
-        # Training configuration
-        config = {
-            'epochs': 1,  # Physics-informed training epochs (reduced for faster testing)
-            'lr': 1e-3,     # Learning rate for stable physics-informed training
-            'time_window': 20,  # Time bundling window
-            'generate_ground_truth_for_validation': True,  # Generate ground truth for validation
-        }
-        
-        print(f"Training configuration:")
-        print(f"  Epochs: {config['epochs']}")
-        print(f"  Learning rate: {config['lr']}")
-        print(f"  Time window: {config['time_window']}")
-        print(f"  Time steps: {time_config.num_steps}")
-        print(f"  dt: {time_config.dt}")
-        print(f"  Physics-informed loss: FEM residual with temporal bundling")
-        print(f"  Number of problems: {len(all_problems)}")
-        
-        # Create PIMGN trainer with multiple problems
-        trainer = PIMGNTrainer(all_problems, config)
-        
-        # Train model with physics-informed loss on multiple problems
-        print("\nStarting multi-problem physics-informed training...")
-        trainer.train(train_indices, val_indices)
-        
-        # Evaluate model on validation problems
-        print("\nEvaluating on validation problems:")
-        val_errors = trainer.evaluate(problem_indices=val_indices)
-        
-        # Evaluate model on training problems (to check for overfitting)
-        print("\nEvaluating on sample training problems:")
-        train_errors = trainer.evaluate(problem_indices=train_indices[:3])  # Just first 3 for efficiency
-        
-        # Get predictions for first validation problem for visualization
-        predictions_val = trainer.rollout(problem_idx=val_indices[0])
+    # Generate multiple problems
+    n_problems = 5
+    all_problems, time_config = generate_multiple_problems(n_problems=n_problems, seed=42)
     
-        fem_solver = trainer.all_fem_solvers[val_indices[0]]
-        ground_truth = fem_solver.solve_transient_problem(all_problems[val_indices[0]])
-        
-        # Plot results with validation comparison
-        plot_results([predictions_val], [ground_truth], val_errors, trainer.losses, trainer.val_losses, save_path="results/physics_informed")
-        
-        # Export results for first validation problem
-        print("Exporting results for first validation problem...")
-        
-        
-        # Generate ground truth for visualization
-        ground_truth_val = fem_solver.solve_transient_problem(all_problems[val_indices[0]])
-        
-        # Ensure all arrays have the same length for export
-        min_length = min(
-            len(ground_truth_val), 
-            len(predictions_val), 
-            len(time_config.time_steps_export)
-        )
-        
-        fem_solver.export_to_vtk(
-            ground_truth_val[:min_length],
-            predictions_val[:min_length],
-            time_config.time_steps_export[:min_length],
-            filename="results/physics_informed/pimgn_multiproblem_comparison.vtk",
-        )
-        
-    else:
-        print("SINGLE-PROBLEM PHYSICS-INFORMED TRAINING")
-        print("=" * 40)
-        
-        # Create single test problem
-        problem, time_config = create_test_problem()
-        all_problems = [problem]
-        
-        # Training configuration
-        config = {
-            'epochs': 300,  # Physics-informed training epochs (reduced for faster testing)
-            'lr': 1e-3,     # Learning rate for stable physics-informed training
-            'time_window': 20,  # Time bundling window
-            'generate_ground_truth_for_validation': False,  # Don't need validation for single problem
-        }
-        
-        print(f"Training configuration:")
-        print(f"  Epochs: {config['epochs']}")
-        print(f"  Learning rate: {config['lr']}")
-        print(f"  Time window: {config['time_window']}")
-        print(f"  Time steps: {time_config.num_steps}")
-        print(f"  dt: {time_config.dt}")
-        print(f"  Physics-informed loss: FEM residual with temporal bundling")
-        
-        # Create PIMGN trainer
-        trainer = PIMGNTrainer(all_problems, config)
-        
-        # Train model with physics-informed loss
-        print("\nStarting physics-informed training...")
-        trainer.train(train_problems_indices=[0])  # Only train on the single problem
-        
-        # Evaluate model
-        print("\nEvaluating trained PIMGN...")
-        try:
-            predictions, ground_truth, errors = trainer.evaluate_with_ground_truth(problem_indices=[0])
-            
-            # Plot results with ground truth comparison
-            plot_results(predictions[0], ground_truth[0], errors, trainer.losses, [], save_path="results/physics_informed")
-            
-            # Export results for visualization
-            print("Exporting results...")
-            min_length = min(len(ground_truth[0]), len(predictions[0]), len(time_config.time_steps_export))
-            trainer.all_fem_solvers[0].export_to_vtk(
-                ground_truth[0][:min_length], 
-                predictions[0][:min_length], 
-                time_config.time_steps_export[:min_length], 
-                filename="results/physics_informed/pimgn_single_comparison.vtk"
-            )
-            
-        except Exception as e:
-            print(f"Ground truth evaluation failed: {e}")
-            print("Performing rollout evaluation without ground truth...")
-            
-            # Just get predictions without ground truth comparison
-            predictions = trainer.rollout(problem_idx=0)
-            plot_results([predictions], None, None, trainer.losses, None, save_path="results/physics_informed")
+    # Training configuration
+    config = {
+        'epochs': 10,
+        'lr': 1e-3,
+        'time_window': 20,
+        'generate_ground_truth_for_validation': True,
+        'save_interval': 300,
+        'save_epoch_interval': 100,
+        'log_filename': "pimgn_multiple_problems_log.json"
+    }
     
-    print("Physics-Informed MeshGraphNet test completed!")
-    print(f"Results saved to: results/physics_informed/")
+    print(f"Training configuration:")
+    print(f"  Epochs: {config['epochs']}")
+    print(f"  Learning rate: {config['lr']}")
+    print(f"  Time window: {config['time_window']}")
+    print(f"  Time steps: {time_config.num_steps}")
+    print(f"  dt: {time_config.dt}")
+    print(f"  Physics-informed loss: FEM residual with temporal bundling")
+    
+    # Create PIMGN trainer
+    trainer = PIMGNTrainer(all_problems, config)
+    
+    # Train model with physics-informed loss
+    print("\nStarting physics-informed training...")
+    train_indices = list(range(n_problems - 1))  # Last for validation
+    val_indices = list(range(n_problems - 1, n_problems))
+    trainer.train(train_problems_indices=train_indices, val_problems_indices=val_indices)
+    
+    # Evaluate model
+    print("\nEvaluating trained PIMGN...")
+    last_residuals = trainer.last_residuals
+    pos_data = trainer.problems[0].graph_data.pos.numpy()
+    predictions, ground_truth, errors = trainer.evaluate_with_ground_truth(problem_indices=val_indices)
+    
+    # Plot results with ground truth comparison
+    plot_results(errors, trainer.losses, trainer.val_losses, last_residuals, pos_data, save_path="results/physics_informed")
+    trainer.save_logs()
+    min_length = min(len(ground_truth[0]), len(predictions[0]), len(time_config.time_steps_export))
+    trainer.all_fem_solvers[-1].export_to_vtk(
+        ground_truth[0][:min_length], 
+        predictions[0][:min_length], 
+        time_config.time_steps_export[:min_length], 
+        filename="results/physics_informed/pimgn_single_comparison.vtk",
+        material_field=getattr(trainer.problems[-1], 'material_field', None)
+    )
 
+    print("maxh for last problem:", trainer.problems[-1].mesh_config.maxh)
+
+    model_path = "results/physics_informed/pimgn_trained_model.pth"
+    torch.save(trainer.model.state_dict(), model_path)
+    print(f"Trained model saved to: {model_path}")
+
+def _run_single_problem_experiment(problem, time_config, config, experiment_name: str):
+    print("=" * 60)
+    print(f"PIMGN TEST - {experiment_name.upper()}")
+    print("=" * 60)
+
+    Path("results").mkdir(exist_ok=True)
+    Path("results/physics_informed").mkdir(exist_ok=True)
+
+    print("=" * 40)
+    print("Training configuration:")
+    print(f"  Epochs: {config['epochs']}")
+    print(f"  Learning rate: {config['lr']}")
+    print(f"  Time window: {config['time_window']}")
+    print(f"  Time steps: {time_config.num_steps}")
+    print(f"  dt: {time_config.dt}")
+    print(f"  Physics-informed loss: FEM residual with temporal bundling")
+
+    config['log_filename'] = f"pimgn_{experiment_name.replace(' ', '_').lower()}_log.json"
+    config['save_interval'] = 300
+    config['save_epoch_interval'] = 100
+
+    trainer = PIMGNTrainer([problem], config)
+
+    print("\nStarting physics-informed training...")
+    trainer.train(train_problems_indices=[0])
+
+    print("\nEvaluating trained PIMGN...")
+    last_residuals = trainer.last_residuals
+    pos_data = trainer.problems[0].graph_data.pos.numpy()
+    try:
+        predictions, ground_truth, errors = trainer.evaluate_with_ground_truth(problem_indices=[0])
+        plot_results(errors, trainer.losses, [], last_residuals, pos_data, save_path="results/physics_informed")
+
+        print("Exporting results...")
+        min_length = min(len(ground_truth[0]), len(predictions[0]), len(time_config.time_steps_export))
+        trainer.all_fem_solvers[0].export_to_vtk(
+            ground_truth[0][:min_length],
+            predictions[0][:min_length],
+            time_config.time_steps_export[:min_length],
+            filename="results/physics_informed/pimgn_single_comparison.vtk",
+            material_field=getattr(trainer.problems[0], 'material_field', None)
+        )
+    except Exception as e:
+        print(f"Ground truth evaluation failed: {e}")
+
+    print("Physics-Informed MeshGraphNet test completed!")
+    print("Results saved to: results/physics_informed/")
+    trainer.save_logs()
+
+    model_path = "results/physics_informed/pimgn_trained_model.pth"
+    torch.save(trainer.model.state_dict(), model_path)
+    print(f"Trained model saved to: {model_path}")
+
+def _run_multiple_problem_experiment(problems, time_config, config, experiment_name: str):
+    print("=" * 60)
+    print(f"PIMGN TEST - {experiment_name.upper()}")
+    print("=" * 60)
+
+    Path("results").mkdir(exist_ok=True)
+    Path("results/physics_informed").mkdir(exist_ok=True)
+
+    print("=" * 40)
+    print("Training configuration:")
+    print(f"  Epochs: {config['epochs']}")
+    print(f"  Learning rate: {config['lr']}")
+    print(f"  Time window: {config['time_window']}")
+    print(f"  Time steps: {time_config.num_steps}")
+    print(f"  dt: {time_config.dt}")
+    print(f"  Physics-informed loss: FEM residual with temporal bundling")
+
+    config['log_filename'] = f"pimgn_{experiment_name.replace(' ', '_').lower()}_log.json"
+    config['save_interval'] = 300
+    config['save_epoch_interval'] = 100
+
+    trainer = PIMGNTrainer(problems, config)
+
+    print("\nStarting physics-informed training...")
+    train_indices = list(range(len(problems) - 1))  # Last for validation
+    val_indices = list(range(len(problems) - 1, len(problems)))
+    trainer.train(train_problems_indices=train_indices, val_problems_indices=val_indices)
+
+    print("\nEvaluating trained PIMGN...")
+    last_residuals = trainer.last_residuals
+    pos_data = trainer.problems[0].graph_data.pos.numpy()
+    predictions, ground_truth, errors = trainer.evaluate_with_ground_truth(problem_indices=val_indices)
+
+    plot_results(errors, trainer.losses, trainer.val_losses, last_residuals, pos_data, save_path="results/physics_informed")
+
+    print("Physics-Informed MeshGraphNet test completed!")
+    print("Results saved to: results/physics_informed/")
+    trainer.save_logs()
+
+    min_length = min(len(ground_truth[0]), len(predictions[0]), len(time_config.time_steps_export))
+    trainer.all_fem_solvers[0].export_to_vtk(
+        ground_truth[0][:min_length],
+        predictions[0][:min_length],
+        time_config.time_steps_export[:min_length],
+        filename="results/physics_informed/pimgn_single_comparison.vtk",
+        material_field=getattr(trainer.problems[0], 'material_field', None)
+    )
+
+    model_path = "results/physics_informed/pimgn_trained_model.pth"
+    torch.save(trainer.model.state_dict(), model_path)
+    print(f"Trained model saved to: {model_path}")
+
+def train_pimgn_on_single_problem():
+    problem, time_config = create_test_problem(maxh=0.2, alpha=3)
+    config = {
+        'epochs': 500,
+        'lr': 1e-3,
+        'time_window': 20,
+        'generate_ground_truth_for_validation': False,
+    }
+    _run_single_problem_experiment(problem, time_config, config, "Test problem")
+
+def train_test_multiple_problems():
+    problems = []
+    time_config = None
+    for i in range(3):
+        problem, time_config = create_test_problem(maxh=0.1, alpha=np.random.uniform(0.1, 5.0))
+        problems.append(problem)
+    config = {
+        'epochs': 100,
+        'lr': 1e-3,
+        'time_window': 20,
+        'generate_ground_truth_for_validation': False,
+    }
+    _run_multiple_problem_experiment(problems, time_config, config, "Multiple test problems")
+
+def train_pimgn_on_nonlinear_rectangular_problem():
+    problems = []
+    time_config = None
+    for _ in range(5):
+        problem, time_config = create_nonlinear_rectangular_problem(maxh=0.1, seed=np.random.randint(0, 10000))
+        problems.append(problem)
+    config = {
+        'epochs': 500,
+        'lr': 1e-3,
+        'time_window': 20,
+        'generate_ground_truth_for_validation': False,
+    }
+    _run_multiple_problem_experiment(problems, time_config, config, "Nonlinear rectangular heating")
+
+def main():
+    """Main function to run Physics-Informed MeshGraphNet training and evaluation."""
+    # Uncomment one of the following lines to run the desired test
+    train_pimgn_on_single_problem()
+    # train_test_multiple_problems()
+    # train_pimgn_on_multiple_problems()
+    # train_pimgn_on_nonlinear_rectangular_problem()
 
 if __name__ == "__main__":
     main()

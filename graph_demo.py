@@ -7,16 +7,19 @@ from new_pignn.mesh_utils import (
     create_gaussian_initial_condition,
     create_neumann_values,
     create_dirichlet_values,
+    create_lshape_mesh,
 )
 
 
 def main():
-    mesh = create_rectangular_mesh(width=1.0, height=0.6, maxh=0.2)
+    mesh = create_lshape_mesh(maxh=0.1)
     n_points = len(list(mesh.ngmesh.Points()))
     print(f"   Created mesh with {n_points} nodes")
 
-    dirichlet_names = ["left", "right"]
-    neumann_names = ["top", "bottom"]
+    dirichlet_names = ["outer"]
+    neumann_names = []
+    dirichlet_boundaries_dict = {"outer": 1}
+    neumann_boundaries_dict = {}
 
     # First create a dummy graph to get positions and auxiliary data
     temp_creator = GraphCreator(
@@ -39,14 +42,12 @@ def main():
         enforce_boundary_conditions=True,
     )
     print(f"   Temperature range: [{T_initial.min():.3f}, {T_initial.max():.3f}]")
-    
-    # Create Neumann values with boundary-specific constant values
-    neumann_boundary_values = {"top": 1, "bottom": 0}  # Constant flux on top boundary
+
     neumann_vals = temp_creator.create_neumann_values(
         temp_data.pos,
         temp_aux,
         neumann_names,
-        flux_values=neumann_boundary_values,
+        flux_values=neumann_boundaries_dict,
         seed=42
     )
     print(f"   Neumann values range: [{neumann_vals.min():.3f}, {neumann_vals.max():.3f}]")
@@ -56,15 +57,11 @@ def main():
         print(f"   Neumann nodes flux range: [{neumann_nodes.min():.3f}, {neumann_nodes.max():.3f}]")
 
     # Create Dirichlet values with boundary-specific constant values
-    dirichlet_boundary_values = {
-        "left": 5,
-        "right": 5,
-    }
     dirichlet_vals = temp_creator.create_dirichlet_values(
         temp_data.pos,
         temp_aux,
         dirichlet_names,
-        boundary_values=dirichlet_boundary_values,
+        boundary_values=dirichlet_boundaries_dict,
         seed=42
     )
     print(f"   Dirichlet values range: [{dirichlet_vals.min():.3f}, {dirichlet_vals.max():.3f}]")
@@ -75,7 +72,7 @@ def main():
 
     creator = GraphCreator(
         mesh,
-        n_neighbors=2,
+        n_neighbors=1,
         dirichlet_names=dirichlet_names,
         neumann_names=neumann_names,
         connectivity_method="fem",
