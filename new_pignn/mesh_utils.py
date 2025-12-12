@@ -27,10 +27,10 @@ def create_rectangular_mesh(
     Create a 2D rectangular mesh with named boundary segments.
     """
     geo = SplineGeometry()
-    p1 = geo.AppendPoint(-width, -height)
-    p2 = geo.AppendPoint(width, -height)
+    p1 = geo.AppendPoint(0, 0)
+    p2 = geo.AppendPoint(width, 0)
     p3 = geo.AppendPoint(width, height)
-    p4 = geo.AppendPoint(-width, height)
+    p4 = geo.AppendPoint(0, height)
 
     geo.Append(["line", p1, p2], bc=bc_bottom)
     geo.Append(["line", p2, p3], bc=bc_right)
@@ -263,6 +263,7 @@ def build_graph_from_mesh(
     neumann_values: Optional[np.ndarray] = None,
     dirichlet_values: Optional[np.ndarray] = None,
     robin_values: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    source_values: Optional[np.ndarray] = None,
     connectivity_method: str = "fem",
     n_neighbors: int = 8,
     add_self_loops: bool = True,
@@ -282,6 +283,7 @@ def build_graph_from_mesh(
         neumann_values: Per-node Neumann boundary values (N,) - optional, h_N values for flux BC
         dirichlet_values: Per-node Dirichlet boundary values (N,) - optional, prescribed values for Dirichlet BC
         robin_values: Tuple of (h_values, amb_values) for Robin BCs - optional
+        source_values: Per-node source term values (N,) - optional, volumetric heat source
         connectivity_method: "fem" (mesh connectivity) or "knn" (k-nearest neighbors)
         n_neighbors: Number of neighbors for k-NN connectivity
         add_self_loops: Whether to add self-loops to all nodes
@@ -315,7 +317,7 @@ def build_graph_from_mesh(
         
     # 4. Build node features
     node_features = _build_node_features(
-        node_types, T_current, t_scalar, material_node_field, neumann_values, dirichlet_values, robin_values, n_nodes, device
+        node_types, T_current, t_scalar, material_node_field, neumann_values, dirichlet_values, robin_values, source_values, n_nodes, device
     )
     
     # 5. Build edge features
@@ -336,6 +338,7 @@ def build_graph_from_mesh(
         'neumann_values': neumann_values,
         'dirichlet_values': dirichlet_values,
         'robin_values': robin_values,
+        'source_values': source_values,
         'mesh': mesh,
         'connectivity_method': connectivity_method
     }
@@ -433,6 +436,7 @@ def create_free_node_subgraph(data: Data, aux: Dict) -> Tuple[Data, Dict, Dict]:
         'neumann_values': aux['neumann_values'][free_indices.cpu().numpy()] if aux['neumann_values'] is not None else None,
         'dirichlet_values': aux['dirichlet_values'][free_indices.cpu().numpy()] if aux['dirichlet_values'] is not None else None,
         'robin_values': robin_values_sub,
+        'source_values': aux['source_values'][free_indices.cpu().numpy()] if aux.get('source_values') is not None else None,
         'mesh': aux['mesh'],
         'connectivity_method': aux['connectivity_method']
     }
@@ -597,12 +601,13 @@ def _build_node_features(
     neumann_values: Optional[np.ndarray],
     dirichlet_values: Optional[np.ndarray],
     robin_values: Optional[Tuple[np.ndarray, np.ndarray]],
+    source_values: Optional[np.ndarray],
     n_nodes: int,
     device: torch.device = None
 ) -> torch.Tensor:
     """
     Build node feature matrix according to PI-MGN methodology.
-    Features: [one_hot_node_type(4), T_current(1), t_scalar(1), material(1), neumann_value(1), dirichlet_value(1), robin_h(1), robin_amb(1)]
+    Features: [one_hot_node_type(4), T_current(1), t_scalar(1), material(1), neumann_value(1), dirichlet_value(1), robin_h(1), robin_amb(1), source(1)]
     """
     if device is None:
         device = node_types.device
@@ -657,6 +662,16 @@ def _build_node_features(
         amb_tensor = torch.zeros(n_nodes, 1, device=device)
     features.append(h_tensor)
     features.append(amb_tensor)
+    
+    # Source term values (volumetric heat source)
+    if source_values is not None:
+        if isinstance(source_values, torch.Tensor):
+            source_tensor = source_values.detach().clone().to(dtype=torch.float32, device=device).unsqueeze(1)
+        else:
+            source_tensor = torch.tensor(source_values, dtype=torch.float32, device=device).unsqueeze(1)
+    else:
+        source_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no source
+    features.append(source_tensor)
     
     return torch.cat(features, dim=1)
 

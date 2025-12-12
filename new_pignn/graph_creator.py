@@ -36,6 +36,7 @@ class GraphCreator:
     def create_graph(self, T_current: Optional[np.ndarray] = None, t_scalar: float = 0.0,
                    material_node_field: Optional[np.ndarray] = None, neumann_values: Optional[np.ndarray] = None,
                    dirichlet_values: Optional[np.ndarray] = None, robin_values: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+                   source_values: Optional[np.ndarray] = None,
                    add_self_loops: bool = True, device: Optional[torch.device] = None) -> Tuple[Data, Dict]:
         """
         Create PI-MGN graph from mesh according to the paper's methodology.
@@ -47,6 +48,7 @@ class GraphCreator:
             neumann_values: Per-node Neumann boundary values (N,) - optional, h_N values for flux BC
             dirichlet_values: Per-node Dirichlet boundary values (N,) - optional, prescribed values for Dirichlet BC
             robin_values: Tuple of (h_values, amb_values) for Robin BCs - optional
+            source_values: Per-node source term values (N,) - optional, volumetric heat source
             add_self_loops: Whether to add self-loops to all nodes
             device: Target device for tensors (CPU if None)
             
@@ -65,6 +67,7 @@ class GraphCreator:
             neumann_values=neumann_values,
             dirichlet_values=dirichlet_values,
             robin_values=robin_values,
+            source_values=source_values,
             connectivity_method=self.connectivity_method,
             n_neighbors=self.n_neighbors,
             add_self_loops=add_self_loops,

@@ -5,6 +5,7 @@ from typing import Optional, List, Tuple
 import torch
 import scipy.sparse as sp
 import os
+from pathlib import Path
 from mesh_utils import create_rectangular_mesh, build_graph_from_mesh
 
 
@@ -14,17 +15,23 @@ class FEMSolver:
         self.order = order
         
         # Set up finite element space with proper Dirichlet boundaries
+        dirichlet_string = None
         if problem is not None and problem.mesh_config.dirichlet_pipe:
             dirichlet_string = problem.mesh_config.dirichlet_pipe
-        else:
-            # Default fallback - use all boundaries as Dirichlet
-            dirichlet_string = "left|right|top|bottom"
             
-        self.fes = ng.H1(
-            mesh,
-            order=order,
-            dirichlet=dirichlet_string
-        )
+        # Create H1 space - only pass dirichlet if we have boundaries
+        if dirichlet_string:
+            self.fes = ng.H1(
+                mesh,
+                order=order,
+                dirichlet=dirichlet_string
+            )
+        else:
+            # No Dirichlet boundaries - all DOFs are free
+            self.fes = ng.H1(
+                mesh,
+                order=order
+            )
         self.problem = problem
         if problem is not None:
             self.init_matrices()
@@ -147,9 +154,12 @@ class FEMSolver:
         # Set initial condition on the interior
         gfu_initial.vec.FV().NumPy()[:] = problem.initial_condition
 
-        # Set Dirichlet boundary conditions
-        boundary_cf = self.mesh.BoundaryCF(problem.boundary_values, default=0)
-        gfu.Set(boundary_cf, definedon=self.mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
+        # Set Dirichlet boundary conditions (only if we have Dirichlet boundaries)
+        boundary_cf = None
+        has_dirichlet = problem.mesh_config.dirichlet_pipe and problem.boundary_values
+        if has_dirichlet:
+            boundary_cf = self.mesh.BoundaryCF(problem.boundary_values, default=0)
+            gfu.Set(boundary_cf, definedon=self.mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
 
         # Copy initial condition values for free DOFs only
         free_dofs = self.fes.FreeDofs()
@@ -177,7 +187,10 @@ class FEMSolver:
             rhs_vec.data += dt * total_force
 
             gfu_next = ng.GridFunction(self.fes)
-            gfu_next.Set(boundary_cf, definedon=self.mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
+            
+            # Only set Dirichlet BCs if we have them
+            if has_dirichlet and boundary_cf is not None:
+                gfu_next.Set(boundary_cf, definedon=self.mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
 
             rhs_vec.data -= mstar.mat * gfu_next.vec
             gfu_next.vec.data += mstarinv * rhs_vec
@@ -332,21 +345,11 @@ class FEMSolver:
         dtype = temperature_field.dtype
 
         if problem.source_function is not None:
-            source_nodal = torch.tensor(problem.source_function, device=device, dtype=dtype)
+            if isinstance(problem.source_function, torch.Tensor):
+                source_nodal = problem.source_function.detach().clone().to(device=device, dtype=dtype)
+            else:
+                source_nodal = torch.tensor(problem.source_function, device=device, dtype=dtype)
             return torch.sparse.mm(mass_mat, source_nodal.unsqueeze(1)).squeeze()
-
-        params = getattr(problem, "nonlinear_source_params", None)
-        material_fraction = getattr(problem, "material_fraction_field", None)
-        if params and material_fraction is not None:
-            vf_tensor = torch.tensor(material_fraction, device=device, dtype=dtype)
-            q0 = params.get("q0", 0.0)
-            t0 = max(params.get("t0", 1.0), 1e-8)
-            C = params.get("C", 0.0)
-            time_scalar = 0.0 if time_scalar is None else time_scalar
-            q_tilde = q0 * (1.0 - vf_tensor)
-            exponent = torch.exp(-C * temperature_field * (time_scalar / t0))
-            source_density = q_tilde * exponent * C * temperature_field
-            return torch.sparse.mm(mass_mat, source_density.unsqueeze(1)).squeeze()
 
         return torch.zeros_like(temperature_field, device=device, dtype=dtype)
 
@@ -437,6 +440,20 @@ class FEMSolver:
             vtk_out.Do(time=time)
         print(f"VTK file saved as {filename}")
 
+        # save mesh
+        file_path = Path(filename).parent.parent / "results_data"
+        os.makedirs(file_path, exist_ok=True)
+        mesh_filename = file_path / "mesh.vol"
+        self.mesh.ngmesh.Save(str(mesh_filename))
+
+        # save exact, predicted, difference as npz
+        npz_filename = file_path / "results.npz"
+        np.savez_compressed(
+            npz_filename,
+            exact=array_true,
+            predicted=array_pred,
+        )
+        print(f"Results saved as {npz_filename}")
 
 if __name__ == "__main__":
 
@@ -444,10 +461,9 @@ if __name__ == "__main__":
     from mesh_utils import build_graph_from_mesh, create_gaussian_initial_condition
     from containers import MeshProblem
     from graph_creator import GraphCreator
-    from train_problems import create_nonlinear_rectangular_problem, create_test_problem
+    from train_problems import create_test_problem, create_mms_problem, create_industrial_heating_problem, create_source_test_problem
 
-    
-    problem, time_config = create_test_problem(maxh=0.1, alpha=3)
+    problem, time_config = create_source_test_problem(maxh=0.1, alpha=1)
 
     # Initialize FEM solver
     fem_solver = FEMSolver(problem.mesh, order=1, problem=problem)
@@ -455,7 +471,6 @@ if __name__ == "__main__":
     # Solve transient problem
     transient_solution = fem_solver.solve_transient_problem(problem)
 
-    # Test residual computation with inhomogeneous Dirichlet BCs
     for step_idx, time_value in enumerate(problem.time_config.time_steps, start=1):
         t_prev = torch.tensor(transient_solution[step_idx - 1], dtype=torch.float64)
         t_pred_next = torch.tensor(transient_solution[step_idx], dtype=torch.float64)
@@ -469,12 +484,12 @@ if __name__ == "__main__":
         print(
             f"Time step {step_idx}, Residual (mean): {np.abs(torch.mean(residual).item()):.2e}"
         )
-    # assert np.mean(residual.numpy()) < 1e-8, "Residual is too high!"
+    assert np.mean(residual.numpy()) < 1e-8, "Residual is too high!"
 
     fem_solver.export_to_vtk(
         np.array(transient_solution),
         np.array(transient_solution),
         problem.time_config.time_steps,
-        filename="results/vtk/transient_solution.vtk",
+        filename="results/fem_tests/vtk/result",
     )
 

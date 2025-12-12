@@ -1,21 +1,9 @@
 import numpy as np
-import torch
 import random
-import torch.nn as nn
-import torch.optim as optim
-import matplotlib.pyplot as plt
-from pathlib import Path
-import time
-from argparse import Namespace
-from typing import List
 
-# Import our modules
-from meshgraphnet import MeshGraphNet
-from fem import FEMSolver
 from mesh_utils import create_dirichlet_values, create_rectangular_mesh, create_lshape_mesh, create_gaussian_initial_condition
 from graph_creator import GraphCreator
 from containers import TimeConfig, MeshConfig, MeshProblem
-from torch_geometric.data import Data
 
 def create_test_problem(maxh=0.2, alpha=1.0):
     """Create a simple test problem for PIMGN training."""
@@ -24,7 +12,7 @@ def create_test_problem(maxh=0.2, alpha=1.0):
     # Time configuration
     time_config = TimeConfig(
         dt=0.01,
-        t_final=2.0
+        t_final=1.0
     )
     # Create rectangular mesh
     mesh = create_rectangular_mesh(width=2, height=1, maxh=maxh)
@@ -94,7 +82,7 @@ def create_test_problem(maxh=0.2, alpha=1.0):
         centered=True,
         enforce_boundary_conditions=True,
     )
-    initial_condition = np.zeros_like(initial_condition)
+    initial_condition = np.ones_like(initial_condition) * 20.0
     
     # Create problem
     problem = MeshProblem(
@@ -301,151 +289,341 @@ def create_lshaped_problem(maxh=0.2):
     
     return problem, time_config
 
-def create_nonlinear_rectangular_problem(maxh=0.1, seed=42, n_functions=10):
-    """Create 2D nonlinear inhomogeneous heating problem on a rectangle."""
-    import ngsolve as ng
+def create_mms_problem(maxh=0.2, alpha=0.1, problem_id=0):
+    """Create a manufactured solution problem for testing."""
+    # Time configuration
+    time_config = TimeConfig(
+        dt=0.01,
+        t_final=1.0
+    )
+    # Create rectangular mesh
+    mesh = create_rectangular_mesh(width=1, height=1, maxh=maxh)
 
-    rng = np.random.default_rng(seed)
-
-    # Experiment constants from paper
-    t0 = 1.0
-    T0 = 100.0
-    q0 = 20.0
-    alpha_f = 0.1
-    alpha_m = 0.01
-    vf0 = 0.5
-    dt = 0.01
-    t_final = 0.4
-
-    time_config = TimeConfig(dt=dt, t_final=t_final)
-
-    mesh = create_rectangular_mesh(width=1.0, height=1.0, maxh=maxh)
-
-    dirichlet_boundaries = ["bottom", "right", "top", "left"]
+    dirichlet_boundaries = ["left", "right", "bottom", "top"]
     neumann_boundaries = []
-    dirichlet_boundaries_dict = {name: T0 for name in dirichlet_boundaries}
+    dirichlet_boundaries_dict = {"left": 0, "right": 0, "bottom": 0, "top": 0}
     neumann_boundaries_dict = {}
 
+    # Mesh configuration
     mesh_config = MeshConfig(
         maxh=maxh,
         order=1,
         dim=2,
         dirichlet_boundaries=dirichlet_boundaries,
         neumann_boundaries=neumann_boundaries,
-        mesh_type="rectangle",
+        mesh_type="rectangle"
     )
-
+    
+    # Create graph to get node positions
     graph_creator = GraphCreator(
         mesh=mesh,
         n_neighbors=2,
         dirichlet_names=dirichlet_boundaries,
         neumann_names=neumann_boundaries,
-        connectivity_method="fem",
+        connectivity_method="fem"
     )
-
+    # First create a temporary graph to get positions and aux data
     temp_data, temp_aux = graph_creator.create_graph()
-
+    
+    # Create Neumann values based on the temporary data
     neumann_vals = graph_creator.create_neumann_values(
         pos=temp_data.pos,
         aux_data=temp_aux,
         neumann_names=neumann_boundaries,
         flux_values=neumann_boundaries_dict,
-        seed=seed,
+        seed=42
     )
     dirichlet_vals = create_dirichlet_values(
         pos=temp_data.pos,
         aux_data=temp_aux,
         dirichlet_names=dirichlet_boundaries,
-        boundary_values=dirichlet_boundaries_dict,
+        boundary_values=dirichlet_boundaries_dict
     )
-
-    pos_np = temp_data.pos.numpy()
-    vf_field = np.full(pos_np.shape[0], vf0, dtype=np.float64)
-
-    coeff_params = []
-    for _ in range(n_functions):
-        ai = rng.uniform(0.0, 1.0 / 20.0)
-        kx = rng.uniform(0.0, 8.0 * np.pi)
-        ky = rng.uniform(0.0, 8.0 * np.pi)
-        dx = rng.uniform(0.0, 2.0 * np.pi)
-        dy = rng.uniform(0.0, 2.0 * np.pi)
-        coeff_params.append((ai, kx, ky, dx, dy))
-        vf_field += ai * np.sin(kx * pos_np[:, 0] + dx) * np.sin(ky * pos_np[:, 1] + dy)
-
-    vf_field = np.clip(vf_field, 0.05, 0.95)
-    alpha_field = 1.0 / (vf_field / alpha_f + (1.0 - vf_field) / alpha_m)
-
-    # Build coefficient function for FEM assembly
-    x, y = ng.x, ng.y
-    vf_cf = ng.CoefficientFunction(vf0)
-    for ai, kx, ky, dx, dy in coeff_params:
-        vf_cf += ai * ng.sin(kx * x + dx) * ng.sin(ky * y + dy)
-    alpha_cf = 1.0 / (vf_cf / alpha_f + (1 - vf_cf) / alpha_m)
-
-    initial_condition = np.ones_like(pos_np[:, 0]) * T0
-
-    gaussians = create_gaussian_initial_condition(
-        pos=pos_np,
-        num_gaussians=5,
-        amplitude_range=(1, 10),
-        sigma_fraction_range=(0.1, 0.2),
-        seed=seed,
-        centered=False,
-        enforce_boundary_conditions=False,
-    )
-    initial_condition += gaussians
-
-    temp_data, _ = graph_creator.create_graph(
-        T_current=initial_condition,
-        t_scalar=0.0,
-        material_node_field=vf_field,
-        neumann_values=neumann_vals,
-        dirichlet_values=dirichlet_vals,
-    )
-
+    
+    # Create the final graph with Neumann values
+    temp_data, _ = graph_creator.create_graph(neumann_values=neumann_vals, dirichlet_values=dirichlet_vals)
+    
+    # Manufactured solution initial condition
+    initial_condition = 100*np.sin(np.pi * temp_data.pos[:, 0]) * np.sin(np.pi * temp_data.pos[:, 1])
+    
+    # Create problem
     problem = MeshProblem(
         mesh=mesh,
         graph_data=temp_data,
         initial_condition=initial_condition,
-        alpha=float(alpha_field.mean()),
+        alpha=alpha,  # Thermal diffusivity
         time_config=time_config,
         mesh_config=mesh_config,
-        problem_id=0,
+        problem_id=0
     )
 
-    problem.alpha_coefficient = alpha_cf
-    problem.material_fraction_field = vf_field
-    problem.material_field = alpha_field
-    problem.nonlinear_source_params = {
-        "q0": q0,
-        "t0": t0,
-        "C": 8.0 / T0,
-        "T0": T0,
-    }
-
-    problem.set_neumann_values(neumann_boundaries_dict)
-    problem.set_dirichlet_values(dirichlet_boundaries_dict)
+    # Store the Neumann values array for later use
     problem.set_neumann_values_array(neumann_vals)
     problem.set_dirichlet_values_array(dirichlet_vals)
-
-    # Project initial condition to FEM space to enforce BCs
+    
+    # Set boundary conditions
+    problem.set_neumann_values(neumann_boundaries_dict)
+    problem.set_dirichlet_values(dirichlet_boundaries_dict)
+    import ngsolve as ng
     fes = ng.H1(mesh, order=1, dirichlet=problem.mesh_config.dirichlet_pipe)
     gfu = ng.GridFunction(fes)
     gfu_initial = ng.GridFunction(fes)
 
+    # Set initial condition on the interior
     gfu_initial.vec.FV().NumPy()[:] = problem.initial_condition
+
+    # Set Dirichlet boundary conditions
     boundary_cf = mesh.BoundaryCF(problem.boundary_values, default=0)
     gfu.Set(boundary_cf, definedon=mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
 
+    # Copy initial condition values for free DOFs only
     free_dofs = fes.FreeDofs()
     for dof in range(fes.ndof):
         if free_dofs[dof]:
             gfu.vec[dof] = gfu_initial.vec[dof]
-
     problem.initial_condition = gfu.vec.FV().NumPy()
+    
+    print(f"Problem created with {problem.n_nodes} nodes and {problem.n_edges} edges")
+    print(f"Time steps: {len(time_config.time_steps)}, dt: {time_config.dt}")
+    
+    return problem, time_config
 
-    print(
-        f"Nonlinear rectangular problem created with {problem.n_nodes} nodes, maxh={maxh}, seed={seed}"
+def create_source_test_problem(maxh=0.2, alpha=0.1, problem_id=0):
+    # Time configuration
+    time_config = TimeConfig(
+        dt=0.01,
+        t_final=1.0
+    )
+    # Create rectangular mesh
+    mesh = create_rectangular_mesh(width=1, height=1, maxh=maxh)
+
+    dirichlet_boundaries = ["right", "bottom", "top"]
+    neumann_boundaries = ["left"]
+    dirichlet_boundaries_dict = {"right": 0, "bottom": 0, "top": 0}
+    neumann_boundaries_dict = {"left": 0}
+
+    # Mesh configuration
+    mesh_config = MeshConfig(
+        maxh=maxh,
+        order=1,
+        dim=2,
+        dirichlet_boundaries=dirichlet_boundaries,
+        neumann_boundaries=neumann_boundaries,
+        mesh_type="rectangle"
+    )
+    
+    # Create graph to get node positions
+    graph_creator = GraphCreator(
+        mesh=mesh,
+        n_neighbors=2,
+        dirichlet_names=dirichlet_boundaries,
+        neumann_names=neumann_boundaries,
+        connectivity_method="fem"
+    )
+    # First create a temporary graph to get positions and aux data
+    temp_data, temp_aux = graph_creator.create_graph()
+    
+    # Create Neumann values based on the temporary data
+    neumann_vals = graph_creator.create_neumann_values(
+        pos=temp_data.pos,
+        aux_data=temp_aux,
+        neumann_names=neumann_boundaries,
+        flux_values=neumann_boundaries_dict,
+        seed=42
+    )
+    dirichlet_vals = create_dirichlet_values(
+        pos=temp_data.pos,
+        aux_data=temp_aux,
+        dirichlet_names=dirichlet_boundaries,
+        boundary_values=dirichlet_boundaries_dict
+    )
+    
+    # Create the final graph with Neumann values
+    temp_data, _ = graph_creator.create_graph(neumann_values=neumann_vals, dirichlet_values=dirichlet_vals)
+    
+    # Manufactured solution initial condition
+    initial_condition = np.zeros_like(temp_data.pos[:, 0])
+    
+    # Create problem
+    problem = MeshProblem(
+        mesh=mesh,
+        graph_data=temp_data,
+        initial_condition=initial_condition,
+        alpha=alpha,  # Thermal diffusivity
+        time_config=time_config,
+        mesh_config=mesh_config,
+        problem_id=0
     )
 
+    # Store the Neumann values array for later use
+    problem.set_neumann_values_array(neumann_vals)
+    problem.set_dirichlet_values_array(dirichlet_vals)
+    
+    # Set boundary conditions
+    problem.set_neumann_values(neumann_boundaries_dict)
+    problem.set_dirichlet_values(dirichlet_boundaries_dict)
+
+    x = temp_data.pos[:, 0]
+    y = temp_data.pos[:, 1]
+    x_depth = 1 - x
+    depth = 0.1
+    profile_x = np.exp(-x_depth / depth)
+    y_center = 1 / 2.0
+    sigma_y_mm = 1 / 4.0
+    profile_y = np.exp(-((y - y_center) ** 2) / (2 * sigma_y_mm ** 2))
+    s0 = 500.0
+    source_function = s0 * profile_x * profile_y
+    problem.set_source_function(source_function)
+
+    import ngsolve as ng
+    fes = ng.H1(mesh, order=1, dirichlet=problem.mesh_config.dirichlet_pipe)
+    gfu = ng.GridFunction(fes)
+    gfu_initial = ng.GridFunction(fes)
+
+    # Set initial condition on the interior
+    gfu_initial.vec.FV().NumPy()[:] = problem.initial_condition
+
+    # Set Dirichlet boundary conditions
+    boundary_cf = mesh.BoundaryCF(problem.boundary_values, default=0)
+    gfu.Set(boundary_cf, definedon=mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
+
+    # Copy initial condition values for free DOFs only
+    free_dofs = fes.FreeDofs()
+    for dof in range(fes.ndof):
+        if free_dofs[dof]:
+            gfu.vec[dof] = gfu_initial.vec[dof]
+    problem.initial_condition = gfu.vec.FV().NumPy()
+    
+    print(f"Problem created with {problem.n_nodes} nodes and {problem.n_edges} edges")
+    print(f"Time steps: {len(time_config.time_steps)}, dt: {time_config.dt}")
+    
+    return problem, time_config
+
+def create_industrial_heating_problem(maxh=0.1):
+    density = 7850  # kg/m^3
+    specific_heat = 450  # J/(kg·K)
+    k = 45  # W/(m·K)
+    # Time configuration
+    time_config = TimeConfig(
+        dt=0.01,
+        t_final=1.0
+    )
+    h_conv = 10 # Air convective heat transfer coefficient
+    T_amb = 23 # Ambient temperature
+    alpha = k / (density * specific_heat)  # Thermal diffusivity
+    # Create rectangular mesh
+    L = 30e-3 # m full billet length
+    D = (L / 2) # m half of the billet
+    H = 100e-3 # m
+    mesh = create_rectangular_mesh(width=D, height=H, maxh=maxh)
+
+    dirichlet_boundaries = ["bottom"]
+    neumann_boundaries = ["left"]
+    robin_boundaries = ["top", "right"]
+    dirichlet_boundaries_dict = {"bottom": 23}
+    neumann_boundaries_dict = {"left": 0}
+    robin_boundaries_dict = {"top": (h_conv, T_amb), "right": (h_conv, T_amb)}
+
+    # Mesh configuration
+    mesh_config = MeshConfig(
+        maxh=maxh,
+        order=1,
+        dim=2,
+        dirichlet_boundaries=dirichlet_boundaries,
+        neumann_boundaries=neumann_boundaries,
+        mesh_type="rectangle"
+    )
+    
+    # Create graph to get node positions
+    graph_creator = GraphCreator(
+        mesh=mesh,
+        n_neighbors=2,
+        dirichlet_names=dirichlet_boundaries,
+        neumann_names=neumann_boundaries,
+        connectivity_method="fem"
+    )
+    # First create a temporary graph to get positions and aux data
+    temp_data, temp_aux = graph_creator.create_graph()
+    
+    # Create Neumann values based on the temporary data
+    neumann_vals = graph_creator.create_neumann_values(
+        pos=temp_data.pos,
+        aux_data=temp_aux,
+        neumann_names=neumann_boundaries,
+        flux_values=neumann_boundaries_dict,
+        seed=42
+    )
+    dirichlet_vals = create_dirichlet_values(
+        pos=temp_data.pos,
+        aux_data=temp_aux,
+        dirichlet_names=dirichlet_boundaries,
+        boundary_values=dirichlet_boundaries_dict
+    )
+    h_vals, amb_vals = graph_creator.create_robin_values(
+        pos=temp_data.pos,
+        aux_data=temp_aux,
+        robin_names=robin_boundaries,
+        robin_values=robin_boundaries_dict
+    )
+    
+    # Create the final graph with Neumann values
+    temp_data, _ = graph_creator.create_graph(neumann_values=neumann_vals, dirichlet_values=dirichlet_vals, robin_values=(h_vals, amb_vals))
+    
+    initial_condition = np.ones_like(temp_data.pos[:, 0]) * T_amb
+    
+    # Create problem
+    problem = MeshProblem(
+        mesh=mesh,
+        graph_data=temp_data,
+        initial_condition=initial_condition,
+        alpha=alpha,  # Thermal diffusivity
+        time_config=time_config,
+        mesh_config=mesh_config,
+        problem_id=0
+    )
+
+    # Store the Neumann values array for later use
+    problem.set_neumann_values_array(neumann_vals)
+    problem.set_dirichlet_values_array(dirichlet_vals)
+    problem.set_robin_values_array((h_vals, amb_vals))
+    
+    # Set boundary conditions
+    problem.set_neumann_values(neumann_boundaries_dict)
+    problem.set_dirichlet_values(dirichlet_boundaries_dict)
+    problem.set_robin_values(robin_boundaries_dict)
+
+    x = temp_data.pos[:, 0]
+    y = temp_data.pos[:, 1]
+    x_depth = D - x
+    delta_m = 0.2 * D
+    profile_x = np.exp(-x_depth / delta_m)
+    y_center = H / 2.0
+    sigma_y_m = H / 4.0
+    profile_y = np.exp(-((y - y_center) ** 2) / (2 * sigma_y_m ** 2))
+    s0 = 100
+    source_function = s0 * profile_x * profile_y
+    problem.set_source_function(source_function)
+
+    import ngsolve as ng
+    fes = ng.H1(mesh, order=1, dirichlet=problem.mesh_config.dirichlet_pipe)
+    gfu = ng.GridFunction(fes)
+    gfu_initial = ng.GridFunction(fes)
+
+    # Set initial condition on the interior
+    gfu_initial.vec.FV().NumPy()[:] = problem.initial_condition
+
+    # Set Dirichlet boundary conditions
+    boundary_cf = mesh.BoundaryCF(problem.boundary_values, default=0)
+    gfu.Set(boundary_cf, definedon=mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
+
+    # Copy initial condition values for free DOFs only
+    free_dofs = fes.FreeDofs()
+    for dof in range(fes.ndof):
+        if free_dofs[dof]:
+            gfu.vec[dof] = gfu_initial.vec[dof]
+    problem.initial_condition = gfu.vec.FV().NumPy()
+    
+    print(f"Problem created with {problem.n_nodes} nodes and {problem.n_edges} edges")
+    print(f"Time steps: {len(time_config.time_steps)}, dt: {time_config.dt}")
+    
     return problem, time_config

@@ -1,5 +1,5 @@
-# PDF
-*.pdf
+# PDF from papers/
+papers/
 
 # paper folder
 paper/
