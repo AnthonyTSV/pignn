@@ -5,21 +5,29 @@ from new_pignn.graph_creator import GraphCreator
 from new_pignn.mesh_utils import (
     create_rectangular_mesh,
     create_gaussian_initial_condition,
-    create_neumann_values,
-    create_dirichlet_values,
     create_lshape_mesh,
+    create_ih_mesh,
 )
 
 
 def main():
-    mesh = create_lshape_mesh(maxh=0.1)
+    mesh = create_rectangular_mesh(maxh=0.3)
     n_points = len(list(mesh.ngmesh.Points()))
     print(f"   Created mesh with {n_points} nodes")
 
-    dirichlet_names = ["outer"]
+    dirichlet_names = ["left", "right", "bottom", "top"]
+    dirichlet_boundaries_dict = {
+        "left": 0.0,
+        "right": 0.0,
+        "bottom": 0.0,
+        "top": 0.0,
+    }
     neumann_names = []
-    dirichlet_boundaries_dict = {"outer": 1}
     neumann_boundaries_dict = {}
+
+    import ngsolve as ng
+
+    fes = ng.H1(mesh, order=2, dirichlet="|".join(dirichlet_names))
 
     # First create a dummy graph to get positions and auxiliary data
     temp_creator = GraphCreator(
@@ -28,6 +36,7 @@ def main():
         dirichlet_names=dirichlet_names,
         neumann_names=neumann_names,
         connectivity_method="fem",
+        fes=fes,
     )
     temp_data, temp_aux = temp_creator.create_graph()
 
@@ -48,13 +57,17 @@ def main():
         temp_aux,
         neumann_names,
         flux_values=neumann_boundaries_dict,
-        seed=42
+        seed=42,
     )
-    print(f"   Neumann values range: [{neumann_vals.min():.3f}, {neumann_vals.max():.3f}]")
-    neumann_mask = temp_aux['neumann_mask']
+    print(
+        f"   Neumann values range: [{neumann_vals.min():.3f}, {neumann_vals.max():.3f}]"
+    )
+    neumann_mask = temp_aux["neumann_mask"]
     if neumann_mask.any():
         neumann_nodes = neumann_vals[neumann_mask.numpy()]
-        print(f"   Neumann nodes flux range: [{neumann_nodes.min():.3f}, {neumann_nodes.max():.3f}]")
+        print(
+            f"   Neumann nodes flux range: [{neumann_nodes.min():.3f}, {neumann_nodes.max():.3f}]"
+        )
 
     # Create Dirichlet values with boundary-specific constant values
     dirichlet_vals = temp_creator.create_dirichlet_values(
@@ -62,13 +75,17 @@ def main():
         temp_aux,
         dirichlet_names,
         boundary_values=dirichlet_boundaries_dict,
-        seed=42
+        seed=42,
     )
-    print(f"   Dirichlet values range: [{dirichlet_vals.min():.3f}, {dirichlet_vals.max():.3f}]")
-    dirichlet_mask = temp_aux['dirichlet_mask']
+    print(
+        f"   Dirichlet values range: [{dirichlet_vals.min():.3f}, {dirichlet_vals.max():.3f}]"
+    )
+    dirichlet_mask = temp_aux["dirichlet_mask"]
     if dirichlet_mask.any():
         dirichlet_nodes = dirichlet_vals[dirichlet_mask.numpy()]
-        print(f"   Dirichlet nodes range: [{dirichlet_nodes.min():.3f}, {dirichlet_nodes.max():.3f}]")
+        print(
+            f"   Dirichlet nodes range: [{dirichlet_nodes.min():.3f}, {dirichlet_nodes.max():.3f}]"
+        )
 
     creator = GraphCreator(
         mesh,
@@ -76,13 +93,16 @@ def main():
         dirichlet_names=dirichlet_names,
         neumann_names=neumann_names,
         connectivity_method="fem",
+        fes=fes,
     )
 
     # Create graph with Neumann and Dirichlet values
-    graph_data, aux_data = creator.create_graph(T_current=T_initial, t_scalar=0.0, neumann_values=neumann_vals, dirichlet_values=dirichlet_vals)
-
-    # Print statistics
-    creator.print_graph_stats(graph_data, aux_data)
+    graph_data, aux_data = creator.create_graph(
+        T_current=T_initial,
+        t_scalar=0.0,
+        neumann_values=neumann_vals,
+        dirichlet_values=dirichlet_vals,
+    )
 
     # Visualize graph
     creator.visualize_graph(
@@ -98,11 +118,19 @@ def main():
         dirichlet_names=dirichlet_names,
         neumann_names=neumann_names,
         connectivity_method="fem",
+        fes=fes,
     )
-    full_graph, aux = creator.create_graph(T_current=T_initial, t_scalar=0.0, neumann_values=neumann_vals, dirichlet_values=dirichlet_vals)
+    full_graph, aux = creator.create_graph(
+        T_current=T_initial,
+        t_scalar=0.0,
+        neumann_values=neumann_vals,
+        dirichlet_values=dirichlet_vals,
+    )
 
     # Create subgraph with only free (non-Dirichlet) nodes
-    free_graph, node_mapping, new_aux = creator.create_free_node_subgraph(full_graph, aux)
+    free_graph, node_mapping, new_aux = creator.create_free_node_subgraph(
+        full_graph, aux
+    )
     # Visualize free node subgraph
     creator.visualize_graph(
         free_graph,
@@ -114,7 +142,9 @@ def main():
 
     print("Demo completed! Check the generated visualization files:")
     print("  - graph_visualization_fem.png (with Dirichlet and Neumann values)")
-    print("  - graph_visualization_free_nodes.png (free nodes subgraph with Dirichlet values)")
+    print(
+        "  - graph_visualization_free_nodes.png (free nodes subgraph with Dirichlet values)"
+    )
 
 
 if __name__ == "__main__":

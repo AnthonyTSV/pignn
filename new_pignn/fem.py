@@ -6,32 +6,25 @@ import torch
 import scipy.sparse as sp
 import os
 from pathlib import Path
-from mesh_utils import create_rectangular_mesh, build_graph_from_mesh
+from mesh_utils import create_rectangular_mesh
 
 
 class FEMSolver:
     def __init__(self, mesh: ng.Mesh, order=1, problem: Optional[MeshProblem] = None):
         self.mesh = mesh
         self.order = order
-        
+
         # Set up finite element space with proper Dirichlet boundaries
         dirichlet_string = None
         if problem is not None and problem.mesh_config.dirichlet_pipe:
             dirichlet_string = problem.mesh_config.dirichlet_pipe
-            
+
         # Create H1 space - only pass dirichlet if we have boundaries
         if dirichlet_string:
-            self.fes = ng.H1(
-                mesh,
-                order=order,
-                dirichlet=dirichlet_string
-            )
+            self.fes = ng.H1(mesh, order=order, dirichlet=dirichlet_string)
         else:
             # No Dirichlet boundaries - all DOFs are free
-            self.fes = ng.H1(
-                mesh,
-                order=order
-            )
+            self.fes = ng.H1(mesh, order=order)
         self.problem = problem
         if problem is not None:
             self.init_matrices()
@@ -45,12 +38,12 @@ class FEMSolver:
 
         self.stiffness_matrix = ng.BilinearForm(self.fes, symmetric=True)
         self.stiffness_matrix += self._alpha_weight() * ng.grad(u) * ng.grad(v) * ng.dx
-        
+
         # Add Robin BC contribution to stiffness matrix: + integral(h * u * v) ds
-        if hasattr(self.problem, 'robin_values'):
+        if hasattr(self.problem, "robin_values"):
             for name, (h, _) in self.problem.robin_values.items():
                 self.stiffness_matrix += h * u * v * ng.ds(definedon=name)
-        
+
         self.stiffness_matrix.Assemble()
 
         self.mass_matrix = ng.BilinearForm(self.fes, symmetric=True)
@@ -60,18 +53,20 @@ class FEMSolver:
         self.neumann_matrix = ng.LinearForm(self.fes)
         for name, value in self.problem.neumann_values.items():
             self.neumann_matrix += value * v * ng.ds(definedon=name)
-            
+
         # Add Robin BC contribution to RHS: + integral(h * T_amb * v) ds
-        if hasattr(self.problem, 'robin_values'):
+        if hasattr(self.problem, "robin_values"):
             for name, (h, t_amb) in self.problem.robin_values.items():
                 self.neumann_matrix += h * t_amb * v * ng.ds(definedon=name)
-                
+
         self.neumann_matrix.Assemble()
 
         # Store full matrices
         self.stiffness_matrix_mat = self._ngsolve_to_torch(self.stiffness_matrix.mat)
         self.mass_matrix_mat = self._ngsolve_to_torch(self.mass_matrix.mat)
-        self.neumann_vec = torch.tensor(self.neumann_matrix.vec.FV().NumPy().copy(), dtype=torch.float64)
+        self.neumann_vec = torch.tensor(
+            self.neumann_matrix.vec.FV().NumPy().copy(), dtype=torch.float64
+        )
 
     def _alpha_weight(self):
         if self.problem is None:
@@ -80,27 +75,6 @@ class FEMSolver:
         if alpha_cf is not None:
             return alpha_cf
         return getattr(self.problem, "alpha", 1.0)
-
-    def _scipy_to_torch(self, scipy_matrix):
-        """Convert scipy sparse matrix to torch sparse tensor."""
-        coo = scipy_matrix.tocoo()
-        indices = torch.tensor([coo.row, coo.col], dtype=torch.long)
-        values = torch.tensor(coo.data, dtype=torch.float64)
-        shape = coo.shape
-        return torch.sparse_coo_tensor(indices, values, size=shape, dtype=torch.float64)
-
-    def _ngsolve_to_scipy(self, ngsolve_matrix):
-        """Convert NGSolve matrix to scipy sparse matrix."""
-        if hasattr(ngsolve_matrix, "COO"):
-            rows, cols, vals = ngsolve_matrix.COO()
-            return sp.csr_matrix(
-                (vals, (rows, cols)),
-                shape=(ngsolve_matrix.height, ngsolve_matrix.width),
-            )
-        else:
-            # Fallback to dense conversion
-            dense = np.array(ngsolve_matrix.ToDenseMatrix(), dtype=np.float64)
-            return sp.csr_matrix(dense)
 
     def _ngsolve_to_torch(self, ngsolve_matrix):
         """Convert NGSolve matrix to torch tensor."""
@@ -119,9 +93,9 @@ class FEMSolver:
         u, v = self.fes.TnT()
         mform = u * v * ng.dx
         aform = self._alpha_weight() * ng.grad(u) * ng.grad(v) * ng.dx
-        
+
         # Add Robin BC contribution to stiffness matrix
-        if hasattr(problem, 'robin_values'):
+        if hasattr(problem, "robin_values"):
             for name, (h, _) in problem.robin_values.items():
                 aform += h * u * v * ng.ds(definedon=name)
 
@@ -133,12 +107,12 @@ class FEMSolver:
         f = ng.LinearForm(self.fes)
         for name, value in problem.neumann_values.items():
             f += value * v * ng.ds(definedon=name)
-            
+
         # Add Robin BC contribution to RHS
-        if hasattr(problem, 'robin_values'):
+        if hasattr(problem, "robin_values"):
             for name, (h, t_amb) in problem.robin_values.items():
                 f += h * t_amb * v * ng.ds(definedon=name)
-                
+
         # add source term if provided
         if problem.source_function is not None:
             gfu_source = ng.GridFunction(self.fes)
@@ -159,14 +133,17 @@ class FEMSolver:
         has_dirichlet = problem.mesh_config.dirichlet_pipe and problem.boundary_values
         if has_dirichlet:
             boundary_cf = self.mesh.BoundaryCF(problem.boundary_values, default=0)
-            gfu.Set(boundary_cf, definedon=self.mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
+            gfu.Set(
+                boundary_cf,
+                definedon=self.mesh.Boundaries(problem.mesh_config.dirichlet_pipe),
+            )
 
         # Copy initial condition values for free DOFs only
         free_dofs = self.fes.FreeDofs()
         for dof in range(self.fes.ndof):
             if free_dofs[dof]:
                 gfu.vec[dof] = gfu_initial.vec[dof]
-        
+
         states.append(gfu.vec.FV().NumPy().copy())
         for j in range(int(t_final / dt)):
             current_time = (j + 1) * dt
@@ -187,10 +164,13 @@ class FEMSolver:
             rhs_vec.data += dt * total_force
 
             gfu_next = ng.GridFunction(self.fes)
-            
+
             # Only set Dirichlet BCs if we have them
             if has_dirichlet and boundary_cf is not None:
-                gfu_next.Set(boundary_cf, definedon=self.mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
+                gfu_next.Set(
+                    boundary_cf,
+                    definedon=self.mesh.Boundaries(problem.mesh_config.dirichlet_pipe),
+                )
 
             rhs_vec.data -= mstar.mat * gfu_next.vec
             gfu_next.vec.data += mstarinv * rhs_vec
@@ -211,13 +191,13 @@ class FEMSolver:
 
         For the transient heat equation with inhomogeneous Dirichlet boundary conditions:
         The discrete system is: (1/dt*M + K)*u_n+1 = (1/dt*M)*u_n + f + g_N
-        
+
         For free DOFs, the residual is:
         R_free = (1/dt*M + K)_free,free * u_free_n+1 + (1/dt*M + K)_free,bc * u_bc - (1/dt*M)_free,free * u_free_n - (1/dt*M)_free,bc * u_bc_n - f_free - g_N_free
-        
+
         But since we're using predictions for the entire solution, we compute the residual differently:
         R_free = [(1/dt*M + K) * u_pred_full - (1/dt*M) * u_prev_full - f - g_N]_free
-        
+
         The residual should be zero for an exact solution on free DOFs only.
         """
         # Set problem if not already set
@@ -241,9 +221,11 @@ class FEMSolver:
         # Create full solution vector including boundary values
         t_pred_full = t_pred_next.clone()
         t_prev_full = t_prev.clone()
-        
+
         # Set Dirichlet boundary values from the problem in both prediction and previous state
-        boundary_dofs_vector = self._create_boundary_dofs_vector(problem, device, t_pred_next.dtype)
+        boundary_dofs_vector = self._create_boundary_dofs_vector(
+            problem, device, t_pred_next.dtype
+        )
         t_pred_full[~free_dofs_mask] = boundary_dofs_vector[~free_dofs_mask]
         t_prev_full[~free_dofs_mask] = boundary_dofs_vector[~free_dofs_mask]
 
@@ -286,38 +268,42 @@ class FEMSolver:
         # The residual on boundary DOFs should be zero by construction since we enforce the BC
         residual_free = residual[free_dofs_mask]
 
-        return residual_free ** 2
+        return residual_free**2
 
-    def _create_boundary_dofs_vector(self, problem: MeshProblem, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _create_boundary_dofs_vector(
+        self, problem: MeshProblem, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
         """
         Create a vector with Dirichlet boundary values at boundary DOFs and zeros at free DOFs.
-        
+
         Args:
             problem: MeshProblem containing boundary conditions
             device: Target device for the tensor
             dtype: Target dtype for the tensor
-            
+
         Returns:
             boundary_vector: Vector [N_dofs] with boundary values at boundary nodes, zeros elsewhere
         """
         n_total_dofs = len(self.fes.FreeDofs())
         boundary_vector = torch.zeros(n_total_dofs, device=device, dtype=dtype)
-        
+
         # Get the mesh boundary segments and their corresponding boundary names
         # We need to map the boundary names to actual DOF indices
-        if hasattr(problem, 'boundary_values') and problem.boundary_values:
+        if hasattr(problem, "boundary_values") and problem.boundary_values:
             # Create a grid function to set boundary values
             gfu_boundary = ng.GridFunction(self.fes)
-            
+
             # Set boundary values using NGSolve's BoundaryCF
             try:
                 boundary_cf = self.mesh.BoundaryCF(problem.boundary_values, default=0)
                 gfu_boundary.Set(boundary_cf, ng.BND)
-                
+
                 # Extract the boundary values as a numpy array and convert to torch
                 boundary_values_np = gfu_boundary.vec.FV().NumPy().copy()
-                boundary_vector = torch.tensor(boundary_values_np, device=device, dtype=dtype)
-                
+                boundary_vector = torch.tensor(
+                    boundary_values_np, device=device, dtype=dtype
+                )
+
                 # Zero out the free DOFs (keep only boundary values)
                 free_dofs_bitarray = self.fes.FreeDofs()
                 free_dofs_mask = torch.tensor(
@@ -326,11 +312,11 @@ class FEMSolver:
                     device=device,
                 )
                 boundary_vector[free_dofs_mask] = 0.0
-                
+
             except Exception as e:
                 print(f"Warning: Could not set boundary values automatically: {e}")
                 print("Using zero boundary values")
-                
+
         return boundary_vector
 
     def _compute_source_term(
@@ -346,9 +332,15 @@ class FEMSolver:
 
         if problem.source_function is not None:
             if isinstance(problem.source_function, torch.Tensor):
-                source_nodal = problem.source_function.detach().clone().to(device=device, dtype=dtype)
+                source_nodal = (
+                    problem.source_function.detach()
+                    .clone()
+                    .to(device=device, dtype=dtype)
+                )
             else:
-                source_nodal = torch.tensor(problem.source_function, device=device, dtype=dtype)
+                source_nodal = torch.tensor(
+                    problem.source_function, device=device, dtype=dtype
+                )
             return torch.sparse.mm(mass_mat, source_nodal.unsqueeze(1)).squeeze()
 
         return torch.zeros_like(temperature_field, device=device, dtype=dtype)
@@ -365,7 +357,9 @@ class FEMSolver:
             return None
 
         if self.mass_matrix_mat is None:
-            raise ValueError("Mass matrix not initialized for nonlinear source computation")
+            raise ValueError(
+                "Mass matrix not initialized for nonlinear source computation"
+            )
 
         device = self.mass_matrix_mat.device
         dtype = self.mass_matrix_mat.dtype
@@ -428,6 +422,7 @@ class FEMSolver:
             coefs=coefs,
             names=names,
             filename=str(filename),
+            order=self.order,
         )
         for idx, time in enumerate(time_steps):
             gfu_true.vec.FV().NumPy()[:] = array_true[idx]
@@ -455,18 +450,24 @@ class FEMSolver:
         )
         print(f"Results saved as {npz_filename}")
 
+
 if __name__ == "__main__":
 
     import ngsolve as ng
-    from mesh_utils import build_graph_from_mesh, create_gaussian_initial_condition
+    from mesh_utils import create_gaussian_initial_condition
     from containers import MeshProblem
     from graph_creator import GraphCreator
-    from train_problems import create_test_problem, create_mms_problem, create_industrial_heating_problem, create_source_test_problem
+    from train_problems import (
+        create_test_problem,
+        create_mms_problem,
+        create_industrial_heating_problem,
+        create_source_test_problem,
+    )
 
-    problem, time_config = create_source_test_problem(maxh=0.1, alpha=1)
+    problem, time_config = create_mms_problem(maxh=0.1)
 
     # Initialize FEM solver
-    fem_solver = FEMSolver(problem.mesh, order=1, problem=problem)
+    fem_solver = FEMSolver(problem.mesh, order=2, problem=problem)
 
     # Solve transient problem
     transient_solution = fem_solver.solve_transient_problem(problem)
@@ -492,4 +493,3 @@ if __name__ == "__main__":
         problem.time_config.time_steps,
         filename="results/fem_tests/vtk/result",
     )
-

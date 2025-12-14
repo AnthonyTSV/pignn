@@ -37,11 +37,13 @@ class DataDrivenMGNTrainer:
         # Generate ground truth data using FEM for all problems
         self.all_ground_truth = []
         self.all_fem_solvers: List[FEMSolver] = []
-        
+
         print(f"Generating ground truth data for {len(problems)} problems...")
         for i, problem in enumerate(problems):
             print(f"Solving problem {i+1}/{len(problems)}...")
-            fem_solver = FEMSolver(problem.mesh, problem=problem)
+            fem_solver = FEMSolver(
+                problem.mesh, order=problem.mesh_config.order, problem=problem
+            )
             ground_truth = fem_solver.solve_transient_problem(problem)
             self.all_ground_truth.append(ground_truth)
             self.all_fem_solvers.append(fem_solver)
@@ -83,24 +85,24 @@ class DataDrivenMGNTrainer:
         """Create Dirichlet values array based on problem's boundary conditions."""
         # Create a temporary graph to get positions and auxiliary data
         temp_data, temp_aux = graph_creator.create_graph()
-        
+
         # Define a custom function based on problem's Dirichlet boundary values
         def dirichlet_function(x, y):
             # Get the boundary values from the problem
-            boundary_values = getattr(problem, 'boundary_values', {})
-            
+            boundary_values = getattr(problem, "boundary_values", {})
+
             # Determine which boundary the point (x, y) is on based on position
             # For a rectangular domain, check which boundary is closest
             pos_array = temp_data.pos.numpy()
             x_min, x_max = pos_array[:, 0].min(), pos_array[:, 0].max()
             y_min, y_max = pos_array[:, 1].min(), pos_array[:, 1].max()
-            
+
             tolerance = 1e-6
-            
+
             # Check boundaries in order of priority (left, right, bottom, top)
             if abs(x - x_min) < tolerance:  # Left boundary
                 return boundary_values.get("left", 0.0)
-            elif abs(x - x_max) < tolerance:  # Right boundary  
+            elif abs(x - x_max) < tolerance:  # Right boundary
                 return boundary_values.get("right", 0.0)
             elif abs(y - y_min) < tolerance:  # Bottom boundary
                 return boundary_values.get("bottom", 0.0)
@@ -109,22 +111,24 @@ class DataDrivenMGNTrainer:
             else:
                 # Interior point - should not have Dirichlet BC, but default to 0
                 return 0.0
-        
+
         # Create Dirichlet values using the custom function
         dirichlet_vals = create_dirichlet_values(
             pos=temp_data.pos,
             aux_data=temp_aux,
             dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-            temperature_function=dirichlet_function
+            temperature_function=dirichlet_function,
         )
-        
+
         return dirichlet_vals
 
     def prepare_training_data_all_problems(self):
         """Prepare training data for temporal bundling prediction from all problems."""
         all_training_data = []
-        
-        for prob_idx, (problem, ground_truth) in enumerate(zip(self.problems, self.all_ground_truth)):
+
+        for prob_idx, (problem, ground_truth) in enumerate(
+            zip(self.problems, self.all_ground_truth)
+        ):
             time_steps = self.config["time_config"].time_steps
 
             graph_creator = GraphCreator(
@@ -136,11 +140,10 @@ class DataDrivenMGNTrainer:
             )
 
             # Get the Neumann values for this problem
-            neumann_vals = getattr(problem, 'neumann_values_array', None)
+            neumann_vals = getattr(problem, "neumann_values_array", None)
 
-            
             # Get the Dirichlet values for this problem
-            dirichlet_vals = getattr(problem, 'dirichlet_values_array', None)
+            dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
 
             # Create training pairs for temporal bundling for this problem
             for idx in range(len(time_steps) - self.time_window):  # Need n future steps
@@ -161,7 +164,10 @@ class DataDrivenMGNTrainer:
 
                 # Build graph from current state
                 data, aux = graph_creator.create_graph(
-                    T_current=input_state, t_scalar=current_time, neumann_values=neumann_vals, dirichlet_values=dirichlet_vals
+                    T_current=input_state,
+                    t_scalar=current_time,
+                    neumann_values=neumann_vals,
+                    dirichlet_values=dirichlet_vals,
                 )
 
                 free_graph, node_mapping, free_aux = (
@@ -199,9 +205,8 @@ class DataDrivenMGNTrainer:
         )
 
         # Get the Neumann values for this problem
-        neumann_vals = getattr(self.problem, 'neumann_values_array', None)
-        dirichlet_vals = getattr(self.problem, 'dirichlet_values_array', None)
-    
+        neumann_vals = getattr(self.problem, "neumann_values_array", None)
+        dirichlet_vals = getattr(self.problem, "dirichlet_values_array", None)
 
         # Create training pairs for temporal bundling
         for idx in range(len(time_steps) - self.time_window):  # Need n future steps
@@ -222,7 +227,10 @@ class DataDrivenMGNTrainer:
 
             # Build graph from current state
             data, aux = graph_creator.create_graph(
-                T_current=input_state, t_scalar=current_time, neumann_values=neumann_vals, dirichlet_values=dirichlet_vals
+                T_current=input_state,
+                t_scalar=current_time,
+                neumann_values=neumann_vals,
+                dirichlet_values=dirichlet_vals,
             )
 
             free_graph, node_mapping, free_aux = (
@@ -249,30 +257,32 @@ class DataDrivenMGNTrainer:
         """Split training data into train and validation sets based on problem indices."""
         train_data = []
         val_data = []
-        
+
         for data_point in self.training_data:
             problem_id = data_point["problem_id"]
             if problem_id in train_problems_indices:
                 train_data.append(data_point)
             elif problem_id in val_problems_indices:
                 val_data.append(data_point)
-        
+
         return train_data, val_data
 
     def validate(self, val_data):
         """Evaluate model on validation data."""
         self.model.eval()
         total_loss = 0.0
-        
+
         with torch.no_grad():
             for data_point in val_data:
                 graph_data = data_point["graph_data"].to(self.device)
-                target_tensor = torch.tensor(data_point["target"], dtype=torch.float32, device=self.device)
-                
+                target_tensor = torch.tensor(
+                    data_point["target"], dtype=torch.float32, device=self.device
+                )
+
                 predictions = self.model.forward(graph_data)
                 loss = nn.MSELoss()(predictions, target_tensor)
                 total_loss += loss.item()
-        
+
         return total_loss / len(val_data)
 
     def train_step(self, graph_data, target):
@@ -303,8 +313,12 @@ class DataDrivenMGNTrainer:
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters())}")
 
         # Split data
-        train_data, val_data = self.split_train_validation(train_problems_indices, val_problems_indices)
-        print(f"Training samples: {len(train_data)}, Validation samples: {len(val_data)}")
+        train_data, val_data = self.split_train_validation(
+            train_problems_indices, val_problems_indices
+        )
+        print(
+            f"Training samples: {len(train_data)}, Validation samples: {len(val_data)}"
+        )
 
         self.model.train()
 
@@ -346,7 +360,7 @@ class DataDrivenMGNTrainer:
     def rollout(self, problem_idx=0, n_steps=None):
         """Perform rollout prediction with temporal bundling for a specific problem."""
         self.model.eval()
-        
+
         problem = self.problems[problem_idx]
         ground_truth = self.all_ground_truth[problem_idx]
 
@@ -368,10 +382,10 @@ class DataDrivenMGNTrainer:
         )
 
         # Get the Neumann values for this problem
-        neumann_vals = getattr(problem, 'neumann_values_array', None)
-        
+        neumann_vals = getattr(problem, "neumann_values_array", None)
+
         # Get the Dirichlet values for this problem
-        dirichlet_vals = getattr(problem, 'dirichlet_values_array', None)
+        dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
 
         with torch.no_grad():
             step_idx = 0
@@ -380,7 +394,10 @@ class DataDrivenMGNTrainer:
 
                 # Build graph
                 data, aux = graph_creator.create_graph(
-                    T_current=T_current, t_scalar=current_time, neumann_values=neumann_vals, dirichlet_values=dirichlet_vals
+                    T_current=T_current,
+                    t_scalar=current_time,
+                    neumann_values=neumann_vals,
+                    dirichlet_values=dirichlet_vals,
                 )
                 free_graph, node_mapping, free_aux = (
                     graph_creator.create_free_node_subgraph(data, aux)
@@ -388,7 +405,9 @@ class DataDrivenMGNTrainer:
                 free_data = free_graph.to(self.device)
 
                 # Predict next n time steps
-                predictions_bundled = self.model.forward(free_data) # Shape: (n_free_nodes, time_window)
+                predictions_bundled = self.model.forward(
+                    free_data
+                )  # Shape: (n_free_nodes, time_window)
 
                 # Extract predictions for each time step
                 free_idx = node_mapping["free_to_original"].detach().cpu().numpy()
@@ -428,14 +447,14 @@ class DataDrivenMGNTrainer:
     def evaluate(self, problem_indices=None):
         """Evaluate the trained model on specified problems."""
         print("Evaluating model...")
-        
+
         if problem_indices is None:
             problem_indices = range(len(self.problems))
 
         all_errors = []
         for prob_idx in problem_indices:
             print(f"Evaluating problem {prob_idx + 1}...")
-            
+
             # Get predictions for this problem
             predictions = self.rollout(problem_idx=prob_idx)
             ground_truth = self.all_ground_truth[prob_idx]
@@ -445,19 +464,25 @@ class DataDrivenMGNTrainer:
             for i, (pred, true) in enumerate(zip(predictions, ground_truth)):
                 l2_error = np.linalg.norm(pred - true) / np.linalg.norm(true)
                 errors.append(l2_error)
-            
+
             all_errors.append(errors)
-            print(f"Problem {prob_idx + 1} - Average L2 error: {np.mean(errors):.6f}, Final L2 error: {errors[-1]:.6f}")
+            print(
+                f"Problem {prob_idx + 1} - Average L2 error: {np.mean(errors):.6f}, Final L2 error: {errors[-1]:.6f}"
+            )
 
         # Overall statistics
         avg_errors = np.mean([np.mean(errors) for errors in all_errors])
         final_errors = np.mean([errors[-1] for errors in all_errors])
-        print(f"\nOverall - Average L2 error: {avg_errors:.6f}, Final L2 error: {final_errors:.6f}")
+        print(
+            f"\nOverall - Average L2 error: {avg_errors:.6f}, Final L2 error: {final_errors:.6f}"
+        )
 
         return all_errors
 
 
-def plot_results(predictions, ground_truth, errors, losses, val_losses, save_path="results"):
+def plot_results(
+    predictions, ground_truth, errors, losses, val_losses, save_path="results"
+):
     """Plot training results."""
     Path(save_path).mkdir(exist_ok=True)
 
@@ -466,8 +491,8 @@ def plot_results(predictions, ground_truth, errors, losses, val_losses, save_pat
 
     # Training and validation loss
     plt.subplot(1, 4, 1)
-    plt.plot(losses, label='Training')
-    plt.plot(val_losses, label='Validation')
+    plt.plot(losses, label="Training")
+    plt.plot(val_losses, label="Validation")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("MeshGraphNet Training/Validation Loss")
@@ -499,7 +524,9 @@ def plot_results(predictions, ground_truth, errors, losses, val_losses, save_pat
     num_plots = min(4, len(predictions))
     for i in range(1, num_plots):
         plt.scatter(ground_truth[i], predictions[i], alpha=0.5, label=f"Time Step {i}")
-    max_overall = max(np.max(ground_truth[num_plots-1]), np.max(predictions[num_plots-1]))
+    max_overall = max(
+        np.max(ground_truth[num_plots - 1]), np.max(predictions[num_plots - 1])
+    )
     plt.plot([0, max_overall], [0, max_overall], "k--", label="Ideal")
     plt.title("Predictions vs Ground Truth (Problem 1)")
     plt.xlabel("Ground Truth Temperature")
@@ -525,7 +552,7 @@ def main():
     # all_problems, time_config = generate_multiple_problems(n_problems=2, seed=42)
     mesh_problem, time_config = create_test_problem()
     all_problems = [mesh_problem, mesh_problem]
-    
+
     # Split problems into train and validation
     train_indices = list(range(1))
     val_indices = list(range(1, 2))
@@ -560,7 +587,9 @@ def main():
 
     # Evaluate model on training problems (to check for overfitting)
     print("\nEvaluating on training problems:")
-    train_errors = trainer.evaluate(problem_indices=train_indices[:3])  # Just first 3 for efficiency
+    train_errors = trainer.evaluate(
+        problem_indices=train_indices[:3]
+    )  # Just first 3 for efficiency
 
     # Get predictions for first validation problem for visualization
     predictions_val = trainer.rollout(problem_idx=val_indices[0])
@@ -568,24 +597,22 @@ def main():
 
     # Plot results
     plot_results(
-        predictions_val, 
-        ground_truth_val, 
-        val_errors, 
-        trainer.losses, 
-        trainer.val_losses
+        predictions_val,
+        ground_truth_val,
+        val_errors,
+        trainer.losses,
+        trainer.val_losses,
     )
 
     # Export results for first validation problem
     print("Exporting results for first validation problem...")
     fem_solver = trainer.all_fem_solvers[val_indices[0]]
-    
+
     # Ensure all arrays have the same length for export
     min_length = min(
-        len(ground_truth_val), 
-        len(predictions_val), 
-        len(time_config.time_steps_export)
+        len(ground_truth_val), len(predictions_val), len(time_config.time_steps_export)
     )
-    
+
     fem_solver.export_to_vtk(
         ground_truth_val[:min_length],
         predictions_val[:min_length],
@@ -603,10 +630,10 @@ def main():
         "val_avg_errors": [np.mean(errors) for errors in val_errors],
         "train_avg_errors": [np.mean(errors) for errors in train_errors],
     }
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("TRAINING SUMMARY")
-    print("="*60)
+    print("=" * 60)
     print(f"Total problems: {summary['total_problems']}")
     print(f"Training problems: {summary['train_problems']}")
     print(f"Validation problems: {summary['val_problems']}")
