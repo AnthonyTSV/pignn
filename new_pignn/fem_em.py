@@ -245,27 +245,49 @@ class FEMSolverEM:
         Export solutions to VTK file for visualization in Paraview.
         """
 
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        out_dir = os.path.dirname(filename)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
 
-        # Create GridFunctions for true and predicted solutions (magnitude)
-        gfu_true_mag = ng.GridFunction(self.fes)
-        gfu_pred_mag = ng.GridFunction(self.fes)
+        array_true = np.asarray(array_true)
+        array_pred = np.asarray(array_pred)
 
-        # Set complex values properly
-        gfu_true_mag.vec.FV().NumPy()[:] = array_true
-        gfu_pred_mag.vec.FV().NumPy()[:] = array_pred
+        fes_real = ng.H1(self.mesh, order=self.order)
 
-        # Create magnitude versions for visualization
-        gfu_true_abs = ng.GridFunction(ng.H1(self.mesh, order=self.order))
-        gfu_pred_abs = ng.GridFunction(ng.H1(self.mesh, order=self.order))
+        gfu_true_real = ng.GridFunction(fes_real)
+        gfu_true_imag = ng.GridFunction(fes_real)
+        gfu_true_abs = ng.GridFunction(fes_real)
+        gfu_pred_real = ng.GridFunction(fes_real)
+        gfu_pred_imag = ng.GridFunction(fes_real)
+        gfu_pred_abs = ng.GridFunction(fes_real)
+        gfu_err_abs = ng.GridFunction(fes_real)
+
+        gfu_true_real.vec.FV().NumPy()[:] = np.real(array_true)
+        gfu_true_imag.vec.FV().NumPy()[:] = np.imag(array_true)
         gfu_true_abs.vec.FV().NumPy()[:] = np.abs(array_true)
+        gfu_pred_real.vec.FV().NumPy()[:] = np.real(array_pred)
+        gfu_pred_imag.vec.FV().NumPy()[:] = np.imag(array_pred)
         gfu_pred_abs.vec.FV().NumPy()[:] = np.abs(array_pred)
+        gfu_err_abs.vec.FV().NumPy()[:] = np.abs(array_true - array_pred)
 
         coefs = [
+            gfu_true_real,
+            gfu_true_imag,
             gfu_true_abs,
+            gfu_pred_real,
+            gfu_pred_imag,
             gfu_pred_abs,
+            gfu_err_abs,
         ]
-        names = ["ExactSolution_magnitude", "PredictedSolution_magnitude"]
+        names = [
+            "ExactSolution_real",
+            "ExactSolution_imag",
+            "ExactSolution_abs",
+            "PredictedSolution_real",
+            "PredictedSolution_imag",
+            "PredictedSolution_abs",
+            "AbsError",
+        ]
 
         vtk_out = ng.VTKOutput(
             self.mesh,
