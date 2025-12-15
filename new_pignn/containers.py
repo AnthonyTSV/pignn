@@ -1,5 +1,5 @@
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 import torch
 import ngsolve as ng
@@ -101,11 +101,37 @@ class MeshProblemEM:
         self.n_edges = graph_data.num_edges
 
         self.material_properties = {}
+        self.dirichlet_values = {}
         self.dirichlet_values_array = None  # To be set
+
+        ###
+        
+        self.profile_width = 7 * 1e-3  # m
+        self.profile_height = 7 * 1e-3  # m
+
+        self.mu0 = 4 * 3.1415926535e-7  # Permeability of free space
+        self.mu_r_workpiece = 100  # Relative permeability of workpiece
+        self.mu_r_air = 1.0
+        self.mu_r_coil = 1.0
+
+        self.sigma_workpiece = 6250000.0  # S/m
+        self.sigma_air = 0.0
+        self.sigma_coil = 58823529.0
+
+        # Coil parameters
+        self.N_turns = 1  # Number of turns
+        self.I_coil = 1000  # A
+        self.coil_area = self.profile_width * self.profile_height  # Cross-sectional area
+        self.frequency = 1000  # Hz
+        self.omega = 2 * ng.pi * self.frequency  # rad/s
 
     def set_material_properties(self, material_properties: dict):
         """Set material properties."""
         self.material_properties = material_properties
+
+    def set_dirichlet_values(self, dirichlet_values: dict):
+        """Set Dirichlet boundary conditions."""
+        self.dirichlet_values = dirichlet_values
 
     def set_dirichlet_values_array(self, dirichlet_values_array: np.ndarray):
         """Set Dirichlet values array for all nodes."""
@@ -133,7 +159,9 @@ class TrainingConfig:
     """Configuration for PI-GNN training."""
 
     # Time parameters
-    time_config: TimeConfig = TimeConfig(t_final=1.0, dt=0.01)
+    time_config: TimeConfig = field(
+        default_factory=lambda: TimeConfig(t_final=1.0, dt=0.01)
+    )
 
     # Training parameters
     epochs: int = 500

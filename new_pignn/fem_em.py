@@ -34,41 +34,21 @@ class FEMSolverEM:
     def init_matrices(self):
         if self.problem is None:
             raise ValueError("Problem must be set before initializing matrices")
-
-        profile_width = 7 * 1e-3  # m
-        profile_height = 7 * 1e-3  # m
-
-        mu0 = 4 * 3.1415926535e-7  # Permeability of free space
-        mu_r_workpiece = 100  # Relative permeability of workpiece
-        mu_r_air = 1.0
-        mu_r_coil = 1.0
-
-        sigma_workpiece = 6250000.0  # S/m
-        sigma_air = 0.0
-        sigma_coil = 58823529.0
-
-        # Coil parameters
-        N_turns = 1  # Number of turns
-        I_coil = 1000  # A
-        coil_area = profile_width * profile_height  # Cross-sectional area
-        frequency = 1000  # Hz
-        omega = 2 * ng.pi * frequency  # rad/s
-
         # Define material properties as coefficient functions
         mu_r = self.mesh.MaterialCF(
             {
-                "mat_workpiece": mu_r_workpiece,
-                "mat_air": mu_r_air,
-                "mat_coil": mu_r_coil,
+                "mat_workpiece": self.problem.mu_r_workpiece,
+                "mat_air": self.problem.mu_r_air,
+                "mat_coil": self.problem.mu_r_coil,
             },
             default=1.0,
         )
 
         sigma = self.mesh.MaterialCF(
             {
-                "mat_workpiece": sigma_workpiece,
-                "mat_air": sigma_air,
-                "mat_coil": sigma_coil,
+                "mat_workpiece": self.problem.sigma_workpiece,
+                "mat_air": self.problem.sigma_air,
+                "mat_coil": self.problem.sigma_coil,
             },
             default=0.0,
         )
@@ -89,14 +69,13 @@ class FEMSolverEM:
         # Avoid 1/r singularity on the symmetry axis (r=0)
         inv_r = ng.IfPos(r, 1.0 / r, 0.0)
 
-        nu = 1.0 / (mu0 * mu_r)
+        nu = 1.0 / (self.problem.mu0 * mu_r)
 
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
-        a += 1j * omega * sigma * r * A * v * ng.dx
-
-        Acoil = profile_width * profile_height
-        Js_phi = N_turns * I_coil / Acoil
+        a += 1j * self.problem.omega * sigma * r * A * v * ng.dx
+        Acoil = self.problem.profile_width * self.problem.profile_height
+        Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
         f = ng.LinearForm(fes)
         f += r * Js_phi * v * ng.dx("mat_coil")
 
@@ -121,40 +100,21 @@ class FEMSolverEM:
         return tensor.to(self.device)
 
     def solve(self, problem):
-        profile_width = 7 * 1e-3  # m
-        profile_height = 7 * 1e-3  # m
-
-        mu0 = 4 * 3.1415926535e-7  # Permeability of free space
-        mu_r_workpiece = 100  # Relative permeability of workpiece
-        mu_r_air = 1.0
-        mu_r_coil = 1.0
-
-        sigma_workpiece = 6250000.0  # S/m
-        sigma_air = 0.0
-        sigma_coil = 58823529.0
-
-        # Coil parameters
-        N_turns = 1  # Number of turns
-        I_coil = 1000  # A
-        coil_area = profile_width * profile_height  # Cross-sectional area
-        frequency = 1000  # Hz
-        omega = 2 * ng.pi * frequency  # rad/s
-
         # Define material properties as coefficient functions
         mu_r = self.mesh.MaterialCF(
             {
-                "mat_workpiece": mu_r_workpiece,
-                "mat_air": mu_r_air,
-                "mat_coil": mu_r_coil,
+                "mat_workpiece": self.problem.mu_r_workpiece,
+                "mat_air": self.problem.mu_r_air,
+                "mat_coil": self.problem.mu_r_coil,
             },
             default=1.0,
         )
 
         sigma = self.mesh.MaterialCF(
             {
-                "mat_workpiece": sigma_workpiece,
-                "mat_air": sigma_air,
-                "mat_coil": sigma_coil,
+                "mat_workpiece": self.problem.sigma_workpiece,
+                "mat_air": self.problem.sigma_air,
+                "mat_coil": self.problem.sigma_coil,
             },
             default=0.0,
         )
@@ -175,20 +135,19 @@ class FEMSolverEM:
         # Avoid 1/r singularity on the symmetry axis (r=0)
         inv_r = ng.IfPos(r, 1.0 / r, 0.0)
 
-        nu = 1.0 / (mu0 * mu_r)
+        nu = 1.0 / (self.problem.mu0 * mu_r)
 
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
-        a += 1j * omega * sigma * r * A * v * ng.dx
-
-        Acoil = profile_width * profile_height
-        Js_phi = N_turns * I_coil / Acoil
+        a += 1j * self.problem.omega * sigma * r * A * v * ng.dx
+        Acoil = self.problem.profile_width * self.problem.profile_height
+        Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
         f = ng.LinearForm(fes)
         f += r * Js_phi * v * ng.dx("mat_coil")
 
         a.Assemble()
         f.Assemble()
-        gfA.vec.data = a.mat.Inverse(fes.FreeDofs()) * f.vec
+        gfA.vec.data = a.mat.Inverse() * f.vec
 
         # def curl(u):
         #     gradu = ng.grad(u)
@@ -226,6 +185,55 @@ class FEMSolverEM:
         res = Ax - self.linear_form
 
         return res
+
+    def _create_boundary_dofs_vector(
+        self, problem: MeshProblemEM, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """
+        Create a vector with Dirichlet boundary values at boundary DOFs and zeros at free DOFs.
+
+        Args:
+            problem: MeshProblem containing boundary conditions
+            device: Target device for the tensor
+            dtype: Target dtype for the tensor
+
+        Returns:
+            boundary_vector: Vector [N_dofs] with boundary values at boundary nodes, zeros elsewhere
+        """
+        n_total_dofs = len(self.fes.FreeDofs())
+        boundary_vector = torch.zeros(n_total_dofs, device=device, dtype=dtype)
+
+        # Get the mesh boundary segments and their corresponding boundary names
+        # We need to map the boundary names to actual DOF indices
+        if hasattr(problem, "dirichlet_values") and problem.dirichlet_values:
+            # Create a grid function to set boundary values
+            gfu_boundary = ng.GridFunction(self.fes)
+
+            # Set boundary values using NGSolve's BoundaryCF
+            try:
+                boundary_cf = self.mesh.BoundaryCF(problem.dirichlet_values, default=0)
+                gfu_boundary.Set(boundary_cf, ng.BND)
+
+                # Extract the boundary values as a numpy array and convert to torch
+                boundary_values_np = gfu_boundary.vec.FV().NumPy().copy()
+                boundary_vector = torch.tensor(
+                    boundary_values_np, device=device, dtype=dtype
+                )
+
+                # Zero out the free DOFs (keep only boundary values)
+                free_dofs_bitarray = self.fes.FreeDofs()
+                free_dofs_mask = torch.tensor(
+                    [free_dofs_bitarray[i] for i in range(len(free_dofs_bitarray))],
+                    dtype=torch.bool,
+                    device=device,
+                )
+                boundary_vector[free_dofs_mask] = 0.0
+
+            except Exception as e:
+                print(f"Warning: Could not set boundary values automatically: {e}")
+                print("Using zero boundary values")
+
+        return boundary_vector
 
     def export_to_vtk(
         self,
@@ -297,13 +305,15 @@ if __name__ == "__main__":
     # Initialize FEM solver
     fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
 
-    curl_gfa = fem_solver.solve()
+    gfA = fem_solver.solve(problem)
     # random_solution = np.random.rand(len(curl_gfa)) + 1j * np.random.rand(len(curl_gfa))
     # curl_gfa_noisy = curl_gfa + 1e-6 * (
     #     np.random.rand(len(curl_gfa)) + 1j * np.random.rand(len(curl_gfa))
     # )
-    residual = fem_solver.compute_residual(curl_gfa)
-    print(f"FEM solution computed with residual: {residual:.6e}")
+    residual = fem_solver.compute_residual(gfA)
+    residuals_abs = np.absolute(residual.cpu().numpy())
+    print(residuals_abs)
+    print(f"Mean residual: {np.mean(residuals_abs)}")
 
     # fem_solver.export_to_vtk(
     #     curl_gfa,

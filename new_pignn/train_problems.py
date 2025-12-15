@@ -650,11 +650,11 @@ def create_em_problem():
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     neumann_boundaries = []
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
-    fes = ng.H1(mesh, order=2, dirichlet="|".join(dirichlet_boundaries))
+    fes = ng.H1(mesh, order=1, dirichlet="|".join(dirichlet_boundaries))
     # Mesh configuration
     mesh_config = MeshConfig(
         maxh=1,
-        order=2,
+        order=1,
         dim=2,
         dirichlet_boundaries=dirichlet_boundaries,
         neumann_boundaries=neumann_boundaries,
@@ -688,5 +688,6 @@ def create_em_problem():
         problem_id=0,
     )
     problem.set_dirichlet_values_array(dirichlet_vals)
+    problem.set_dirichlet_values(dirichlet_boundaries_dict)
 
     return problem
