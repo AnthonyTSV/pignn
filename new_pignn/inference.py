@@ -70,7 +70,19 @@ def load_trained_model(model_path, problem):
     ).to(device)
     
     # Load the state dict
-    state_dict = torch.load(model_path, map_location=device)
+    # PyTorch 2.6 changed the default `weights_only` of torch.load from False -> True.
+    # For inference, we *prefer* a safe weights-only load when possible.
+    try:
+        state_dict = torch.load(model_path, map_location=device, weights_only=True)
+    except TypeError:
+        # Older PyTorch versions don't support `weights_only`.
+        state_dict = torch.load(model_path, map_location=device)
+    except Exception as e:
+        print(
+            "Safe weights-only load failed; retrying with weights_only=False. "
+            "Only do this if you trust the checkpoint file."
+        )
+        state_dict = torch.load(model_path, map_location=device, weights_only=False)
     model.load_state_dict(state_dict)
     model.eval()
     

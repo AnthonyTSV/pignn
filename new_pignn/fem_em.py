@@ -147,7 +147,7 @@ class FEMSolverEM:
 
         a.Assemble()
         f.Assemble()
-        gfA.vec.data = a.mat.Inverse() * f.vec
+        gfA.vec.data = a.mat.Inverse(fes.FreeDofs()) * f.vec
 
         # def curl(u):
         #     gradu = ng.grad(u)
@@ -179,10 +179,30 @@ class FEMSolverEM:
 
         pred_sol_tensor = pred_sol_tensor.to(self.device)
 
-        Ax = torch.sparse.mm(self.bilinear_form, pred_sol_tensor.unsqueeze(1)).squeeze(
+        free_dofs_bitarray = self.fes.FreeDofs()
+
+        # Convert BitArray to torch boolean mask
+        free_dofs_mask = torch.tensor(
+            [free_dofs_bitarray[i] for i in range(len(free_dofs_bitarray))],
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        # enforce Dirichlet boundary conditions
+        boundary_dofs_vector = self._create_boundary_dofs_vector(
+            problem=self.problem,
+            device=self.device,
+            dtype=torch.complex128,
+        )
+        pred_full = pred_sol_tensor.clone()
+        pred_full[~free_dofs_mask] = boundary_dofs_vector[~free_dofs_mask]
+
+        Ax = torch.sparse.mm(self.bilinear_form, pred_full.unsqueeze(1)).squeeze(
             1
         )
         res = Ax - self.linear_form
+
+        res = res[free_dofs_mask]
 
         return res
 

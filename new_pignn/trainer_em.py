@@ -109,6 +109,10 @@ class PIMGNTrainerEM:
         self.losses = []
         self.val_losses = []
 
+        # Populated during training when physics loss is computed.
+        # Can remain None if training loop is skipped (e.g., resume at final epoch).
+        self.last_residuals = None
+
         # Initialize logger
         save_dir = config.get("save_dir", "results/physics_informed_em")
         log_filename = config.get("log_filename", "training_log.json")
@@ -130,7 +134,16 @@ class PIMGNTrainerEM:
         resume_from = config.get("resume_from", None)
         if resume_from and os.path.exists(resume_from):
             print(f"Resuming training from checkpoint: {resume_from}")
-            checkpoint = torch.load(resume_from, map_location=self.device)
+            # PyTorch 2.6 changed the default `weights_only` of torch.load from False -> True.
+            # We store a full training checkpoint (optimizer/scheduler/etc.), so we must load
+            # with `weights_only=False`. Only do this for trusted checkpoint files.
+            try:
+                checkpoint = torch.load(
+                    resume_from, map_location=self.device, weights_only=False
+                )
+            except TypeError:
+                # Backward compatibility with older PyTorch versions.
+                checkpoint = torch.load(resume_from, map_location=self.device)
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 # Full checkpoint with optimizer state
                 self.model.load_state_dict(checkpoint["model_state_dict"])
@@ -220,18 +233,20 @@ class PIMGNTrainerEM:
         residual = fem_solver.compute_residual(
             prediction_full,
         )
+        # residual_real_sq = residual.real**2
+        # residual_imag_sq = residual.imag**2
+        # residual_real_free = residual_real_sq[free_to_original]
+        # residual_imag_free = residual_imag_sq[free_to_original]
+        # mse_real = torch.mean(residual_real_free)
+        # mse_imag = torch.mean(residual_imag_free)
+        # residual_free = mse_real + mse_imag
+        residual_free = torch.mean(torch.absolute(residual**2))
 
-        # Compute MSE over free DOFs only.
-        # For complex residuals, use squared magnitude: |r|^2 = real^2 + imag^2
-        residual_magnitude_sq = residual.real**2 + residual.imag**2
-        residual_free = residual_magnitude_sq[free_to_original]
-        fem_loss = torch.mean(residual_free)
+        self.last_residuals = residual_free.detach().cpu().numpy()
 
-        self.last_residuals = residual.detach().cpu().numpy()
+        return residual_free
 
-        return fem_loss
-
-    def train_step(self, problem_idx, iteration=0):
+    def train_step(self, problem_idx, prediction=None):
         """
         Compute physics loss for steady-state problem.
         Returns the loss value and prediction.
@@ -255,32 +270,11 @@ class PIMGNTrainerEM:
         material_field = getattr(problem, "material_field", None)
         source_vals = getattr(problem, "source_function", None)
 
-        # Initial guess: use complex zeros for consistent real/imag feature dims
-        initial_guess = getattr(
-            problem,
-            "initial_condition",
-            np.zeros(
-                int(getattr(fem_solver.fes, "ndof", problem.n_nodes)),
-                dtype=np.complex128,
-            ),
-        )
-        if not np.iscomplexobj(initial_guess):
-            initial_guess = np.asarray(initial_guess, dtype=np.float64).astype(
-                np.complex128
-            )
-
-        # Add small random noise to initial guess for regularization
-        if iteration > 0 and self.config.get("add_noise", False):
-            noise_scale = self.config.get("noise_scale", 0.01)
-            initial_guess = initial_guess + np.random.normal(
-                0, noise_scale, size=initial_guess.shape
-            )
-
         self.optimizer.zero_grad()
 
         # Build full graph
         data, aux = graph_creator.create_graph(
-            T_current=initial_guess,
+            T_current=prediction,
             t_scalar=0.0,  # Time is irrelevant for steady-state
             material_node_field=material_field,
             neumann_values=neumann_vals,
@@ -332,8 +326,8 @@ class PIMGNTrainerEM:
         if val_problems_indices:
             print(f"Validation on problems: {val_problems_indices}")
 
-        # Number of iterations per problem per epoch
-        iterations_per_problem = self.config.get("iterations_per_problem", 10)
+        problem = self.problems[train_problems_indices[0]]
+        prediction = np.random.rand(problem.n_nodes) + 1j * np.random.rand(problem.n_nodes)
 
         for epoch in range(self.start_epoch, self.config["epochs"]):
             epoch_start = time.time()
@@ -345,17 +339,9 @@ class PIMGNTrainerEM:
 
             # Train on each problem in the training set
             for problem_idx in shuffled_train_indices:
-                problem_losses = []
-
-                # Multiple iterations on the same problem to improve convergence
-                for iteration in range(iterations_per_problem):
-                    physics_loss, prediction = self.train_step(problem_idx, iteration)
-                    problem_losses.append(physics_loss)
-
-                # Average loss over all iterations for this problem
-                if problem_losses:
-                    avg_problem_loss = np.mean(problem_losses)
-                    epoch_losses.append(avg_problem_loss)
+                physics_loss, prediction_next = self.train_step(problem_idx, prediction=prediction)
+                prediction = prediction_next
+                epoch_losses.append(physics_loss)
 
             avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0.0
             self.losses.append(avg_epoch_loss)
@@ -649,11 +635,17 @@ def _run_single_problem_experiment(problem, config, experiment_name: str):
     trainer.train(train_problems_indices=[0])
 
     print("\nEvaluating trained PIMGN...")
-    last_residuals = trainer.last_residuals
-    # last_residuals are complex for EM; JSON can't serialize complex numbers.
-    trainer.logger.log_evaluation(
-        np.abs(last_residuals).tolist(), "residuals_per_time_step_abs"
-    )
+    last_residuals = getattr(trainer, "last_residuals", None)
+    if last_residuals is not None:
+        # last_residuals are complex for EM
+        trainer.logger.log_evaluation(
+            np.atleast_1d(np.abs(last_residuals)).tolist(),
+            "residuals_per_time_step_abs",
+        )
+    else:
+        print(
+            "Note: No `last_residuals` available (training may have been skipped due to resume epoch >= configured epochs)."
+        )
     pos_data = trainer.problems[0].graph_data.pos.numpy()
     try:
         predictions, ground_truth, errors = trainer.evaluate_with_ground_truth(
@@ -681,7 +673,7 @@ def _run_single_problem_experiment(problem, config, experiment_name: str):
 def train_pimgn_on_single_problem(resume_from: str = None):
     problem = create_em_problem()
     config = {
-        "epochs": 100,
+        "epochs": 1,
         "lr": 1e-2,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem",

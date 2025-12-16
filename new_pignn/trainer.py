@@ -113,7 +113,16 @@ class PIMGNTrainer:
         resume_from = config.get("resume_from", None)
         if resume_from and os.path.exists(resume_from):
             print(f"Resuming training from checkpoint: {resume_from}")
-            checkpoint = torch.load(resume_from, map_location=self.device)
+            # PyTorch 2.6 changed the default `weights_only` of torch.load from False -> True.
+            # We store a full training checkpoint (optimizer/scheduler/etc.), so we must load
+            # with `weights_only=False`. Only do this for trusted checkpoint files.
+            try:
+                checkpoint = torch.load(
+                    resume_from, map_location=self.device, weights_only=False
+                )
+            except TypeError:
+                # Backward compatibility with older PyTorch versions.
+                checkpoint = torch.load(resume_from, map_location=self.device)
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 # Full checkpoint with optimizer state
                 self.model.load_state_dict(checkpoint["model_state_dict"])
