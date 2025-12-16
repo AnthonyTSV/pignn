@@ -430,16 +430,16 @@ def _run_multiple_problem_experiment(
 
 
 def train_pimgn_on_single_problem(resume_from: str = None):
-    problem, time_config = create_mms_problem(maxh=0.1)
+    problem, time_config = create_mms_problem(maxh=0.2)
     config = {
         "epochs": 500,
         "lr": 1e-3,
         "time_window": 20,
         "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/test_second_order_mms_maxh_0.1",
+        "save_dir": "results/physics_informed/test_first_order_mms_maxh_0.2",
         "resume_from": resume_from,  # Path to checkpoint to resume from
     }
-    _run_single_problem_experiment(problem, time_config, config, "Second order MMS")
+    _run_single_problem_experiment(problem, time_config, config, "First order MMS")
 
 
 def train_multiple_problems():

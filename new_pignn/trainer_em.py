@@ -57,21 +57,21 @@ class PIMGNTrainerEM:
 
         # For steady-state EM, use complex zero initial condition (ensures consistent
         # real/imag feature dimensions in the graph creator).
-        initial_guess = getattr(
-            first_problem,
-            "initial_condition",
-            np.zeros(
-                int(getattr(first_fes, "ndof", first_problem.n_nodes)),
-                dtype=np.complex128,
-            ),
-        )
-        if not np.iscomplexobj(initial_guess):
-            initial_guess = np.asarray(initial_guess, dtype=np.float64).astype(
-                np.complex128
-            )
+        # initial_guess = getattr(
+        #     first_problem,
+        #     "initial_condition",
+        #     np.zeros(
+        #         int(getattr(first_fes, "ndof", first_problem.n_nodes)),
+        #         dtype=np.complex128,
+        #     ),
+        # )
+        # if not np.iscomplexobj(initial_guess):
+        #     initial_guess = np.asarray(initial_guess, dtype=np.float64).astype(
+        #         np.complex128
+        #     )
 
         sample_data, aux = graph_creator.create_graph(
-            T_current=initial_guess,
+            # T_current=initial_guess,
             t_scalar=0.0,
             material_node_field=material_field,
             neumann_values=neumann_vals,
@@ -85,7 +85,7 @@ class PIMGNTrainerEM:
 
         input_dim_node = free_node_data.x.shape[1]
         input_dim_edge = free_node_data.edge_attr.shape[1]
-        output_dim = 2  # Complex-valued solution: [real, imaginary]
+        output_dim = 1  # Complex-valued solution: [real, imaginary]
 
         print(
             f"Input dimensions - Node: {input_dim_node}, Edge: {input_dim_edge}, Output: {output_dim} (complex)"
@@ -191,12 +191,7 @@ class PIMGNTrainerEM:
         dirichlet_mask = aux["dirichlet_mask"].to(self.device)
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         if dirichlet_vals is not None:
-            if np.iscomplexobj(dirichlet_vals):
-                dirichlet_vals_tensor = torch.tensor(
-                    dirichlet_vals, dtype=torch.complex128, device=self.device
-                )
-            else:
-                dirichlet_vals_tensor = torch.tensor(
+            dirichlet_vals_tensor = torch.tensor(
                     dirichlet_vals, dtype=torch.float64, device=self.device
                 )
         else:
@@ -207,40 +202,35 @@ class PIMGNTrainerEM:
         prediction_full_real = torch.zeros(
             n_total, dtype=torch.float64, device=self.device
         )
-        prediction_full_imag = torch.zeros(
-            n_total, dtype=torch.float64, device=self.device
-        )
+        # prediction_full_imag = torch.zeros(
+        #     n_total, dtype=torch.float64, device=self.device
+        # )
         prediction_full_real[free_to_original] = prediction_free[:, 0].to(
             dtype=torch.float64
         )
-        prediction_full_imag[free_to_original] = prediction_free[:, 1].to(
-            dtype=torch.float64
-        )
+        # prediction_full_imag[free_to_original] = prediction_free[:, 1].to(
+        #     dtype=torch.float64
+        # )
 
         # Combine into complex tensor
-        prediction_full = torch.complex(prediction_full_real, prediction_full_imag)
+        prediction_full = prediction_full_real # + 1j * prediction_full_imag
 
         # Enforce Dirichlet BCs on prediction
         if dirichlet_vals_tensor is not None:
-            dirichlet_vals_complex = (
-                dirichlet_vals_tensor
-                if torch.is_complex(dirichlet_vals_tensor)
-                else dirichlet_vals_tensor.to(dtype=torch.complex128)
-            )
-            prediction_full[dirichlet_mask] = dirichlet_vals_complex[dirichlet_mask]
+            dirichlet_vals_float = dirichlet_vals_tensor.to(dtype=torch.float64)
+            prediction_full[dirichlet_mask] = dirichlet_vals_float[dirichlet_mask]
 
         # Compute FEM residual (element-wise errors) for steady-state problem
         residual = fem_solver.compute_residual(
             prediction_full,
         )
-        # residual_real_sq = residual.real**2
+        residual_real_sq = residual.real**2
         # residual_imag_sq = residual.imag**2
         # residual_real_free = residual_real_sq[free_to_original]
         # residual_imag_free = residual_imag_sq[free_to_original]
-        # mse_real = torch.mean(residual_real_free)
-        # mse_imag = torch.mean(residual_imag_free)
-        # residual_free = mse_real + mse_imag
-        residual_free = torch.mean(torch.absolute(residual**2))
+        mse_real = torch.norm(residual_real_sq)
+        # mse_imag = torch.mean(residual_imag_sq)
+        residual_free = mse_real
 
         self.last_residuals = residual_free.detach().cpu().numpy()
 
@@ -274,7 +264,7 @@ class PIMGNTrainerEM:
 
         # Build full graph
         data, aux = graph_creator.create_graph(
-            T_current=prediction,
+            # T_current=prediction,
             t_scalar=0.0,  # Time is irrelevant for steady-state
             material_node_field=material_field,
             neumann_values=neumann_vals,
@@ -308,11 +298,9 @@ class PIMGNTrainerEM:
 
         # Reconstruct full state as complex array
         n_total = int(node_mapping.get("n_original", problem.n_nodes))
-        prediction_full = np.zeros(n_total, dtype=np.complex128)
+        prediction_full = np.zeros(n_total, dtype=np.float64)
         free_to_original = node_mapping["free_to_original"].cpu().numpy()
-        prediction_full[free_to_original] = (
-            prediction_np[:, 0] + 1j * prediction_np[:, 1]
-        )
+        prediction_full[free_to_original] = prediction_np[:, 0]
         if dirichlet_vals is not None:
             dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
             prediction_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
@@ -331,20 +319,11 @@ class PIMGNTrainerEM:
 
         for epoch in range(self.start_epoch, self.config["epochs"]):
             epoch_start = time.time()
-            epoch_losses = []
 
-            # Shuffle training problems for each epoch
-            shuffled_train_indices = train_problems_indices.copy()
-            np.random.shuffle(shuffled_train_indices)
+            physics_loss, prediction_next = self.train_step(0, prediction=prediction)
+            prediction = prediction_next
 
-            # Train on each problem in the training set
-            for problem_idx in shuffled_train_indices:
-                physics_loss, prediction_next = self.train_step(problem_idx, prediction=prediction)
-                prediction = prediction_next
-                epoch_losses.append(physics_loss)
-
-            avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0.0
-            self.losses.append(avg_epoch_loss)
+            self.losses.append(physics_loss)
 
             # Validation (if validation problems are provided and ground truth is available)
             val_loss = None
@@ -353,13 +332,13 @@ class PIMGNTrainerEM:
                 self.val_losses.append(val_loss)
 
             elapsed = time.time() - epoch_start
-            self.logger.log_epoch(epoch, avg_epoch_loss, val_loss, elapsed)
+            self.logger.log_epoch(epoch, physics_loss, val_loss, elapsed)
 
             if epoch % 10 == 0:
                 elapsed = time.time() - epoch_start
                 val_str = f" | Val Loss: {val_loss:.3e}" if val_loss is not None else ""
                 print(
-                    f"Epoch {epoch+1:4d} | Train Loss: {avg_epoch_loss:.3e}{val_str} | Time: {elapsed:.2f}s"
+                    f"Epoch {epoch+1:4d} | Train Loss: {physics_loss:.3e}{val_str} | Time: {elapsed:.2f}s"
                 )
 
             self.scheduler.step()
@@ -411,7 +390,7 @@ class PIMGNTrainerEM:
 
                 # Build graph and make prediction
                 data, aux = graph_creator.create_graph(
-                    T_current=initial_guess,
+                    # T_current=initial_guess,
                     t_scalar=0.0,
                     material_node_field=getattr(problem, "material_field", None),
                     neumann_values=getattr(problem, "neumann_values_array", None),
@@ -479,7 +458,7 @@ class PIMGNTrainerEM:
         with torch.no_grad():
             # Build graph
             data, aux = graph_creator.create_graph(
-                T_current=initial_guess,
+                # T_current=initial_guess,
                 t_scalar=0.0,
                 material_node_field=material_field,
                 neumann_values=neumann_vals,
@@ -500,9 +479,9 @@ class PIMGNTrainerEM:
             dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
 
             n_total = int(node_mapping.get("n_original", problem.n_nodes))
-            prediction_full = np.zeros(n_total, dtype=np.complex128)
+            prediction_full = np.zeros(n_total, dtype=np.float64)
             pred = prediction_free.detach().cpu().numpy()  # [N_free, 2]
-            prediction_full[free_idx] = pred[:, 0] + 1j * pred[:, 1]
+            prediction_full[free_idx] = pred[:, 0]
             if dirichlet_vals is not None:
                 prediction_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
 
@@ -673,7 +652,7 @@ def _run_single_problem_experiment(problem, config, experiment_name: str):
 def train_pimgn_on_single_problem(resume_from: str = None):
     problem = create_em_problem()
     config = {
-        "epochs": 1,
+        "epochs": 1000,
         "lr": 1e-2,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem",

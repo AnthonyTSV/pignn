@@ -307,7 +307,7 @@ def create_mms_problem(maxh=0.2, alpha=0.1, problem_id=0):
     dirichlet_boundaries_dict = {"left": 0, "right": 0, "bottom": 0, "top": 0}
     neumann_boundaries_dict = {}
 
-    order = 2
+    order = 1
 
     fes = ng.H1(mesh, order=order, dirichlet="|".join(dirichlet_boundaries))
 

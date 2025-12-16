@@ -110,16 +110,16 @@ class MeshProblemEM:
         self.profile_height = 7 * 1e-3  # m
 
         self.mu0 = 4 * 3.1415926535e-7  # Permeability of free space
-        self.mu_r_workpiece = 100  # Relative permeability of workpiece
+        self.mu_r_workpiece = 1  # Relative permeability of workpiece
         self.mu_r_air = 1.0
         self.mu_r_coil = 1.0
 
-        self.sigma_workpiece = 6250000.0  # S/m
+        self.sigma_workpiece = 0  # S/m
         self.sigma_air = 0.0
-        self.sigma_coil = 58823529.0
+        self.sigma_coil = 0
 
         # Coil parameters
-        self.N_turns = 1  # Number of turns
+        self.N_turns = 100  # Number of turns
         self.I_coil = 1000  # A
         self.coil_area = self.profile_width * self.profile_height  # Cross-sectional area
         self.frequency = 1000  # Hz

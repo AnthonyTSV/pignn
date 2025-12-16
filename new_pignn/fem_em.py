@@ -55,7 +55,7 @@ class FEMSolverEM:
         fes = ng.H1(
             self.mesh,
             order=self.order,
-            complex=True,
+            complex=False,
             dirichlet=self.problem.mesh_config.dirichlet_pipe,
         )
         A, v = fes.TnT()
@@ -84,7 +84,7 @@ class FEMSolverEM:
 
         self.bilinear_form = self._ngsolve_to_torch(a.mat)
         self.linear_form = torch.tensor(
-            f.vec.FV().NumPy().copy(), dtype=torch.complex128
+            f.vec.FV().NumPy().copy(), dtype=torch.float64
         ).to(self.device)
         self.fes = fes
 
@@ -92,10 +92,10 @@ class FEMSolverEM:
         """Convert NGSolve matrix to torch tensor."""
         rows, cols, vals = ngsolve_matrix.COO()
         indices = torch.tensor([rows, cols], dtype=torch.long)
-        values = torch.tensor(vals, dtype=torch.complex128)
+        values = torch.tensor(vals, dtype=torch.float64)
         shape = (ngsolve_matrix.height, ngsolve_matrix.width)
         tensor = torch.sparse_coo_tensor(
-            indices, values, size=shape, dtype=torch.complex128
+            indices, values, size=shape, dtype=torch.float64
         )
         return tensor.to(self.device)
 
@@ -118,12 +118,7 @@ class FEMSolverEM:
             },
             default=0.0,
         )
-        fes = ng.H1(
-            self.mesh,
-            order=self.order,
-            complex=True,
-            dirichlet=self.problem.mesh_config.dirichlet_pipe,
-        )
+        fes = self.fes
         A, v = fes.TnT()
         gfA = ng.GridFunction(fes)
 
@@ -172,10 +167,10 @@ class FEMSolverEM:
 
         # Handle both numpy arrays and torch tensors
         if isinstance(pred_sol, np.ndarray):
-            pred_sol_tensor = torch.tensor(pred_sol, dtype=torch.complex128)
+            pred_sol_tensor = torch.tensor(pred_sol, dtype=torch.float64)
         else:
             # It's already a tensor - convert dtype while preserving gradients
-            pred_sol_tensor = pred_sol.to(dtype=torch.complex128)
+            pred_sol_tensor = pred_sol.to(dtype=torch.float64)
 
         pred_sol_tensor = pred_sol_tensor.to(self.device)
 
@@ -192,7 +187,7 @@ class FEMSolverEM:
         boundary_dofs_vector = self._create_boundary_dofs_vector(
             problem=self.problem,
             device=self.device,
-            dtype=torch.complex128,
+            dtype=torch.float64,
         )
         pred_full = pred_sol_tensor.clone()
         pred_full[~free_dofs_mask] = boundary_dofs_vector[~free_dofs_mask]
@@ -269,44 +264,35 @@ class FEMSolverEM:
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
 
-        array_true = np.asarray(array_true)
-        array_pred = np.asarray(array_pred)
+        array_true = np.asarray(array_true, dtype=np.float64)
+        array_pred = np.asarray(array_pred, dtype=np.float64)
 
         fes_real = ng.H1(self.mesh, order=self.order)
 
         gfu_true_real = ng.GridFunction(fes_real)
-        gfu_true_imag = ng.GridFunction(fes_real)
-        gfu_true_abs = ng.GridFunction(fes_real)
         gfu_pred_real = ng.GridFunction(fes_real)
-        gfu_pred_imag = ng.GridFunction(fes_real)
-        gfu_pred_abs = ng.GridFunction(fes_real)
         gfu_err_abs = ng.GridFunction(fes_real)
+        gfu_err_rel = ng.GridFunction(fes_real)
 
         gfu_true_real.vec.FV().NumPy()[:] = np.real(array_true)
-        gfu_true_imag.vec.FV().NumPy()[:] = np.imag(array_true)
-        gfu_true_abs.vec.FV().NumPy()[:] = np.abs(array_true)
+        
         gfu_pred_real.vec.FV().NumPy()[:] = np.real(array_pred)
-        gfu_pred_imag.vec.FV().NumPy()[:] = np.imag(array_pred)
-        gfu_pred_abs.vec.FV().NumPy()[:] = np.abs(array_pred)
         gfu_err_abs.vec.FV().NumPy()[:] = np.abs(array_true - array_pred)
+        gfu_err_rel.vec.FV().NumPy()[:] = np.abs(array_true - array_pred) / (np.abs(
+            array_true
+        ) + 1e-10) # avoid division by zero
 
         coefs = [
             gfu_true_real,
-            gfu_true_imag,
-            gfu_true_abs,
             gfu_pred_real,
-            gfu_pred_imag,
-            gfu_pred_abs,
             gfu_err_abs,
+            gfu_err_rel,
         ]
         names = [
             "ExactSolution_real",
-            "ExactSolution_imag",
-            "ExactSolution_abs",
             "PredictedSolution_real",
-            "PredictedSolution_imag",
-            "PredictedSolution_abs",
             "AbsError",
+            "RelError",
         ]
 
         vtk_out = ng.VTKOutput(
@@ -352,6 +338,11 @@ if __name__ == "__main__":
     # curl_gfa_noisy = curl_gfa + 1e-6 * (
     #     np.random.rand(len(curl_gfa)) + 1j * np.random.rand(len(curl_gfa))
     # )
+
+    # npz_filename = "results/physics_informed/test_em_problem/results_data/results.npz"
+    # data = np.load(npz_filename)
+    # gfA = data["predicted"] * 1e-6
+
     residual = fem_solver.compute_residual(gfA)
     residuals_abs = np.absolute(residual.cpu().numpy())
     print(residuals_abs)
