@@ -337,20 +337,14 @@ def _build_knn_connectivity(
 
 def _build_node_features(
     node_types: torch.Tensor,
-    T_current: Optional[np.ndarray],
-    t_scalar: float,
+    A_current: Optional[np.ndarray],
+    current_density: Optional[np.ndarray],
     material_field: Optional[np.ndarray],
-    neumann_values: Optional[np.ndarray],
     dirichlet_values: Optional[np.ndarray],
-    robin_values: Optional[Tuple[np.ndarray, np.ndarray]],
-    source_values: Optional[np.ndarray],
+    omega: float,
     n_nodes: int,
     device: torch.device = None,
 ) -> torch.Tensor:
-    """
-    Build node feature matrix according to PI-MGN methodology.
-    Features: [one_hot_node_type(4), T_current(1), t_scalar(1), material(1), neumann_value(1), dirichlet_value(1), robin_h(1), robin_amb(1), source(1)]
-    """
     if device is None:
         device = node_types.device
 
@@ -363,17 +357,17 @@ def _build_node_features(
     features.append(node_type_onehot)
 
     # Current temperature field
-    if T_current is not None:
+    if A_current is not None:
         T_tensor = torch.tensor(
-            T_current, dtype=torch.float32, device=device
+            A_current, dtype=torch.float32, device=device
         ).unsqueeze(1)
     else:
         T_tensor = torch.zeros(n_nodes, 1, device=device)
     features.append(T_tensor)
 
-    # Time scalar (broadcasted to all nodes)
-    t_tensor = torch.full((n_nodes, 1), t_scalar, dtype=torch.float32, device=device)
-    features.append(t_tensor)
+    # Omega scalar (broadcasted to all nodes)
+    omega_tensor = torch.full((n_nodes, 1), omega, dtype=torch.float32, device=device)
+    features.append(omega_tensor)
 
     # Material field
     if material_field is not None:
@@ -383,15 +377,6 @@ def _build_node_features(
     else:
         mat_tensor = torch.ones(n_nodes, 1, device=device)  # Default material
     features.append(mat_tensor)
-
-    # Neumann boundary values (flux values h_N from paper)
-    if neumann_values is not None:
-        neumann_tensor = torch.tensor(
-            neumann_values, dtype=torch.float32, device=device
-        ).unsqueeze(1)
-    else:
-        neumann_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no flux
-    features.append(neumann_tensor)
 
     # Dirichlet boundary values (prescribed values for Dirichlet BC)
     if dirichlet_values is not None:
@@ -404,31 +389,18 @@ def _build_node_features(
         )  # Default: homogeneous Dirichlet
     features.append(dirichlet_tensor)
 
-    # Robin boundary values (h and T_amb)
-    if robin_values is not None:
-        h_vals, amb_vals = robin_values
-        h_tensor = torch.tensor(h_vals, dtype=torch.float32, device=device).unsqueeze(1)
-        amb_tensor = torch.tensor(
-            amb_vals, dtype=torch.float32, device=device
-        ).unsqueeze(1)
-    else:
-        h_tensor = torch.zeros(n_nodes, 1, device=device)
-        amb_tensor = torch.zeros(n_nodes, 1, device=device)
-    features.append(h_tensor)
-    features.append(amb_tensor)
-
     # Source term values (volumetric heat source)
-    if source_values is not None:
-        if isinstance(source_values, torch.Tensor):
+    if current_density is not None:
+        if isinstance(current_density, torch.Tensor):
             source_tensor = (
-                source_values.detach()
+                current_density.detach()
                 .clone()
                 .to(dtype=torch.float32, device=device)
                 .unsqueeze(1)
             )
         else:
             source_tensor = torch.tensor(
-                source_values, dtype=torch.float32, device=device
+                current_density, dtype=torch.float32, device=device
             ).unsqueeze(1)
     else:
         source_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no source
@@ -440,7 +412,7 @@ def _build_node_features(
 def _build_edge_features(
     edge_index: torch.Tensor,
     pos: torch.Tensor,
-    T_current: Optional[np.ndarray],
+    A_current: Optional[np.ndarray],
     device: torch.device = None,
 ) -> torch.Tensor:
     """
@@ -464,8 +436,8 @@ def _build_edge_features(
     euclidean_dist = torch.norm(relative_pos, dim=1, keepdim=True)
 
     # Temperature difference (if available)
-    if T_current is not None:
-        T_tensor = torch.tensor(T_current, dtype=torch.float32, device=device)
+    if A_current is not None:
+        T_tensor = torch.tensor(A_current, dtype=torch.float32, device=device)
         src_temp = T_tensor[edge_index[0]]
         dst_temp = T_tensor[edge_index[1]]
         temp_diff = (dst_temp - src_temp).unsqueeze(1)
@@ -479,7 +451,7 @@ def _build_edge_features(
 
 
 def _build_global_features(
-    t_scalar: float, n_nodes: int, device: torch.device = None
+    omega: float, n_nodes: int, device: torch.device = None
 ) -> torch.Tensor:
     """
     Build global feature vector.
@@ -487,7 +459,7 @@ def _build_global_features(
     if device is None:
         device = torch.device("cpu")
     global_features = torch.tensor(
-        [t_scalar, float(n_nodes)], dtype=torch.float32, device=device
+        [omega, float(n_nodes)], dtype=torch.float32, device=device
     )
     return global_features
 
@@ -530,44 +502,25 @@ def _get_nodes_on_boundary(
     return list(boundary_nodes)
 
 
-class GraphCreator:
+class GraphCreatorEM:
     def __init__(
         self,
         mesh: ng.Mesh,
         n_neighbors: int = 8,
-        dirichlet_names: List[str] = None,
-        neumann_names: List[str] = None,
-        robin_names: List[str] = None,
-        connectivity_method: str = "fem",
-        fes: ng.FESpace = None,
+        dirichlet_names: List[str] = None
     ):
-        """
-        Initialize GraphCreator for PI-MGN graph construction.
-
-        Args:
-            mesh: NGSolve mesh object
-            n_neighbors: Number of neighbors for k-NN connectivity (ignored for FEM)
-            dirichlet_names: List of Dirichlet boundary names
-            neumann_names: List of Neumann boundary names
-            robin_names: List of Robin boundary names
-            connectivity_method: "fem" (mesh connectivity) or "knn" (k-nearest neighbors)
-        """
         self.mesh = mesh
         self.n_neighbors = n_neighbors
         self.dirichlet_names = dirichlet_names or []
-        self.neumann_names = neumann_names or []
-        self.robin_names = robin_names or []
-        self.connectivity_method = connectivity_method
+        self.connectivity_method = "fem"
 
     def create_graph(
         self,
-        T_current: Optional[np.ndarray] = None,
-        t_scalar: float = 0.0,
+        A_current: Optional[np.ndarray] = None,
+        current_density: Optional[np.ndarray] = None,
         material_node_field: Optional[np.ndarray] = None,
-        neumann_values: Optional[np.ndarray] = None,
         dirichlet_values: Optional[np.ndarray] = None,
-        robin_values: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        source_values: Optional[np.ndarray] = None,
+        omega: float = 0.0,
         add_self_loops: bool = True,
         device: Optional[torch.device] = None,
     ) -> Tuple[Data, Dict]:
@@ -588,8 +541,8 @@ class GraphCreator:
         node_types = _classify_node_types(
             self.mesh,
             self.dirichlet_names or [],
-            self.neumann_names or [],
-            self.robin_names or [],
+            [],
+            [],
             pnum_to_idx,
         )
         node_types = node_types.to(device)
@@ -609,36 +562,31 @@ class GraphCreator:
         # 4. Build node features
         node_features = _build_node_features(
             node_types,
-            T_current,
-            t_scalar,
+            A_current,
+            current_density,
             material_node_field,
-            neumann_values,
             dirichlet_values,
-            robin_values,
-            source_values,
+            omega,
             n_nodes,
             device,
         )
 
         # 5. Build edge features
-        edge_features = _build_edge_features(edge_index, pos_tensor, T_current, device)
+        edge_features = _build_edge_features(edge_index, pos_tensor, A_current, device)
 
         # 6. Build global features
-        global_features = _build_global_features(t_scalar, n_nodes, device)
+        global_features = _build_global_features(omega, n_nodes, device)
 
         # 7. Create auxiliary data
         aux = {
             "pnum_to_idx": pnum_to_idx,
             "node_types": node_types,
             "dirichlet_mask": node_types == 0,
-            "neumann_mask": node_types == 1,
             "interior_mask": node_types == 2,
             "robin_mask": node_types == 3,
             "free_mask": node_types != 0,  # Non-Dirichlet nodes
-            "neumann_values": neumann_values,
             "dirichlet_values": dirichlet_values,
-            "robin_values": robin_values,
-            "source_values": source_values,
+            "current_density": current_density,
             "mesh": self.mesh,
             "connectivity_method": self.connectivity_method,
         }
@@ -746,25 +694,15 @@ class GraphCreator:
             },
             "node_types": aux["node_types"][free_indices],
             "dirichlet_mask": aux["dirichlet_mask"][free_indices],
-            "neumann_mask": aux["neumann_mask"][free_indices],
             "interior_mask": aux["interior_mask"][free_indices],
-            "robin_mask": (
-                aux["robin_mask"][free_indices] if "robin_mask" in aux else None
-            ),
             "free_mask": torch.ones(
                 n_free, dtype=torch.bool, device=device
             ),  # All nodes in subgraph are free
-            "neumann_values": (
-                aux["neumann_values"][free_indices.cpu().numpy()]
-                if aux["neumann_values"] is not None
-                else None
-            ),
             "dirichlet_values": (
                 aux["dirichlet_values"][free_indices.cpu().numpy()]
                 if aux["dirichlet_values"] is not None
                 else None
             ),
-            "robin_values": robin_values_sub,
             "source_values": (
                 aux["source_values"][free_indices.cpu().numpy()]
                 if aux.get("source_values") is not None

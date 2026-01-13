@@ -8,6 +8,10 @@ import os
 from pathlib import Path
 from mesh_utils import create_rectangular_mesh
 
+r_star = 70 * 1e-3  # m
+A_star = 4.8 * 1e-4  # Wb/m
+mu_star = 4 * 3.1415926535e-7 # H/m
+J_star = A_star / (r_star**2 * mu_star)
 
 class FEMSolverEM:
     def __init__(
@@ -73,9 +77,11 @@ class FEMSolverEM:
 
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
-        a += 1j * self.problem.omega * sigma * r * A * v * ng.dx
-        Acoil = self.problem.profile_width * self.problem.profile_height
+        # a += 1j * self.problem.omega * sigma * r * A * v * ng.dx
+        Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
+        Js_phi = Js_phi / J_star  # Normalize current density
+        print("Normalized current density Js_phi:", Js_phi)
         f = ng.LinearForm(fes)
         f += r * Js_phi * v * ng.dx("mat_coil")
 
@@ -130,13 +136,16 @@ class FEMSolverEM:
         # Avoid 1/r singularity on the symmetry axis (r=0)
         inv_r = ng.IfPos(r, 1.0 / r, 0.0)
 
+        # In normalized form: nu = 1/(mu0_normalized * mu_r) = 1/(1 * mu_r) = 1/mu_r
         nu = 1.0 / (self.problem.mu0 * mu_r)
 
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
-        a += 1j * self.problem.omega * sigma * r * A * v * ng.dx
-        Acoil = self.problem.profile_width * self.problem.profile_height
+        # a += 1j * self.problem.omega * sigma * r * A * v * ng.dx
+        Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
+        Js_phi = Js_phi / J_star  # Normalize current density
+        print("Normalized current density Js_phi:", Js_phi)
         f = ng.LinearForm(fes)
         f += r * Js_phi * v * ng.dx("mat_coil")
 

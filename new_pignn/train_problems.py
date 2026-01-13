@@ -645,11 +645,18 @@ def create_industrial_heating_problem(maxh=0.1):
 
 
 def create_em_problem():
+
+    r_star = 70 * 1e-3  # m
+    A_star = 4.8 * 1e-4  # Wb/m
+    mu_star = 4 * 3.1415926535e-7  # H/m
+    J_star = A_star / (r_star**2 * mu_star)
+
+    from graph_creator_em import GraphCreatorEM
+
     mesh = create_ih_mesh()
 
-    dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
-    neumann_boundaries = []
-    dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
+    dirichlet_boundaries = ["bc_air", "bc_axis"]
+    dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0}
     fes = ng.H1(mesh, order=1, dirichlet="|".join(dirichlet_boundaries))
     # Mesh configuration
     mesh_config = MeshConfig(
@@ -657,16 +664,12 @@ def create_em_problem():
         order=1,
         dim=2,
         dirichlet_boundaries=dirichlet_boundaries,
-        neumann_boundaries=neumann_boundaries,
         mesh_type="ih_mesh",
     )
-    graph_creator = GraphCreator(
+    graph_creator = GraphCreatorEM(
         mesh=mesh,
         n_neighbors=2,
         dirichlet_names=dirichlet_boundaries,
-        neumann_names=neumann_boundaries,
-        connectivity_method="fem",
-        fes=fes,
     )
     # First create a temporary graph to get positions and aux data
     temp_data, temp_aux = graph_creator.create_graph()
@@ -687,7 +690,36 @@ def create_em_problem():
         mesh_config=mesh_config,
         problem_id=0,
     )
+    problem.material_field = np.ones(temp_data.pos.shape[0], dtype=np.float64)
     problem.set_dirichlet_values_array(dirichlet_vals)
     problem.set_dirichlet_values(dirichlet_boundaries_dict)
+
+    # Create current density field (only non-zero in coil region)
+    current_density = np.zeros(temp_data.pos.shape[0], dtype=np.float64)
+
+    # Calculate current density in the coil: J = N * I / A_coil
+    Acoil = problem.profile_width_phys * problem.profile_height_phys
+    Js_phi = problem.N_turns * problem.I_coil / Acoil
+    Js_phi = Js_phi / J_star  # Normalize current density
+
+    # Identify nodes in the coil region based on material subdomain
+    ngmesh = mesh.ngmesh
+    for i, elem in enumerate(ngmesh.Elements2D()):
+        # Check if element is in the coil material region
+        mat_index = elem.index
+        mat_name = ngmesh.GetMaterial(mat_index)
+
+        if mat_name == "mat_coil":
+            # Get vertices of this element
+            vertices = elem.vertices
+            for v in vertices:
+                # Find the node index corresponding to this vertex
+                # Vertices in NGSolve are typically 1-based or 0-based depending on the mesh
+                # We need to map to our node indexing
+                node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
+                if 0 <= node_idx < len(current_density):
+                    current_density[node_idx] = Js_phi
+
+    problem.current_density_field = current_density
 
     return problem

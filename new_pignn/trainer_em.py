@@ -13,8 +13,8 @@ from typing import List
 from logger import TrainingLogger
 from meshgraphnet import MeshGraphNet
 from fem_em import FEMSolverEM
-from graph_creator import GraphCreator
-from containers import MeshConfig, MeshProblem
+from graph_creator_em import GraphCreatorEM
+from containers import MeshConfig, MeshProblem, MeshProblemEM
 from torch_geometric.data import Data
 
 from train_problems import create_em_problem
@@ -23,7 +23,7 @@ from train_problems import create_em_problem
 class PIMGNTrainerEM:
     """Trainer for Physics-Informed MeshGraphNet for Steady-State Electromagnetic Problems."""
 
-    def __init__(self, problems: List[MeshProblem], config: dict):
+    def __init__(self, problems: List[MeshProblemEM], config: dict):
         self.problems = problems
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -40,43 +40,23 @@ class PIMGNTrainerEM:
         # Prepare sample data to determine input/output dimensions using first problem
         first_problem = problems[0]
         first_fes = self.all_fem_solvers[0].fes
-        graph_creator = GraphCreator(
+        graph_creator = GraphCreatorEM(
             mesh=first_problem.mesh,
             n_neighbors=2,
             dirichlet_names=first_problem.mesh_config.dirichlet_boundaries,
-            neumann_names=getattr(first_problem.mesh_config, "neumann_boundaries", []),
-            connectivity_method="fem",
-            fes=first_fes,
         )
 
         # Create sample graph to get dimensions
         material_field = getattr(first_problem, "material_field", None)
         neumann_vals = getattr(first_problem, "neumann_values_array", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
-        source_vals = getattr(first_problem, "source_function", None)
-
-        # For steady-state EM, use complex zero initial condition (ensures consistent
-        # real/imag feature dimensions in the graph creator).
-        # initial_guess = getattr(
-        #     first_problem,
-        #     "initial_condition",
-        #     np.zeros(
-        #         int(getattr(first_fes, "ndof", first_problem.n_nodes)),
-        #         dtype=np.complex128,
-        #     ),
-        # )
-        # if not np.iscomplexobj(initial_guess):
-        #     initial_guess = np.asarray(initial_guess, dtype=np.float64).astype(
-        #         np.complex128
-        #     )
+        current_density = getattr(first_problem, "current_density_field", None)
 
         sample_data, aux = graph_creator.create_graph(
-            # T_current=initial_guess,
-            t_scalar=0.0,
+            A_current=None,
             material_node_field=material_field,
-            neumann_values=neumann_vals,
             dirichlet_values=dirichlet_vals,
-            source_values=source_vals,
+            current_density=current_density,
         )
 
         free_node_data, mapping, new_aux = graph_creator.create_free_node_subgraph(
@@ -85,12 +65,12 @@ class PIMGNTrainerEM:
 
         input_dim_node = free_node_data.x.shape[1]
         input_dim_edge = free_node_data.edge_attr.shape[1]
-        output_dim = 1  # Complex-valued solution: [real, imaginary]
+        output_dim = 1
 
         print(
             f"Input dimensions - Node: {input_dim_node}, Edge: {input_dim_edge}, Output: {output_dim} (complex)"
         )
-        print(f"Steady-state electromagnetic problem")
+        print("Steady-state electromagnetic problem")
         print(f"Training on {len(problems)} problems")
 
         # Create MeshGraphNet model for steady-state prediction
@@ -102,8 +82,17 @@ class PIMGNTrainerEM:
             num_layers=12,
         ).to(self.device)
 
+        # Initialize model weights to produce smaller initial outputs
+        # with torch.no_grad():
+        #     for param in self.model.parameters():
+        #         if param.dim() > 1:
+        #             torch.nn.init.xavier_uniform_(param, gain=1)
+        #         else:
+        #             param.fill_(0.0)
+
         self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
-        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.995)
+        self.scheduler = optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=1000, gamma=0.9)
 
         # Training history
         self.losses = []
@@ -181,7 +170,7 @@ class PIMGNTrainerEM:
 
         Loss = MSE over N_test_functions errors
         """
-        problem: MeshProblem = self.problems[problem_idx]
+        problem: MeshProblemEM = self.problems[problem_idx]
         fem_solver: FEMSolverEM = self.all_fem_solvers[problem_idx]
 
         free_to_original = node_mapping["free_to_original"].to(self.device)
@@ -192,8 +181,8 @@ class PIMGNTrainerEM:
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         if dirichlet_vals is not None:
             dirichlet_vals_tensor = torch.tensor(
-                    dirichlet_vals, dtype=torch.float64, device=self.device
-                )
+                dirichlet_vals, dtype=torch.float64, device=self.device
+            )
         else:
             dirichlet_vals_tensor = None
 
@@ -213,7 +202,7 @@ class PIMGNTrainerEM:
         # )
 
         # Combine into complex tensor
-        prediction_full = prediction_full_real # + 1j * prediction_full_imag
+        prediction_full = prediction_full_real  # + 1j * prediction_full_imag
 
         # Enforce Dirichlet BCs on prediction
         if dirichlet_vals_tensor is not None:
@@ -228,9 +217,13 @@ class PIMGNTrainerEM:
         # residual_imag_sq = residual.imag**2
         # residual_real_free = residual_real_sq[free_to_original]
         # residual_imag_free = residual_imag_sq[free_to_original]
-        mse_real = torch.norm(residual_real_sq)
+        mse_real = torch.sum(residual_real_sq)
         # mse_imag = torch.mean(residual_imag_sq)
-        residual_free = mse_real
+
+        # Normalize physics loss to make training more stable
+        # Scale by the number of free DOFs to make loss magnitude reasonable
+        n_free_dofs = len(free_to_original)
+        residual_free = mse_real / n_free_dofs
 
         self.last_residuals = residual_free.detach().cpu().numpy()
 
@@ -241,35 +234,30 @@ class PIMGNTrainerEM:
         Compute physics loss for steady-state problem.
         Returns the loss value and prediction.
         """
-        problem: MeshProblem = self.problems[problem_idx]
+        problem: MeshProblemEM = self.problems[problem_idx]
         fem_solver: FEMSolverEM = self.all_fem_solvers[problem_idx]
 
         # Create graph creator for this specific problem
-        graph_creator = GraphCreator(
+        graph_creator = GraphCreatorEM(
             mesh=problem.mesh,
             n_neighbors=2,
             dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-            neumann_names=getattr(problem.mesh_config, "neumann_boundaries", []),
-            connectivity_method="fem",
-            fes=fem_solver.fes,
         )
 
         # Get the values for this problem
         neumann_vals = getattr(problem, "neumann_values_array", None)
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
-        source_vals = getattr(problem, "source_function", None)
+        current_density = getattr(problem, "current_density_field", None)
 
         self.optimizer.zero_grad()
 
         # Build full graph
         data, aux = graph_creator.create_graph(
-            # T_current=prediction,
-            t_scalar=0.0,  # Time is irrelevant for steady-state
+            A_current=None,
             material_node_field=material_field,
-            neumann_values=neumann_vals,
             dirichlet_values=dirichlet_vals,
-            source_values=source_vals,
+            current_density=current_density,
         )
 
         # Create free node subgraph (only non-Dirichlet nodes)
@@ -315,7 +303,10 @@ class PIMGNTrainerEM:
             print(f"Validation on problems: {val_problems_indices}")
 
         problem = self.problems[train_problems_indices[0]]
-        prediction = np.random.rand(problem.n_nodes) + 1j * np.random.rand(problem.n_nodes)
+        # Initialize prediction with zeros instead of random noise
+        # Random noise can lead to huge residuals (due to large system matrix entries)
+        # which can cause the network to collapse to zero output.
+        prediction = np.zeros(problem.n_nodes, dtype=np.float64)
 
         for epoch in range(self.start_epoch, self.config["epochs"]):
             epoch_start = time.time()
@@ -346,78 +337,7 @@ class PIMGNTrainerEM:
         print("Physics-Informed MeshGraphNet EM training completed!")
 
     def validate(self, val_problems_indices):
-        """Validate model on held-out problems using physics-informed loss."""
-        if self.all_ground_truth is None:
-            print(
-                "Warning: No ground truth available for validation. Skipping validation."
-            )
-            return None
-
-        self.model.eval()
-        total_loss = 0.0
-        num_validations = 0
-
-        with torch.no_grad():
-            for problem_idx in val_problems_indices:
-                problem: MeshProblem = self.problems[problem_idx]
-                fem_solver: FEMSolverEM = self.all_fem_solvers[problem_idx]
-
-                # Use initial guess
-                initial_guess = getattr(
-                    problem,
-                    "initial_condition",
-                    np.zeros(
-                        int(getattr(fem_solver.fes, "ndof", problem.n_nodes)),
-                        dtype=np.complex128,
-                    ),
-                )
-                if not np.iscomplexobj(initial_guess):
-                    initial_guess = np.asarray(initial_guess, dtype=np.float64).astype(
-                        np.complex128
-                    )
-
-                # Create graph creator for this specific problem
-                graph_creator = GraphCreator(
-                    mesh=problem.mesh,
-                    n_neighbors=2,
-                    dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-                    neumann_names=getattr(
-                        problem.mesh_config, "neumann_boundaries", []
-                    ),
-                    connectivity_method="fem",
-                    fes=fem_solver.fes,
-                )
-
-                # Build graph and make prediction
-                data, aux = graph_creator.create_graph(
-                    # T_current=initial_guess,
-                    t_scalar=0.0,
-                    material_node_field=getattr(problem, "material_field", None),
-                    neumann_values=getattr(problem, "neumann_values_array", None),
-                    dirichlet_values=getattr(problem, "dirichlet_values_array", None),
-                    source_values=getattr(problem, "source_function", None),
-                )
-
-                free_data, node_mapping, free_aux = (
-                    graph_creator.create_free_node_subgraph(data=data, aux=aux)
-                )
-                free_data = free_data.to(self.device)
-
-                prediction_free = self.model.forward(free_data)
-
-                # Compute physics loss for validation
-                physics_loss = self.compute_physics_informed_loss(
-                    prediction_free,
-                    problem_idx,
-                    aux,
-                    node_mapping,
-                )
-
-                total_loss += physics_loss.item()
-                num_validations += 1
-
-        self.model.train()
-        return total_loss / num_validations if num_validations > 0 else 0.0
+        raise NotImplementedError("Validation not implemented")
 
     def predict(self, problem_idx=0):
         """Predict steady-state solution for a specific problem."""
@@ -427,43 +347,32 @@ class PIMGNTrainerEM:
         fem_solver: FEMSolverEM = self.all_fem_solvers[problem_idx]
 
         # Initial guess (use complex zeros for consistent graph feature dims)
-        initial_guess = getattr(
-            problem,
-            "initial_condition",
+        initial_guess = (
             np.zeros(
                 int(getattr(fem_solver.fes, "ndof", problem.n_nodes)),
-                dtype=np.complex128,
+                dtype=np.float64,
             ),
         )
-        if not np.iscomplexobj(initial_guess):
-            initial_guess = np.asarray(initial_guess, dtype=np.float64).astype(
-                np.complex128
-            )
 
-        graph_creator = GraphCreator(
+        graph_creator = GraphCreatorEM(
             mesh=problem.mesh,
             n_neighbors=2,
             dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-            neumann_names=getattr(problem.mesh_config, "neumann_boundaries", []),
-            connectivity_method="fem",
-            fes=fem_solver.fes,
         )
 
         # Get the values for this problem
         neumann_vals = getattr(problem, "neumann_values_array", None)
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
-        source_vals = getattr(problem, "source_function", None)
+        current_density = getattr(problem, "current_density_field", None)
 
         with torch.no_grad():
             # Build graph
             data, aux = graph_creator.create_graph(
-                # T_current=initial_guess,
-                t_scalar=0.0,
+                A_current=None,
                 material_node_field=material_field,
-                neumann_values=neumann_vals,
                 dirichlet_values=dirichlet_vals,
-                source_values=source_vals,
+                current_density=current_density,
             )
 
             free_graph, node_mapping, free_aux = (
@@ -652,13 +561,13 @@ def _run_single_problem_experiment(problem, config, experiment_name: str):
 def train_pimgn_on_single_problem(resume_from: str = None):
     problem = create_em_problem()
     config = {
-        "epochs": 1000,
-        "lr": 1e-2,
+        "epochs": 10000,
+        "lr": 1e-4,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem",
         "resume_from": resume_from,  # Path to checkpoint to resume from
     }
-    _run_single_problem_experiment(problem, config, "Second order EM")
+    _run_single_problem_experiment(problem, config, "First order EM")
 
 
 if __name__ == "__main__":

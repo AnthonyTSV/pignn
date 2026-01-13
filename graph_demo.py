@@ -27,12 +27,12 @@ def main():
 
     import ngsolve as ng
 
-    fes = ng.H1(mesh, order=2, dirichlet="|".join(dirichlet_names))
+    fes = ng.H1(mesh, order=1, dirichlet="|".join(dirichlet_names))
 
     # First create a dummy graph to get positions and auxiliary data
     temp_creator = GraphCreator(
         mesh,
-        n_neighbors=2,
+        n_neighbors=1,
         dirichlet_names=dirichlet_names,
         neumann_names=neumann_names,
         connectivity_method="fem",

@@ -4,6 +4,10 @@ from typing import Optional, Tuple, List
 import torch
 import ngsolve as ng
 
+r_star = 70 * 1e-3  # m
+A_star = 4.8 * 1e-4  # Wb/m
+mu_star = 4 * 3.1415926535e-7 # H/m
+J_star = A_star / (r_star**2 * mu_star)
 
 class MeshProblem:
     """Container for a single training problem with mesh, initial condition, and physics parameters."""
@@ -103,13 +107,20 @@ class MeshProblemEM:
         self.material_properties = {}
         self.dirichlet_values = {}
         self.dirichlet_values_array = None  # To be set
+        self.material_field = None  # To be set
+        self.current_density_field = None  # To be set (current density at each node)
 
         ###
         
-        self.profile_width = 7 * 1e-3  # m
-        self.profile_height = 7 * 1e-3  # m
+        self.profile_width_phys = 7 * 1e-3
+        self.profile_height_phys = 7 * 1e-3
 
-        self.mu0 = 4 * 3.1415926535e-7  # Permeability of free space
+        self.profile_width = 7 * 1e-3 / r_star  # m
+        self.profile_height = 7 * 1e-3 / r_star  # m
+
+        # In the nondimensionalized system, mu0 = 1 (dimensionless)
+        # because we scaled by mu_star = mu0
+        self.mu0 = 1.0  # Normalized permeability of free space
         self.mu_r_workpiece = 1  # Relative permeability of workpiece
         self.mu_r_air = 1.0
         self.mu_r_coil = 1.0
@@ -119,9 +130,8 @@ class MeshProblemEM:
         self.sigma_coil = 0
 
         # Coil parameters
-        self.N_turns = 100  # Number of turns
+        self.N_turns = 1  # Number of turns
         self.I_coil = 1000  # A
-        self.coil_area = self.profile_width * self.profile_height  # Cross-sectional area
         self.frequency = 1000  # Hz
         self.omega = 2 * ng.pi * self.frequency  # rad/s
 

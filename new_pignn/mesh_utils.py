@@ -83,44 +83,51 @@ def create_lshape_mesh(
 
 
 def create_ih_mesh():
-    workpiece_diameter = 15 * 1e-3  # m
-    workpiece_height = 70 * 1e-3  # m
+    # Normalization constants
+    r_star = 70 * 1e-3  # m
+    A_star = 4.8 * 1e-4  # Wb/m
+    mu_star = 4 * 3.1415926535e-7 # H/m
+    J_star = A_star / (r_star**2 * mu_star)
 
-    coil_diameter = 30 * 1e-3  # m outer
-    profile_width = 7 * 1e-3  # m
-    profile_height = 7 * 1e-3  # m
+
+    workpiece_diameter = 15 * 1e-3 / r_star  # m
+    workpiece_height = 70 * 1e-3 / r_star  # m
+
+    coil_diameter = 30 * 1e-3 / r_star  # m outer
+    profile_width = 7 * 1e-3 / r_star  # m
+    profile_height = 7 * 1e-3 / r_star  # m
 
     air_height = 3 * workpiece_height  # m
-    air_width = 0.12  # m
+    air_width = 0.12 / r_star  # m
 
     geo = CSG2d()
 
-    rect_workpiece = (
-        Rectangle(
-            pmin=(0, workpiece_height),
-            pmax=(workpiece_diameter, 2 * workpiece_height),
-            mat="mat_workpiece",
-            # bc="bc_workpiece",
-            left="bc_workpiece_left",
-        )
-        .Mat("mat_workpiece")
-        .Maxh(5e-3)
-    )
+    # rect_workpiece = (
+    #     Rectangle(
+    #         pmin=(0, workpiece_height),
+    #         pmax=(workpiece_diameter, 2 * workpiece_height),
+    #         mat="mat_workpiece",
+    #         # bc="bc_workpiece",
+    #         left="bc_workpiece_left",
+    #     )
+    #     .Mat("mat_workpiece")
+    #     .Maxh(5e-3)
+    # )
 
-    rect_air = Rectangle(
-        pmin=(0, 0),
-        pmax=(air_width, air_height),
-        mat="mat_air",
-        bc="bc_air",
-        left="bc_axis",
-    ).Mat("mat_air")
-    rect_air = rect_air.Maxh(60e-2)
+    rect_air = (
+        Rectangle(
+            pmin=(0, 0),
+            pmax=(air_width, air_height),
+            mat="mat_air",
+            bc="bc_air",
+            left="bc_axis",
+        )
+        .Mat("mat_air")
+        .Maxh(60e-3 / r_star)
+    )
     rect_coil = (
         Rectangle(
-            pmin=(
-                coil_diameter / 2 + profile_width,
-                air_height / 2 - profile_height / 2,
-            ),
+            pmin=(coil_diameter / 2 + profile_width, air_height / 2 - profile_height / 2),
             pmax=(
                 coil_diameter / 2 + 2 * profile_width,
                 air_height / 2 + profile_height / 2,
@@ -129,15 +136,14 @@ def create_ih_mesh():
             bc="bc_coil",
         )
         .Mat("mat_coil")
-        .Maxh(1e-3)
+        .Maxh(1e-3 / r_star)
     )
 
-    workpiece = rect_workpiece * rect_air
+    # workpiece = rect_workpiece * rect_air
     coil = rect_coil * rect_air
-    air = rect_air - workpiece - coil
+    air = rect_air - coil
 
     geo.Add(air)
-    geo.Add(workpiece)
     geo.Add(coil)
 
     # generate mesh
