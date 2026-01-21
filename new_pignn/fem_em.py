@@ -9,7 +9,7 @@ from pathlib import Path
 from mesh_utils import create_rectangular_mesh
 
 r_star = 70 * 1e-3  # m
-A_star = 4.8 * 1e-4  # Wb/m
+A_star = 1e-3
 mu_star = 4 * 3.1415926535e-7 # H/m
 J_star = A_star / (r_star**2 * mu_star)
 

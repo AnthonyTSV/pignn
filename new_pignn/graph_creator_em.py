@@ -369,13 +369,19 @@ def _build_node_features(
     omega_tensor = torch.full((n_nodes, 1), omega, dtype=torch.float32, device=device)
     features.append(omega_tensor)
 
-    # Material field
+    # Material field (mu_r)
+    # Use log(mu_r) as feature for better scaling when mu_r varies widely (e.g., 1 to 100)
+    # This helps the network learn because:
+    # 1. log(1) = 0, log(100) ≈ 4.6 is a much smaller range than 1 to 100
+    # 2. The PDE uses nu = 1/(mu0*mu_r), and log transforms multiplicative relationships to additive
     if material_field is not None:
+        # Use log(mu_r) for better scaling
+        log_mu_r = np.log(material_field + 1e-10)  # Add small epsilon to avoid log(0)
         mat_tensor = torch.tensor(
-            material_field, dtype=torch.float32, device=device
+            log_mu_r, dtype=torch.float32, device=device
         ).unsqueeze(1)
     else:
-        mat_tensor = torch.ones(n_nodes, 1, device=device)  # Default material
+        mat_tensor = torch.zeros(n_nodes, 1, device=device)  # log(1) = 0 for default material
     features.append(mat_tensor)
 
     # Dirichlet boundary values (prescribed values for Dirichlet BC)
@@ -389,21 +395,27 @@ def _build_node_features(
         )  # Default: homogeneous Dirichlet
     features.append(dirichlet_tensor)
 
-    # Source term values (volumetric heat source)
+    # Source term values (current density)
+    # Normalize current density to be in similar range as other features
+    # Use log(1 + |J|) to handle the large values and map to ~[0, 5] range
     if current_density is not None:
         if isinstance(current_density, torch.Tensor):
-            source_tensor = (
+            j_vals = (
                 current_density.detach()
                 .clone()
                 .to(dtype=torch.float32, device=device)
-                .unsqueeze(1)
             )
         else:
-            source_tensor = torch.tensor(
+            j_vals = torch.tensor(
                 current_density, dtype=torch.float32, device=device
-            ).unsqueeze(1)
+            )
+        # Normalize: log(1 + |J|) to compress the range
+        # Also add a binary indicator for coil region (where J != 0)
+        j_indicator = (torch.abs(j_vals) > 1e-10).float().unsqueeze(1)  # Binary: is coil?
+        j_normalized = torch.log1p(torch.abs(j_vals)).unsqueeze(1)  # log(1 + |J|)
+        source_tensor = torch.cat([j_indicator, j_normalized], dim=1)
     else:
-        source_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no source
+        source_tensor = torch.zeros(n_nodes, 2, device=device)  # Default: no source (indicator=0, log_j=0)
     features.append(source_tensor)
 
     return torch.cat(features, dim=1)
