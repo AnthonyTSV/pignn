@@ -121,13 +121,13 @@ class MeshProblemEM:
         # In the nondimensionalized system, mu0 = 1 (dimensionless)
         # because we scaled by mu_star = mu0
         self.mu0 = 1.0  # Normalized permeability of free space
-        self.mu_r_workpiece = 1  # Relative permeability of workpiece
+        self.mu_r_workpiece = 100  # Relative permeability of workpiece
         self.mu_r_air = 1.0
         self.mu_r_coil = 1.0
 
-        self.sigma_workpiece = 0  # S/m
+        self.sigma_workpiece = 1e6  # Electrical conductivity [S/m]
         self.sigma_air = 0.0
-        self.sigma_coil = 0
+        self.sigma_coil = 5.8e7
 
         # Coil parameters
         self.N_turns = 1  # Number of turns

@@ -561,7 +561,7 @@ def _run_single_problem_experiment(problem, config, experiment_name: str):
 def train_pimgn_on_single_problem(resume_from: str = None):
     problem = create_em_problem()
     config = {
-        "epochs": 10000,
+        "epochs": 20000,
         "lr": 1e-4,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem",

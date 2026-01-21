@@ -102,17 +102,17 @@ def create_ih_mesh():
 
     geo = CSG2d()
 
-    # rect_workpiece = (
-    #     Rectangle(
-    #         pmin=(0, workpiece_height),
-    #         pmax=(workpiece_diameter, 2 * workpiece_height),
-    #         mat="mat_workpiece",
-    #         # bc="bc_workpiece",
-    #         left="bc_workpiece_left",
-    #     )
-    #     .Mat("mat_workpiece")
-    #     .Maxh(5e-3)
-    # )
+    rect_workpiece = (
+        Rectangle(
+            pmin=(0, workpiece_height),
+            pmax=(workpiece_diameter, 2 * workpiece_height),
+            mat="mat_workpiece",
+            # bc="bc_workpiece",
+            left="bc_workpiece_left",
+        )
+        .Mat("mat_workpiece")
+        .Maxh(5e-3)
+    )
 
     rect_air = (
         Rectangle(
@@ -139,12 +139,13 @@ def create_ih_mesh():
         .Maxh(1e-3 / r_star)
     )
 
-    # workpiece = rect_workpiece * rect_air
+    workpiece = rect_workpiece * rect_air
     coil = rect_coil * rect_air
-    air = rect_air - coil
+    air = rect_air - coil - workpiece
 
     geo.Add(air)
     geo.Add(coil)
+    geo.Add(workpiece)
 
     # generate mesh
     m = geo.GenerateMesh()

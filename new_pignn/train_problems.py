@@ -647,7 +647,7 @@ def create_industrial_heating_problem(maxh=0.1):
 def create_em_problem():
 
     r_star = 70 * 1e-3  # m
-    A_star = 4.8 * 1e-4  # Wb/m
+    A_star = 1e-3  # Wb/m
     mu_star = 4 * 3.1415926535e-7  # H/m
     J_star = A_star / (r_star**2 * mu_star)
 
@@ -690,36 +690,46 @@ def create_em_problem():
         mesh_config=mesh_config,
         problem_id=0,
     )
-    problem.material_field = np.ones(temp_data.pos.shape[0], dtype=np.float64)
     problem.set_dirichlet_values_array(dirichlet_vals)
     problem.set_dirichlet_values(dirichlet_boundaries_dict)
 
-    # Create current density field (only non-zero in coil region)
-    current_density = np.zeros(temp_data.pos.shape[0], dtype=np.float64)
+    # Create material fields (mu_r at each node) based on material subdomain
+    n_nodes = temp_data.pos.shape[0]
+    mu_r_field = np.ones(n_nodes, dtype=np.float64)  # Default to air (mu_r = 1)
+    current_density = np.zeros(n_nodes, dtype=np.float64)
 
     # Calculate current density in the coil: J = N * I / A_coil
     Acoil = problem.profile_width_phys * problem.profile_height_phys
     Js_phi = problem.N_turns * problem.I_coil / Acoil
     Js_phi = Js_phi / J_star  # Normalize current density
 
-    # Identify nodes in the coil region based on material subdomain
+    # Material property mapping (mu_r values)
+    mu_r_map = {
+        "mat_workpiece": problem.mu_r_workpiece,
+        "mat_air": problem.mu_r_air,
+        "mat_coil": problem.mu_r_coil,
+    }
+
+    # Identify nodes in each material region and assign properties
     ngmesh = mesh.ngmesh
     for i, elem in enumerate(ngmesh.Elements2D()):
-        # Check if element is in the coil material region
         mat_index = elem.index
         mat_name = ngmesh.GetMaterial(mat_index)
 
-        if mat_name == "mat_coil":
-            # Get vertices of this element
-            vertices = elem.vertices
-            for v in vertices:
-                # Find the node index corresponding to this vertex
-                # Vertices in NGSolve are typically 1-based or 0-based depending on the mesh
-                # We need to map to our node indexing
-                node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
-                if 0 <= node_idx < len(current_density):
+        # Get vertices of this element
+        vertices = elem.vertices
+        for v in vertices:
+            node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
+            if 0 <= node_idx < n_nodes:
+                # Assign mu_r based on material region
+                if mat_name in mu_r_map:
+                    mu_r_field[node_idx] = mu_r_map[mat_name]
+
+                # Assign current density (only in coil)
+                if mat_name == "mat_coil":
                     current_density[node_idx] = Js_phi
 
+    problem.material_field = mu_r_field
     problem.current_density_field = current_density
 
     return problem
