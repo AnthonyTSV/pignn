@@ -111,7 +111,7 @@ def create_ih_mesh():
             left="bc_workpiece_left",
         )
         .Mat("mat_workpiece")
-        .Maxh(50e-3)
+        .Maxh(5e-3 / r_star)
     )
 
     rect_air = (

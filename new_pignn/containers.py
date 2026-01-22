@@ -5,7 +5,7 @@ import torch
 import ngsolve as ng
 
 r_star = 70 * 1e-3  # m
-A_star = 1e-3
+A_star = 4.8 * 1e-4  # Wb/m
 mu_star = 4 * 3.1415926535e-7 # H/m
 J_star = A_star / (r_star**2 * mu_star)
 
@@ -121,7 +121,7 @@ class MeshProblemEM:
         # In the nondimensionalized system, mu0 = 1 (dimensionless)
         # because we scaled by mu_star = mu0
         self.mu0 = 1.0  # Normalized permeability of free space
-        self.mu_r_workpiece = 100  # Relative permeability of workpiece
+        self.mu_r_workpiece = 100.0  # Relative permeability of workpiece
         self.mu_r_air = 1.0
         self.mu_r_coil = 1.0
 

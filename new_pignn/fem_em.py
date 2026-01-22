@@ -1,15 +1,18 @@
 import numpy as np
 from containers import MeshConfig, MeshProblem, MeshProblemEM
 import ngsolve as ng
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union, Literal
 import torch
 import scipy.sparse as sp
 import os
 from pathlib import Path
 from mesh_utils import create_rectangular_mesh
 
+TensorLike = Union[np.ndarray, torch.Tensor]
+NormalizeMode = Literal["none", "ndof", "rhs"]
+
 r_star = 70 * 1e-3  # m
-A_star = 1e-3
+A_star = 4.8 * 1e-4  # Wb/m
 mu_star = 4 * 3.1415926535e-7 # H/m
 J_star = A_star / (r_star**2 * mu_star)
 
@@ -210,6 +213,92 @@ class FEMSolverEM:
 
         return res
 
+    def _to_tensor64(self, x: TensorLike) -> torch.Tensor:
+        """Convert numpy/torch input to float64 torch tensor on the correct device."""
+        if isinstance(x, np.ndarray):
+            t = torch.tensor(x, dtype=torch.float64, device=self.device)
+        else:
+            t = x.to(device=self.device, dtype=torch.float64)
+        return t
+
+    def _free_dofs_mask(self) -> torch.Tensor:
+        """Torch boolean mask for free DOFs."""
+        free_dofs_bitarray = self.fes.FreeDofs()
+        return torch.tensor(
+            [free_dofs_bitarray[i] for i in range(len(free_dofs_bitarray))],
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+    def _apply_dirichlet(
+        self,
+        pred_sol_tensor: torch.Tensor,
+        free_dofs_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build full DOF vector with Dirichlet values enforced."""
+        boundary_dofs_vector = self._create_boundary_dofs_vector(
+            problem=self.problem,
+            device=self.device,
+            dtype=torch.float64,
+        )
+
+        pred_full = pred_sol_tensor.clone()
+        pred_full[~free_dofs_mask] = boundary_dofs_vector[~free_dofs_mask]
+        return pred_full
+
+    @torch.no_grad()
+    def _rhs_norm(self, free_dofs_mask: torch.Tensor, eps: float) -> torch.Tensor:
+        """Compute stable norm of RHS on free DOFs (no gradients needed)."""
+        rhs_free = self.linear_form[free_dofs_mask]
+        return torch.linalg.norm(rhs_free) + eps
+
+    def compute_energy_loss(
+        self,
+        pred_sol: TensorLike,
+        *,
+        normalize: NormalizeMode = "ndof",
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
+        """
+        Energy functional loss:
+            Pi(a) = 0.5 * a^T K a - f^T a
+
+        Minimizing Pi(a) yields the same stationary point as Ka = f
+        (assuming K is SPD after Dirichlet constraints).
+
+        Args:
+            pred_sol: numpy array or torch tensor of DOFs (size ndof)
+            normalize: "none" | "ndof" | "rhs"
+            eps: small value for numerical stability
+        Returns:
+            Scalar torch tensor loss
+        """
+        if self.bilinear_form is None or self.linear_form is None:
+            raise ValueError("Bilinear and linear forms must be initialized")
+
+        pred_sol_tensor = self._to_tensor64(pred_sol)
+        free_dofs_mask = self._free_dofs_mask()
+
+        # Enforce Dirichlet BCs (hard)
+        pred_full = self._apply_dirichlet(pred_sol_tensor, free_dofs_mask)
+
+        # Ax = K a
+        ax = torch.sparse.mm(self.bilinear_form, pred_full.unsqueeze(1)).squeeze(1)
+
+        # Energy functional: 0.5 a^T (K a) - f^T a
+        energy = 0.5 * torch.dot(pred_full, ax) - torch.dot(self.linear_form, pred_full)
+
+        if normalize == "none":
+            return energy
+        if normalize == "ndof":
+            ndof_free = free_dofs_mask.sum().clamp_min(1).to(dtype=torch.float64)
+            return energy / ndof_free
+        if normalize == "rhs":
+            rhsn = self._rhs_norm(free_dofs_mask=free_dofs_mask, eps=eps)
+            return energy / rhsn
+
+        raise ValueError(f"Unknown normalize mode: {normalize}")
+
     def _create_boundary_dofs_vector(
         self, problem: MeshProblemEM, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
@@ -351,6 +440,8 @@ if __name__ == "__main__":
     # npz_filename = "results/physics_informed/test_em_problem/results_data/results.npz"
     # data = np.load(npz_filename)
     # gfA = data["predicted"] * 1e-6
+
+    residual_int = fem_solver.compute_energy_loss(gfA)
 
     residual = fem_solver.compute_residual(gfA)
     residuals_abs = np.absolute(residual.cpu().numpy())

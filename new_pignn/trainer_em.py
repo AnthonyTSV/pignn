@@ -152,7 +152,7 @@ class PIMGNTrainerEM:
             print("Generating ground truth for validation...")
             self.all_ground_truth = []
             for i, problem in enumerate(problems):
-                print(f"Solving problem {i+1}/{len(problems)}...")
+                print(f"Solving problem {i+1}/{len(problems)} for validation...")
                 ground_truth = self.all_fem_solvers[i].solve(problem)
                 self.all_ground_truth.append(ground_truth)
         else:
@@ -210,24 +210,24 @@ class PIMGNTrainerEM:
             prediction_full[dirichlet_mask] = dirichlet_vals_float[dirichlet_mask]
 
         # Compute FEM residual (element-wise errors) for steady-state problem
-        residual = fem_solver.compute_residual(
+        residual = fem_solver.compute_energy_loss(
             prediction_full,
         )
-        residual_real_sq = residual.real**2
-        # residual_imag_sq = residual.imag**2
-        # residual_real_free = residual_real_sq[free_to_original]
-        # residual_imag_free = residual_imag_sq[free_to_original]
-        mse_real = torch.sum(residual_real_sq)
-        # mse_imag = torch.mean(residual_imag_sq)
+        # residual_real_sq = residual.real**2
+        # # residual_imag_sq = residual.imag**2
+        # # residual_real_free = residual_real_sq[free_to_original]
+        # # residual_imag_free = residual_imag_sq[free_to_original]
+        # mse_real = torch.sum(residual_real_sq)
+        # # mse_imag = torch.mean(residual_imag_sq)
 
-        # Normalize physics loss to make training more stable
-        # Scale by the number of free DOFs to make loss magnitude reasonable
-        n_free_dofs = len(free_to_original)
-        residual_free = mse_real / n_free_dofs
+        # # Normalize physics loss to make training more stable
+        # # Scale by the number of free DOFs to make loss magnitude reasonable
+        # n_free_dofs = len(free_to_original)
+        # residual_free = mse_real / n_free_dofs
 
-        self.last_residuals = residual_free.detach().cpu().numpy()
+        # self.last_residuals = residual_free.detach().cpu().numpy()
 
-        return residual_free
+        return residual
 
     def train_step(self, problem_idx, prediction=None):
         """
@@ -266,7 +266,7 @@ class PIMGNTrainerEM:
         )
         free_data = free_data.to(self.device)
 
-        # Forward pass - get prediction for FREE nodes [N_free_nodes, 1]
+        # Forward pass - get prediction for FREE nodes [N_free_nodes, 2] (real, imag)
         prediction_free = self.model.forward(free_data)
 
         # Compute physics-informed loss for steady-state
@@ -282,9 +282,9 @@ class PIMGNTrainerEM:
         self.optimizer.step()
 
         # Convert prediction to numpy and reconstruct complex values
-        prediction_np = prediction_free.detach().cpu().numpy()  # [N_free, 1]
+        prediction_np = prediction_free.detach().cpu().numpy()  # [N_free, 2]
 
-        # Reconstruct full state
+        # Reconstruct full state as complex array
         n_total = int(node_mapping.get("n_original", problem.n_nodes))
         prediction_full = np.zeros(n_total, dtype=np.float64)
         free_to_original = node_mapping["free_to_original"].cpu().numpy()
@@ -561,8 +561,9 @@ def _run_single_problem_experiment(problem, config, experiment_name: str):
 def train_pimgn_on_single_problem(resume_from: str = None):
     problem = create_em_problem()
     config = {
-        "epochs": 1000,
+        "epochs": 2000,
         "lr": 1e-4,
+        "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem",
         "resume_from": resume_from,  # Path to checkpoint to resume from
     }

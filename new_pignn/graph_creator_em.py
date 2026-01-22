@@ -344,7 +344,6 @@ def _build_node_features(
     omega: float,
     n_nodes: int,
     device: torch.device = None,
-    pos: Optional[torch.Tensor] = None,  # Add position as input
 ) -> torch.Tensor:
     if device is None:
         device = node_types.device
@@ -357,13 +356,7 @@ def _build_node_features(
     node_type_onehot[torch.arange(n_nodes, device=device), node_types] = 1.0
     features.append(node_type_onehot)
 
-    if pos is not None:
-        pos_tensor = pos.to(dtype=torch.float32, device=device)
-        features.append(pos_tensor)  # [n_nodes, 2] for (r, z)
-    else:
-        features.append(torch.zeros(n_nodes, 2, device=device))
-
-    # Current solution field (A_phi)
+    # Current temperature field
     if A_current is not None:
         T_tensor = torch.tensor(
             A_current, dtype=torch.float32, device=device
@@ -376,28 +369,15 @@ def _build_node_features(
     omega_tensor = torch.full((n_nodes, 1), omega, dtype=torch.float32, device=device)
     features.append(omega_tensor)
 
-    # Material field (mu_r) - provide BOTH log(mu_r) AND nu = 1/mu_r
-    # The PDE uses nu = 1/(mu0*mu_r), so providing nu directly helps the network?
+    # Material field
     if material_field is not None:
-        # 1. log(mu_r) for better scaling: transforms [1, 100] to [0, 4.6]
-        log_mu_r = np.log(material_field + 1e-10)
-        log_mu_r_tensor = torch.tensor(
-            log_mu_r, dtype=torch.float32, device=device
+        mat_tensor = torch.tensor(
+            material_field, dtype=torch.float32, device=device
         ).unsqueeze(1)
-        
-        # 2. nu = 1/mu_r - the actual coefficient in the PDE (normalized, mu0=1)
-        # This is what the physics actually uses
-        nu = 1.0 / (material_field + 1e-10)
-        nu_tensor = torch.tensor(
-            nu, dtype=torch.float32, device=device
-        ).unsqueeze(1)
-        
-        features.append(log_mu_r_tensor)
-        features.append(nu_tensor)
     else:
-        features.append(torch.zeros(n_nodes, 1, device=device))  # log(1) = 0
-        features.append(torch.ones(n_nodes, 1, device=device))   # nu = 1/1 = 1
-    
+        mat_tensor = torch.ones(n_nodes, 1, device=device)  # Default material
+    features.append(mat_tensor)
+
     # Dirichlet boundary values (prescribed values for Dirichlet BC)
     if dirichlet_values is not None:
         dirichlet_tensor = torch.tensor(
@@ -409,27 +389,21 @@ def _build_node_features(
         )  # Default: homogeneous Dirichlet
     features.append(dirichlet_tensor)
 
-    # Source term values (current density)
-    # Normalize current density to be in similar range as other features
-    # Use log(1 + |J|) to handle the large values and map to ~[0, 5] range
+    # Source term values (volumetric heat source)
     if current_density is not None:
         if isinstance(current_density, torch.Tensor):
-            j_vals = (
+            source_tensor = (
                 current_density.detach()
                 .clone()
                 .to(dtype=torch.float32, device=device)
+                .unsqueeze(1)
             )
         else:
-            j_vals = torch.tensor(
+            source_tensor = torch.tensor(
                 current_density, dtype=torch.float32, device=device
-            )
-        # Normalize: log(1 + |J|) to compress the range
-        # Also add a binary indicator for coil region (where J != 0)
-        j_indicator = (torch.abs(j_vals) > 1e-10).float().unsqueeze(1)  # Binary: is coil?
-        j_normalized = torch.log1p(torch.abs(j_vals)).unsqueeze(1)  # log(1 + |J|)
-        source_tensor = torch.cat([j_indicator, j_normalized], dim=1)
+            ).unsqueeze(1)
     else:
-        source_tensor = torch.zeros(n_nodes, 2, device=device)  # Default: no source (indicator=0, log_j=0)
+        source_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no source
     features.append(source_tensor)
 
     return torch.cat(features, dim=1)
@@ -595,7 +569,6 @@ class GraphCreatorEM:
             omega,
             n_nodes,
             device,
-            pos=pos_tensor,
         )
 
         # 5. Build edge features
