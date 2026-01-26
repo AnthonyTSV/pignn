@@ -17,7 +17,7 @@ from graph_creator_em import GraphCreatorEM
 from containers import MeshConfig, MeshProblem, MeshProblemEM
 from torch_geometric.data import Data
 
-from train_problems import create_em_problem
+from train_problems import create_em_problem, create_em_problem_complex
 
 
 class PIMGNTrainerEM:
@@ -36,6 +36,7 @@ class PIMGNTrainerEM:
                 problem.mesh, order=order, problem=problem, device=self.device
             )
             self.all_fem_solvers.append(fem_solver)
+        self.is_complex = any(getattr(problem, "complex", False) for problem in problems)
 
         # Prepare sample data to determine input/output dimensions using first problem
         first_problem = problems[0]
@@ -48,6 +49,7 @@ class PIMGNTrainerEM:
 
         # Create sample graph to get dimensions
         material_field = getattr(first_problem, "material_field", None)
+        sigma_field = getattr(first_problem, "sigma_field", None)
         neumann_vals = getattr(first_problem, "neumann_values_array", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
         current_density = getattr(first_problem, "current_density_field", None)
@@ -55,6 +57,7 @@ class PIMGNTrainerEM:
         sample_data, aux = graph_creator.create_graph(
             A_current=None,
             material_node_field=material_field,
+            sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
             current_density=current_density,
         )
@@ -65,7 +68,7 @@ class PIMGNTrainerEM:
 
         input_dim_node = free_node_data.x.shape[1]
         input_dim_edge = free_node_data.edge_attr.shape[1]
-        output_dim = 1
+        output_dim = 2 if self.is_complex else 1  # Real and Imaginary parts
 
         print(
             f"Input dimensions - Node: {input_dim_node}, Edge: {input_dim_edge}, Output: {output_dim} (complex)"
@@ -81,14 +84,6 @@ class PIMGNTrainerEM:
             output_dim=output_dim,
             num_layers=12,
         ).to(self.device)
-
-        # Initialize model weights to produce smaller initial outputs
-        # with torch.no_grad():
-        #     for param in self.model.parameters():
-        #         if param.dim() > 1:
-        #             torch.nn.init.xavier_uniform_(param, gain=1)
-        #         else:
-        #             param.fill_(0.0)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
         self.scheduler = optim.lr_scheduler.StepLR(
@@ -191,15 +186,15 @@ class PIMGNTrainerEM:
         prediction_full_real = torch.zeros(
             n_total, dtype=torch.float64, device=self.device
         )
-        # prediction_full_imag = torch.zeros(
-        #     n_total, dtype=torch.float64, device=self.device
-        # )
+        prediction_full_imag = torch.zeros(
+            n_total, dtype=torch.float64, device=self.device
+        )
         prediction_full_real[free_to_original] = prediction_free[:, 0].to(
             dtype=torch.float64
         )
-        # prediction_full_imag[free_to_original] = prediction_free[:, 1].to(
-        #     dtype=torch.float64
-        # )
+        prediction_full_imag[free_to_original] = prediction_free[:, 1].to(
+            dtype=torch.float64
+        )
 
         # Combine into complex tensor
         prediction_full = prediction_full_real  # + 1j * prediction_full_imag
@@ -209,23 +204,16 @@ class PIMGNTrainerEM:
             dirichlet_vals_float = dirichlet_vals_tensor.to(dtype=torch.float64)
             prediction_full[dirichlet_mask] = dirichlet_vals_float[dirichlet_mask]
 
-        # Compute FEM residual (element-wise errors) for steady-state problem
-        residual = fem_solver.compute_energy_loss(
-            prediction_full,
-        )
-        # residual_real_sq = residual.real**2
-        # # residual_imag_sq = residual.imag**2
-        # # residual_real_free = residual_real_sq[free_to_original]
-        # # residual_imag_free = residual_imag_sq[free_to_original]
-        # mse_real = torch.sum(residual_real_sq)
-        # # mse_imag = torch.mean(residual_imag_sq)
-
-        # # Normalize physics loss to make training more stable
-        # # Scale by the number of free DOFs to make loss magnitude reasonable
-        # n_free_dofs = len(free_to_original)
-        # residual_free = mse_real / n_free_dofs
-
-        # self.last_residuals = residual_free.detach().cpu().numpy()
+        if self.is_complex:
+            # Compute complex residual
+            residual = fem_solver.compute_complex_energy_norm_loss(
+                prediction_full_real,
+                prediction_full_imag,
+            )
+        else:
+            residual = fem_solver.compute_energy_loss(
+                prediction_full,
+            )
 
         return residual
 
@@ -248,6 +236,7 @@ class PIMGNTrainerEM:
         neumann_vals = getattr(problem, "neumann_values_array", None)
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
+        sigma_field = getattr(problem, "sigma_field", None)
         current_density = getattr(problem, "current_density_field", None)
 
         self.optimizer.zero_grad()
@@ -256,6 +245,7 @@ class PIMGNTrainerEM:
         data, aux = graph_creator.create_graph(
             A_current=None,
             material_node_field=material_field,
+            sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
             current_density=current_density,
         )
@@ -364,6 +354,7 @@ class PIMGNTrainerEM:
         neumann_vals = getattr(problem, "neumann_values_array", None)
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
+        sigma_field = getattr(problem, "sigma_field", None)
         current_density = getattr(problem, "current_density_field", None)
 
         with torch.no_grad():
@@ -371,6 +362,7 @@ class PIMGNTrainerEM:
             data, aux = graph_creator.create_graph(
                 A_current=None,
                 material_node_field=material_field,
+                sigma_field=sigma_field,
                 dirichlet_values=dirichlet_vals,
                 current_density=current_density,
             )
@@ -388,11 +380,20 @@ class PIMGNTrainerEM:
             dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
 
             n_total = int(node_mapping.get("n_original", problem.n_nodes))
-            prediction_full = np.zeros(n_total, dtype=np.float64)
-            pred = prediction_free.detach().cpu().numpy()  # [N_free, 2]
-            prediction_full[free_idx] = pred[:, 0]
-            if dirichlet_vals is not None:
-                prediction_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
+            if problem.complex:
+                prediction_real, prediction_imag = prediction_free[:, 0], prediction_free[:, 1]
+                prediction_full = np.zeros(n_total, dtype=np.complex128)
+                pred_real = prediction_real.detach().cpu().numpy()  # [N_free]
+                pred_imag = prediction_imag.detach().cpu().numpy()  # [N_free]
+                prediction_full[free_idx] = pred_real + 1j * pred_imag
+                if dirichlet_vals is not None:
+                    prediction_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
+            else:
+                prediction_full = np.zeros(n_total, dtype=np.float64)
+                pred = prediction_free.detach().cpu().numpy()  # [N_free, 2]
+                prediction_full[free_idx] = pred[:, 0]
+                if dirichlet_vals is not None:
+                    prediction_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
 
         return prediction_full
 
@@ -509,7 +510,7 @@ class PIMGNTrainerEM:
         print(f"Checkpoint saved to: {path}")
 
 
-def _run_single_problem_experiment(problem, config, experiment_name: str):
+def _run_single_problem_experiment(problem: MeshProblemEM, config, experiment_name: str):
     print("=" * 60)
     print(f"PIMGN TEST - {experiment_name.upper()}")
     print("=" * 60)
@@ -541,11 +542,18 @@ def _run_single_problem_experiment(problem, config, experiment_name: str):
         )
 
         print("Exporting results...")
-        trainer.all_fem_solvers[0].export_to_vtk(
-            ground_truth[0],
-            predictions[0],
-            filename=f"{save_path}/vtk/result",
-        )
+        if not problem.complex:
+            trainer.all_fem_solvers[0].export_to_vtk(
+                ground_truth[0],
+                predictions[0],
+                filename=f"{save_path}/vtk/result",
+            )
+        else:
+            trainer.all_fem_solvers[0].export_to_vtk_complex(
+                ground_truth[0],
+                predictions[0],
+                filename=f"{save_path}/vtk/result_complex",
+            )
     except Exception as e:
         print(f"Ground truth evaluation failed: {e}")
 
@@ -569,6 +577,17 @@ def train_pimgn_on_single_problem(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, config, "First order EM")
 
+def train_pimgn_em_complex(resume_from: str = None):
+    problem = create_em_problem_complex()
+    config = {
+        "epochs": 30000,
+        "lr": 1e-4,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/test_em_problem_complex",
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_single_problem_experiment(problem, config, "First order EM Complex")
 
 if __name__ == "__main__":
-    train_pimgn_on_single_problem()
+    # train_pimgn_on_single_problem()
+    train_pimgn_em_complex()

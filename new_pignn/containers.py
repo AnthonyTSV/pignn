@@ -108,6 +108,7 @@ class MeshProblemEM:
         self.dirichlet_values = {}
         self.dirichlet_values_array = None  # To be set
         self.material_field = None  # To be set
+        self.sigma_field = None
         self.current_density_field = None  # To be set (current density at each node)
 
         ###
@@ -134,6 +135,7 @@ class MeshProblemEM:
         self.I_coil = 1000  # A
         self.frequency = 1000  # Hz
         self.omega = 2 * ng.pi * self.frequency  # rad/s
+        self.complex = True
 
     def set_material_properties(self, material_properties: dict):
         """Set material properties."""
