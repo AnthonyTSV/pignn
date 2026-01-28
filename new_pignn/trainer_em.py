@@ -53,6 +53,7 @@ class PIMGNTrainerEM:
         neumann_vals = getattr(first_problem, "neumann_values_array", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
         current_density = getattr(first_problem, "current_density_field", None)
+        kappa = getattr(first_problem, "kappa", 1.0)
 
         sample_data, aux = graph_creator.create_graph(
             A_current=None,
@@ -60,6 +61,7 @@ class PIMGNTrainerEM:
             sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
             current_density=current_density,
+            omega=kappa,
         )
 
         free_node_data, mapping, new_aux = graph_creator.create_free_node_subgraph(
@@ -238,6 +240,7 @@ class PIMGNTrainerEM:
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
         current_density = getattr(problem, "current_density_field", None)
+        omega = getattr(problem, "kappa", 1.0)
 
         self.optimizer.zero_grad()
 
@@ -248,6 +251,7 @@ class PIMGNTrainerEM:
             sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
             current_density=current_density,
+            omega=omega,
         )
 
         # Create free node subgraph (only non-Dirichlet nodes)
@@ -356,6 +360,7 @@ class PIMGNTrainerEM:
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
         current_density = getattr(problem, "current_density_field", None)
+        omega = getattr(problem, "kappa", 1.0)
 
         with torch.no_grad():
             # Build graph
@@ -365,6 +370,7 @@ class PIMGNTrainerEM:
                 sigma_field=sigma_field,
                 dirichlet_values=dirichlet_vals,
                 current_density=current_density,
+                omega=omega
             )
 
             free_graph, node_mapping, free_aux = (
@@ -580,7 +586,7 @@ def train_pimgn_on_single_problem(resume_from: str = None):
 def train_pimgn_em_complex(resume_from: str = None):
     problem = create_em_problem_complex()
     config = {
-        "epochs": 30000,
+        "epochs": 10000,
         "lr": 1e-4,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem_complex",

@@ -6,7 +6,6 @@ import torch
 import scipy.sparse as sp
 import os
 from pathlib import Path
-from mesh_utils import create_rectangular_mesh
 
 TensorLike = Union[np.ndarray, torch.Tensor]
 NormalizeMode = Literal["none", "ndof", "rhs"]
@@ -598,6 +597,75 @@ class FEMSolverEM:
 
         raise ValueError(f"Unknown normalize mode: {normalize}")
 
+    def compute_pi_abs_loss(
+        self,
+        pred_sol_real,
+        pred_sol_imag,
+        *,
+        squared: bool = True,
+        normalize: NormalizeMode = "ndof",
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
+        """
+        Loss = |Pi(u)|  or |Pi(u)|^2, where
+            Pi(u) = 0.5 * u^H (Kr + i Ki) u - f^H u.
+
+        Notes:
+        - pred_sol_real/pred_sol_imag should already have Dirichlet enforced
+          (or you enforce them before calling).
+        - We compute Pi using the full DOF vectors (recommended), then optionally scale.
+        - If squared=True, returns |Pi|^2 (smoother, avoids sqrt).
+        """
+        free_mask = self._free_dofs_mask()
+
+        ur = self._to_tensor64(pred_sol_real)
+        ui = self._to_tensor64(pred_sol_imag)
+
+        Kr, Ki = self.bilinear_form  # sparse real matrices
+
+        # Ku real/imag parts
+        Kr_ur = torch.sparse.mm(Kr, ur.unsqueeze(1)).squeeze(1)
+        Ki_ui = torch.sparse.mm(Ki, ui.unsqueeze(1)).squeeze(1)
+        Ku_r = Kr_ur - Ki_ui
+
+        Ki_ur = torch.sparse.mm(Ki, ur.unsqueeze(1)).squeeze(1)
+        Kr_ui = torch.sparse.mm(Kr, ui.unsqueeze(1)).squeeze(1)
+        Ku_i = Ki_ur + Kr_ui
+
+        # u^H Ku parts
+        uHKu_real = torch.dot(ur, Ku_r) + torch.dot(ui, Ku_i)
+        uHKu_imag = torch.dot(ur, Ku_i) - torch.dot(ui, Ku_r)
+
+        # f^H u parts (assuming f is real)
+        f = self.linear_form.to(dtype=torch.float64, device=ur.device)
+        fHu_real = torch.dot(f, ur)
+        fHu_imag = torch.dot(f, ui)
+
+        Pi_real = 0.5 * uHKu_real - fHu_real
+        Pi_imag = 0.5 * uHKu_imag - fHu_imag
+
+        # |Pi| or |Pi|^2
+        Pi_abs2 = Pi_real * Pi_real + Pi_imag * Pi_imag
+        if squared:
+            loss = Pi_abs2
+        else:
+            loss = torch.sqrt(Pi_abs2 + eps)
+
+        # Optional normalization (purely for scale/stability)
+        if normalize == "none":
+            return loss
+
+        if normalize == "ndof":
+            n_free = free_mask.sum().clamp_min(1).to(dtype=torch.float64)
+            return loss / n_free
+
+        if normalize == "rhs":
+            rhsn = torch.linalg.norm(f[free_mask]) + eps
+            # scale like (|Pi| / ||f||)^2 if squared, else |Pi|/||f||
+            return loss / (rhsn * rhsn) if squared else loss / rhsn
+
+        raise ValueError(f"Unknown normalize mode: {normalize}")
+
     def _create_boundary_dofs_vector(
         self, problem: MeshProblemEM, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
@@ -807,9 +875,10 @@ if __name__ == "__main__":
     if np.iscomplexobj(gfA):
         gfA_real = np.real(gfA)
         gfA_imag = np.imag(gfA)
-        residual_int = fem_solver.compute_complex_energy_norm_loss(
+        residual_int = fem_solver.compute_pi_abs_loss(
             torch.tensor(gfA_real, dtype=torch.float64),
             torch.tensor(gfA_imag, dtype=torch.float64),
+            squared=True, normalize="ndof",
         )
         print(f"Complex energy residual: {residual_int.item()}")
     else:

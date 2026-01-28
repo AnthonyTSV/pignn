@@ -135,6 +135,7 @@ class MeshProblemEM:
         self.I_coil = 1000  # A
         self.frequency = 1000  # Hz
         self.omega = 2 * ng.pi * self.frequency  # rad/s
+        self.kappa = self.omega * mu_star * (r_star**2)  # Nondimensional frequency
         self.complex = True
 
     def set_material_properties(self, material_properties: dict):
