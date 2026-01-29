@@ -407,6 +407,17 @@ def _build_node_features(
         source_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no source
     features.append(source_tensor)
 
+    # Sigma (conductivity) field
+    # The neural network needs this information to learn where eddy currents occur
+    if sigma_field is not None:
+        sigma_np = np.array(sigma_field, dtype=np.float32)
+        sigma_tensor = torch.tensor(
+            sigma_np, dtype=torch.float32, device=device
+        ).unsqueeze(1)
+    else:
+        sigma_tensor = torch.zeros(n_nodes, 1, device=device)
+    features.append(sigma_tensor)
+
     return torch.cat(features, dim=1)
 
 

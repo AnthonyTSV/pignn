@@ -209,7 +209,9 @@ class FEMSolverEM:
 
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
-        a += 1j * kappa * sigma * r * A * v * ng.dx("mat_coil")
+        # Eddy current term: applied to all conductive regions (including workpiece)
+        # In induction heating, eddy currents are induced in conductive materials
+        a += 1j * kappa * sigma * r * A * v * ng.dx
         Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
         Js_phi = Js_phi / J_star  # Normalize current density
@@ -298,7 +300,8 @@ class FEMSolverEM:
 
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
-        a += 1j * kappa * sigma * r * A * v * ng.dx("mat_coil")
+        # Eddy current term: applied to all conductive regions (including workpiece)
+        a += 1j * kappa * sigma * r * A * v * ng.dx
         Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
         Js_phi = Js_phi / J_star  # Normalize current density

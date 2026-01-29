@@ -53,7 +53,6 @@ class PIMGNTrainerEM:
         neumann_vals = getattr(first_problem, "neumann_values_array", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
         current_density = getattr(first_problem, "current_density_field", None)
-        kappa = getattr(first_problem, "kappa", 1.0)
 
         sample_data, aux = graph_creator.create_graph(
             A_current=None,
@@ -61,7 +60,6 @@ class PIMGNTrainerEM:
             sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
             current_density=current_density,
-            omega=kappa,
         )
 
         free_node_data, mapping, new_aux = graph_creator.create_free_node_subgraph(
@@ -198,13 +196,12 @@ class PIMGNTrainerEM:
             dtype=torch.float64
         )
 
-        # Combine into complex tensor
-        prediction_full = prediction_full_real  # + 1j * prediction_full_imag
-
-        # Enforce Dirichlet BCs on prediction
+        # Enforce Dirichlet BCs on prediction (real and imaginary parts)
         if dirichlet_vals_tensor is not None:
             dirichlet_vals_float = dirichlet_vals_tensor.to(dtype=torch.float64)
-            prediction_full[dirichlet_mask] = dirichlet_vals_float[dirichlet_mask]
+            # For complex Dirichlet BCs, the imaginary part is typically 0
+            prediction_full_real[dirichlet_mask] = dirichlet_vals_float[dirichlet_mask].real if dirichlet_vals_float.is_complex() else dirichlet_vals_float[dirichlet_mask]
+            prediction_full_imag[dirichlet_mask] = dirichlet_vals_float[dirichlet_mask].imag if dirichlet_vals_float.is_complex() else 0.0
 
         if self.is_complex:
             # Compute complex residual
@@ -214,7 +211,7 @@ class PIMGNTrainerEM:
             )
         else:
             residual = fem_solver.compute_energy_loss(
-                prediction_full,
+                prediction_full_real,  # For non-complex, use only real part
             )
 
         return residual
@@ -240,7 +237,6 @@ class PIMGNTrainerEM:
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
         current_density = getattr(problem, "current_density_field", None)
-        omega = getattr(problem, "kappa", 1.0)
 
         self.optimizer.zero_grad()
 
@@ -251,7 +247,6 @@ class PIMGNTrainerEM:
             sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
             current_density=current_density,
-            omega=omega,
         )
 
         # Create free node subgraph (only non-Dirichlet nodes)
@@ -302,6 +297,15 @@ class PIMGNTrainerEM:
         # which can cause the network to collapse to zero output.
         prediction = np.zeros(problem.n_nodes, dtype=np.float64)
 
+        # Generate ground truth once for periodic evaluation
+        print("Generating ground truth for evaluation...")
+        eval_ground_truth = {}
+        for prob_idx in train_problems_indices:
+            eval_ground_truth[prob_idx] = self.all_fem_solvers[prob_idx].solve(
+                self.problems[prob_idx]
+            )
+        print("Ground truth generated.")
+
         for epoch in range(self.start_epoch, self.config["epochs"]):
             epoch_start = time.time()
 
@@ -325,6 +329,19 @@ class PIMGNTrainerEM:
                 print(
                     f"Epoch {epoch+1:4d} | Train Loss: {physics_loss:.3e}{val_str} | Time: {elapsed:.2f}s"
                 )
+
+            # Evaluate L2 error every 100 epochs
+            if (epoch + 1) % 100 == 0:
+                self.model.eval()
+                for prob_idx in train_problems_indices:
+                    pred = self.predict(problem_idx=prob_idx)
+                    gt = eval_ground_truth[prob_idx]
+                    if len(pred) == len(gt):
+                        l2_error = np.linalg.norm(pred - gt) / np.linalg.norm(gt)
+                        print(
+                            f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} | L2 Error: {l2_error:.6e}"
+                        )
+                self.model.train()
 
             self.scheduler.step()
 
@@ -360,7 +377,6 @@ class PIMGNTrainerEM:
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
         current_density = getattr(problem, "current_density_field", None)
-        omega = getattr(problem, "kappa", 1.0)
 
         with torch.no_grad():
             # Build graph
@@ -370,7 +386,6 @@ class PIMGNTrainerEM:
                 sigma_field=sigma_field,
                 dirichlet_values=dirichlet_vals,
                 current_density=current_density,
-                omega=omega
             )
 
             free_graph, node_mapping, free_aux = (
@@ -586,7 +601,7 @@ def train_pimgn_on_single_problem(resume_from: str = None):
 def train_pimgn_em_complex(resume_from: str = None):
     problem = create_em_problem_complex()
     config = {
-        "epochs": 10000,
+        "epochs": 1000,
         "lr": 1e-4,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem_complex",
