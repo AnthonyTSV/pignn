@@ -744,6 +744,9 @@ def create_em_problem_complex():
     A_star = 4.8 * 1e-4  # Wb/m
     mu_star = 4 * 3.1415926535e-7  # H/m
     J_star = A_star / (r_star**2 * mu_star)
+    frequency = 1000  # Hz
+    omega = 2 * ng.pi * frequency  # rad/s
+    sigma_star = J_star / (omega * A_star)
 
     from graph_creator_em import GraphCreatorEM
 
@@ -787,9 +790,9 @@ def create_em_problem_complex():
     problem.set_dirichlet_values_array(dirichlet_vals)
     problem.set_dirichlet_values(dirichlet_boundaries_dict)
     problem.complex = True
-    problem.sigma_workpiece = 1e6
-    problem.sigma_air = 0.0
-    problem.sigma_coil = 5.8e7
+    problem.sigma_workpiece = 1e6 / sigma_star
+    problem.sigma_air = 0.0 / sigma_star
+    problem.sigma_coil = 5.8e7 / sigma_star
 
     # Create material fields (mu_r at each node) based on material subdomain
     n_nodes = temp_data.pos.shape[0]
@@ -815,6 +818,12 @@ def create_em_problem_complex():
         "mat_coil": problem.sigma_coil,
     }
 
+    material_encode = {
+        "mat_workpiece": 2,
+        "mat_air": 0,
+        "mat_coil": 1,
+    }
+
     # Identify nodes in each material region and assign properties
     ngmesh = mesh.ngmesh
     for i, elem in enumerate(ngmesh.Elements2D()):
@@ -826,15 +835,16 @@ def create_em_problem_complex():
         for v in vertices:
             node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
             if 0 <= node_idx < n_nodes:
-                # Assign mu_r based on material region
-                if mat_name in mu_r_map:
-                    mu_r_field[node_idx] = mu_r_map[mat_name]
-                if mat_name in sigma_map:
-                    sigma_field[node_idx] = sigma_map[mat_name]
+                # # Assign mu_r based on material region
+                # if mat_name in mu_r_map:
+                #     mu_r_field[node_idx] = mu_r_map[mat_name]
+                # if mat_name in sigma_map:
+                #     sigma_field[node_idx] = sigma_map[mat_name]
 
-                # Assign current density (only in coil)
-                if mat_name == "mat_coil":
-                    current_density[node_idx] = Js_phi
+                # # Assign current density (only in coil)
+                # if mat_name == "mat_coil":
+                #     current_density[node_idx] = Js_phi
+                mu_r_field[node_idx] = material_encode[mat_name]
 
     problem.material_field = mu_r_field
     problem.sigma_field = sigma_field

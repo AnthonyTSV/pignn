@@ -186,16 +186,13 @@ def _resolve_boundary_names_to_bcnr(
 def _classify_node_types(
     mesh: Mesh,
     dirichlet_names: List[str],
-    neumann_names: List[str],
-    robin_names: List[str],
     pnum_to_idx: Dict[int, int],
 ) -> torch.Tensor:
     """
-    Classify nodes as Dirichlet (0), Neumann (1), Interior (2), or Robin (3).
-    Dirichlet conditions take priority over Neumann/Robin at corner nodes.
+    Classify nodes as Dirichlet (0) or Interior (1).
     """
     n_nodes = len(pnum_to_idx)
-    node_types = torch.full((n_nodes,), 2, dtype=torch.long)  # Default: interior
+    node_types = torch.full((n_nodes,), 1, dtype=torch.long)  # Default: interior
 
     # Get boundary segments
     segments_1d = list(mesh.ngmesh.Elements1D())
@@ -204,30 +201,8 @@ def _classify_node_types(
 
     # Resolve boundary names to BC numbers
     dirichlet_bcnr = _resolve_boundary_names_to_bcnr(mesh, dirichlet_names)
-    neumann_bcnr = _resolve_boundary_names_to_bcnr(mesh, neumann_names)
-    robin_bcnr = _resolve_boundary_names_to_bcnr(mesh, robin_names)
 
-    # First pass: Mark Neumann nodes
-    for seg in segments_1d:
-        bc_code = int(getattr(seg, "bc", getattr(seg, "si", getattr(seg, "index", 0))))
-        if bc_code in neumann_bcnr:
-            vertices = seg.vertices
-            vertex_indices = _normalize_ids_to_idx(
-                vertices, pnum_to_idx, n_nodes, context="boundary_segments"
-            )
-            node_types[vertex_indices] = 1  # Neumann
-
-    # Second pass: Mark Robin nodes (overrides Neumann if overlap, though usually distinct)
-    for seg in segments_1d:
-        bc_code = int(getattr(seg, "bc", getattr(seg, "si", getattr(seg, "index", 0))))
-        if bc_code in robin_bcnr:
-            vertices = seg.vertices
-            vertex_indices = _normalize_ids_to_idx(
-                vertices, pnum_to_idx, n_nodes, context="boundary_segments"
-            )
-            node_types[vertex_indices] = 3  # Robin
-
-    # Third pass: Mark Dirichlet nodes (takes priority over everything)
+    # Mark Dirichlet nodes
     for seg in segments_1d:
         bc_code = int(getattr(seg, "bc", getattr(seg, "si", getattr(seg, "index", 0))))
         if bc_code in dirichlet_bcnr:
@@ -235,7 +210,7 @@ def _classify_node_types(
             vertex_indices = _normalize_ids_to_idx(
                 vertices, pnum_to_idx, n_nodes, context="boundary_segments"
             )
-            node_types[vertex_indices] = 0  # Dirichlet (takes priority)
+            node_types[vertex_indices] = 0  # Dirichlet
 
     return node_types
 
@@ -337,6 +312,7 @@ def _build_knn_connectivity(
 
 def _build_node_features(
     node_types: torch.Tensor,
+    pos: torch.Tensor,
     A_current: Optional[np.ndarray],
     current_density: Optional[np.ndarray],
     material_field: Optional[np.ndarray],
@@ -351,24 +327,27 @@ def _build_node_features(
 
     features = []
 
-    # One-hot encoding of node types (Dirichlet=0, Neumann=1, Interior=2, Robin=3)
-    # We use 4 classes now
-    node_type_onehot = torch.zeros(n_nodes, 4, device=device)
+    # Position features (r, z coordinates)
+    # pos is already a torch tensor on the correct device
+    features.append(pos)
+
+    # One-hot encoding of node types (Dirichlet=0, Interior=1)
+    node_type_onehot = torch.zeros(n_nodes, 2, device=device)
     node_type_onehot[torch.arange(n_nodes, device=device), node_types] = 1.0
     features.append(node_type_onehot)
 
     # Current temperature field
-    if A_current is not None:
-        T_tensor = torch.tensor(
-            A_current, dtype=torch.float32, device=device
-        ).unsqueeze(1)
-    else:
-        T_tensor = torch.zeros(n_nodes, 1, device=device)
-    features.append(T_tensor)
+    # if A_current is not None:
+    #     T_tensor = torch.tensor(
+    #         A_current, dtype=torch.float32, device=device
+    #     ).unsqueeze(1)
+    # else:
+    #     T_tensor = torch.zeros(n_nodes, 1, device=device)
+    # features.append(T_tensor)
 
     # Omega scalar (broadcasted to all nodes)
-    omega_tensor = torch.full((n_nodes, 1), omega, dtype=torch.float32, device=device)
-    features.append(omega_tensor)
+    # omega_tensor = torch.full((n_nodes, 1), omega, dtype=torch.float32, device=device)
+    # features.append(omega_tensor)
 
     # Material field
     if material_field is not None:
@@ -391,32 +370,33 @@ def _build_node_features(
     features.append(dirichlet_tensor)
 
     # Source term values (volumetric heat source)
-    if current_density is not None:
-        if isinstance(current_density, torch.Tensor):
-            source_tensor = (
-                current_density.detach()
-                .clone()
-                .to(dtype=torch.float32, device=device)
-                .unsqueeze(1)
-            )
-        else:
-            source_tensor = torch.tensor(
-                current_density, dtype=torch.float32, device=device
-            ).unsqueeze(1)
-    else:
-        source_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no source
-    features.append(source_tensor)
+    # if current_density is not None:
+    #     if isinstance(current_density, torch.Tensor):
+    #         source_tensor = (
+    #             current_density.detach()
+    #             .clone()
+    #             .to(dtype=torch.float32, device=device)
+    #             .unsqueeze(1)
+    #         )
+    #     else:
+    #         source_tensor = torch.tensor(
+    #             current_density, dtype=torch.float32, device=device
+    #         ).unsqueeze(1)
+    # else:
+    #     source_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no source
+    # features.append(source_tensor)
 
     # Sigma (conductivity) field
     # The neural network needs this information to learn where eddy currents occur
-    if sigma_field is not None:
-        sigma_np = np.array(sigma_field, dtype=np.float32)
-        sigma_tensor = torch.tensor(
-            sigma_np, dtype=torch.float32, device=device
-        ).unsqueeze(1)
-    else:
-        sigma_tensor = torch.zeros(n_nodes, 1, device=device)
-    features.append(sigma_tensor)
+    # if sigma_field is not None:
+    #     # Normalize sigma for better numerical conditioning (log-scale or relative to max)
+    #     sigma_np = np.array(sigma_field, dtype=np.float32)
+    #     sigma_tensor = torch.tensor(
+    #         sigma_np, dtype=torch.float32, device=device
+    #     ).unsqueeze(1)
+    # else:
+    #     sigma_tensor = torch.zeros(n_nodes, 1, device=device)
+    # features.append(sigma_tensor)
 
     return torch.cat(features, dim=1)
 
@@ -448,28 +428,30 @@ def _build_edge_features(
     euclidean_dist = torch.norm(relative_pos, dim=1, keepdim=True)
 
     # Temperature difference (if available)
-    if A_current is not None:
-        T_tensor = torch.tensor(A_current, dtype=torch.float32, device=device)
-        src_temp = T_tensor[edge_index[0]]
-        dst_temp = T_tensor[edge_index[1]]
-        temp_diff = (dst_temp - src_temp).unsqueeze(1)
-    else:
-        temp_diff = torch.zeros(edge_index.shape[1], 1, device=device)
+    # if A_current is not None:
+    #     T_tensor = torch.tensor(A_current, dtype=torch.float32, device=device)
+    #     src_temp = T_tensor[edge_index[0]]
+    #     dst_temp = T_tensor[edge_index[1]]
+    #     temp_diff = (dst_temp - src_temp).unsqueeze(1)
+    # else:
+    #     temp_diff = torch.zeros(edge_index.shape[1], 1, device=device)
 
     # Concatenate all edge features
-    edge_features = torch.cat([relative_pos, euclidean_dist, temp_diff], dim=1)
+    edge_features = torch.cat([relative_pos, euclidean_dist], dim=1)
 
     return edge_features
 
 
 def _build_global_features(
-    omega: float, n_nodes: int, device: torch.device = None
+    omega: Optional[float], n_nodes: int, device: torch.device = None
 ) -> torch.Tensor:
     """
     Build global feature vector.
     """
     if device is None:
         device = torch.device("cpu")
+    if omega is None:
+        omega = 0.0
     global_features = torch.tensor(
         [omega, float(n_nodes)], dtype=torch.float32, device=device
     )
@@ -533,7 +515,7 @@ class GraphCreatorEM:
         material_node_field: Optional[np.ndarray] = None,
         sigma_field: Optional[np.ndarray] = None,
         dirichlet_values: Optional[np.ndarray] = None,
-        omega: float = 0.0,
+        omega: Optional[float] = None,
         add_self_loops: bool = True,
         device: Optional[torch.device] = None,
     ) -> Tuple[Data, Dict]:
@@ -550,12 +532,10 @@ class GraphCreatorEM:
         # Convert to torch tensor on target device
         pos_tensor = torch.tensor(pos, dtype=torch.float32, device=device)
 
-        # 2. Determine node types (Dirichlet/Neumann/Robin/Interior)
+        # 2. Determine node types (Dirichlet/Interior)
         node_types = _classify_node_types(
             self.mesh,
             self.dirichlet_names or [],
-            [],
-            [],
             pnum_to_idx,
         )
         node_types = node_types.to(device)
@@ -575,6 +555,7 @@ class GraphCreatorEM:
         # 4. Build node features
         node_features = _build_node_features(
             node_types,
+            pos_tensor,
             A_current,
             current_density,
             material_node_field,
@@ -596,9 +577,8 @@ class GraphCreatorEM:
             "pnum_to_idx": pnum_to_idx,
             "node_types": node_types,
             "dirichlet_mask": node_types == 0,
-            "interior_mask": node_types == 2,
-            "robin_mask": node_types == 3,
-            "free_mask": node_types != 0,  # Non-Dirichlet nodes
+            "interior_mask": node_types == 1,
+            "free_mask": node_types != 0,  # Non-Dirichlet nodes (i.e., interior)
             "dirichlet_values": dirichlet_values,
             "current_density": current_density,
             "mesh": self.mesh,
@@ -646,9 +626,7 @@ class GraphCreatorEM:
         aux_tensors_to_move = [
             "node_types",
             "dirichlet_mask",
-            "neumann_mask",
             "interior_mask",
-            "robin_mask",
         ]
         for key in aux_tensors_to_move:
             if key in aux and hasattr(aux[key], "to"):
@@ -680,15 +658,6 @@ class GraphCreatorEM:
 
         # Remap edge indices to subgraph
         free_edge_index = old_to_new[free_edges]
-
-        # Handle Robin values for subgraph
-        robin_values_sub = None
-        if aux.get("robin_values") is not None:
-            h_vals, amb_vals = aux["robin_values"]
-            robin_values_sub = (
-                h_vals[free_indices.cpu().numpy()],
-                amb_vals[free_indices.cpu().numpy()],
-            )
 
         # Create subgraph data
         free_data = Data(
@@ -735,63 +704,6 @@ class GraphCreatorEM:
         }
 
         return free_data, node_mapping, free_aux
-
-    def create_neumann_values(
-        self,
-        pos,
-        aux_data,
-        neumann_names,
-        flux_values=None,
-        flux_magnitude=1.0,
-        seed=None,
-    ):
-        if seed is not None:
-            np.random.seed(seed)
-
-        # Convert pos to numpy if it's a torch tensor
-        if hasattr(pos, "numpy"):
-            pos_np = pos.numpy()
-        else:
-            pos_np = np.array(pos)
-
-        n_nodes = pos_np.shape[0]
-        neumann_values = np.zeros(n_nodes)
-
-        # Get mesh from aux data
-        mesh = aux_data["mesh"]
-        pnum_to_idx = aux_data["pnum_to_idx"]
-
-        # Handle different input formats for neumann_names
-        if isinstance(neumann_names, str):
-            neumann_names = [neumann_names]
-
-        # Handle different input formats for flux_values
-        if flux_values is None:
-            # Use default flux_magnitude for all boundaries
-            flux_values = {name: flux_magnitude for name in neumann_names}
-        elif isinstance(flux_values, (int, float)):
-            # Single constant value for all boundaries
-            flux_values = {name: flux_values for name in neumann_names}
-        elif not isinstance(flux_values, dict):
-            raise ValueError(
-                "flux_values must be None, a number, or a dict mapping boundary names to values"
-            )
-
-        # Assign flux values based on boundary names
-        for boundary_name in neumann_names:
-            if boundary_name not in flux_values:
-                raise ValueError(
-                    f"No flux value specified for boundary '{boundary_name}'"
-                )
-
-            # Get nodes on this specific boundary
-            boundary_nodes = _get_nodes_on_boundary(mesh, boundary_name, pnum_to_idx)
-            flux_value = flux_values[boundary_name]
-
-            for node_idx in boundary_nodes:
-                neumann_values[node_idx] = flux_value
-
-        return neumann_values
 
     def create_dirichlet_values(
         self,
@@ -858,66 +770,6 @@ class GraphCreatorEM:
 
         return dirichlet_values
 
-    def create_robin_values(
-        self,
-        pos,
-        aux_data,
-        robin_names,
-        robin_values=None,
-        h_default=1.0,
-        amb_default=0.0,
-        seed=None,
-    ):
-        if seed is not None:
-            np.random.seed(seed)
-
-        # Convert pos to numpy if it's a torch tensor
-        if hasattr(pos, "numpy"):
-            pos_np = pos.numpy()
-        else:
-            pos_np = np.array(pos)
-
-        n_nodes = pos_np.shape[0]
-        h_values = np.zeros(n_nodes)
-        amb_values = np.zeros(n_nodes)
-
-        # Get mesh from aux data
-        mesh = aux_data["mesh"]
-        pnum_to_idx = aux_data["pnum_to_idx"]
-
-        # Handle different input formats for robin_names
-        if isinstance(robin_names, str):
-            robin_names = [robin_names]
-
-        # Handle different input formats for robin_values
-        if robin_values is None:
-            # Use default values for all boundaries
-            robin_values = {name: (h_default, amb_default) for name in robin_names}
-        elif isinstance(robin_values, (tuple, list)) and len(robin_values) == 2:
-            # Single tuple for all boundaries
-            robin_values = {name: robin_values for name in robin_names}
-        elif not isinstance(robin_values, dict):
-            raise ValueError(
-                "robin_values must be None, a tuple (h, T_amb), or a dict mapping boundary names to tuples"
-            )
-
-        # Assign values based on boundary names
-        for boundary_name in robin_names:
-            if boundary_name not in robin_values:
-                raise ValueError(
-                    f"No Robin values specified for boundary '{boundary_name}'"
-                )
-
-            # Get nodes on this specific boundary
-            boundary_nodes = _get_nodes_on_boundary(mesh, boundary_name, pnum_to_idx)
-            h_val, amb_val = robin_values[boundary_name]
-
-            for node_idx in boundary_nodes:
-                h_values[node_idx] = h_val
-                amb_values[node_idx] = amb_val
-
-        return h_values, amb_values
-
     def visualize_graph(
         self,
         data: Data,
@@ -946,31 +798,23 @@ class GraphCreatorEM:
             node_colors = ["green"] * data.num_nodes
             node_type_counts = {
                 0: 0,
-                1: 0,
-                2: data.num_nodes,
-                3: 0,
-            }  # No Dirichlet/Neumann/Robin in free nodes
+                1: data.num_nodes,
+            }  # No Dirichlet in free nodes
         else:
             # For full graphs, use the node types from aux
             node_types = aux["node_types"].numpy()
             # Ensure we only process as many node types as we have nodes in the graph
             node_types = node_types[: data.num_nodes]
             node_colors = []
-            node_type_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+            node_type_counts = {0: 0, 1: 0}
 
             for node_type in node_types:
                 if node_type == 0:  # Dirichlet
                     node_colors.append("red")
                     node_type_counts[0] += 1
-                elif node_type == 1:  # Neumann
-                    node_colors.append("blue")
-                    node_type_counts[1] += 1
-                elif node_type == 3:  # Robin
-                    node_colors.append("orange")
-                    node_type_counts[3] += 1
                 else:  # Interior
                     node_colors.append("green")
-                    node_type_counts[2] += 1
+                    node_type_counts[1] += 1
 
         # Plot 1: Graph structure with node types
         nx.draw_networkx_nodes(
@@ -995,9 +839,7 @@ class GraphCreatorEM:
         # Add legend for node types
         legend_elements = [
             mpatches.Patch(color="red", label=f"Dirichlet ({node_type_counts[0]})"),
-            mpatches.Patch(color="blue", label=f"Neumann ({node_type_counts[1]})"),
-            mpatches.Patch(color="orange", label=f"Robin ({node_type_counts[3]})"),
-            mpatches.Patch(color="green", label=f"Interior ({node_type_counts[2]})"),
+            mpatches.Patch(color="green", label=f"Interior ({node_type_counts[1]})"),
         ]
         ax1.legend(handles=legend_elements, loc="upper right", bbox_to_anchor=(1, 1))
 
@@ -1036,71 +878,6 @@ class GraphCreatorEM:
 
         ax2.set_aspect("equal")
         ax2.axis("off")
-
-        # Plot 3: Neumann values visualization (if available)
-        if data.x.shape[1] > 6:  # Has Neumann data (7th feature)
-            neumann_values = data.x[
-                :, 6
-            ].numpy()  # Neumann values are 7th feature (index 6)
-            neumann_mask = aux["neumann_mask"]
-
-            # Only show non-zero Neumann values or Neumann boundary nodes
-            if neumann_mask.any() or (neumann_values != 0).any():
-                # Create scatter plot colored by Neumann values
-                scatter = ax3.scatter(
-                    data.pos[:, 0].numpy(),
-                    data.pos[:, 1].numpy(),
-                    c=neumann_values,
-                    cmap="viridis",
-                    s=node_size,
-                    alpha=0.8,
-                )
-
-                # Add colorbar
-                cbar = plt.colorbar(scatter, ax=ax3)
-                cbar.set_label("Neumann Values, ($h_N$)")
-
-                # Highlight Neumann boundary nodes with red circles
-                if neumann_mask.any():
-                    neumann_indices = torch.where(neumann_mask)[0]
-                    neumann_pos = data.pos[neumann_indices].numpy()
-                    ax3.scatter(
-                        neumann_pos[:, 0],
-                        neumann_pos[:, 1],
-                        s=node_size * 2,
-                        facecolors="none",
-                        edgecolors="red",
-                        linewidth=2,
-                    )
-
-                ax3.set_title(
-                    f"Neumann Values\\nRange: [{neumann_values.min():.3f}, {neumann_values.max():.3f}]"
-                )
-            else:
-                ax3.text(
-                    0.5,
-                    0.5,
-                    "No Neumann values\\navailable",
-                    ha="center",
-                    va="center",
-                    transform=ax3.transAxes,
-                    fontsize=12,
-                )
-                ax3.set_title("Neumann Values (N/A)")
-        else:
-            ax3.text(
-                0.5,
-                0.5,
-                "No Neumann data\\navailable",
-                ha="center",
-                va="center",
-                transform=ax3.transAxes,
-                fontsize=12,
-            )
-            ax3.set_title("Neumann Values (N/A)")
-
-        ax3.set_aspect("equal")
-        ax3.axis("off")
 
         # Plot 4: Dirichlet values visualization (if available)
         if data.x.shape[1] > 7:  # Has Dirichlet data (8th feature)

@@ -204,6 +204,9 @@ class MeshGraphNet(nn.Module):
             if g_in is None:
                 # If not provided, use zeros to preserve interface
                 g_in = x.new_zeros((B, self.global_encoder[0].in_features))
+            # Ensure g_in is 2D [B, input_dim_global]
+            if g_in.dim() == 1:
+                g_in = g_in.unsqueeze(0)
             g = self.global_encoder(g_in)  # [B, 128]
         else:
             g = x.new_zeros(

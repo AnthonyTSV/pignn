@@ -15,6 +15,9 @@ r_star = 70 * 1e-3  # m
 A_star = 4.8 * 1e-4  # Wb/m
 mu_star = 4 * 3.1415926535e-7 # H/m
 J_star = A_star / (r_star**2 * mu_star)
+frequency = 1000  # Hz
+omega = 2 * ng.pi * frequency  # rad/s
+sigma_star = J_star / (omega * A_star)
 
 def _sparse_diag(A: torch.Tensor) -> torch.Tensor:
     """
@@ -205,13 +208,11 @@ class FEMSolverEM:
 
         nu = 1.0 / (self.problem.mu0 * mu_r)
 
-        kappa = self.problem.omega * mu_star * (r_star**2)
-
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
         # Eddy current term: applied to all conductive regions (including workpiece)
         # In induction heating, eddy currents are induced in conductive materials
-        a += 1j * kappa * sigma * r * A * v * ng.dx
+        a += 1j * sigma * r * A * v * ng.dx
         Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
         Js_phi = Js_phi / J_star  # Normalize current density
@@ -296,12 +297,10 @@ class FEMSolverEM:
         # In normalized form: nu = 1/(mu0_normalized * mu_r) = 1/(1 * mu_r) = 1/mu_r
         nu = 1.0 / (self.problem.mu0 * mu_r)
 
-        kappa = self.problem.omega * mu_star * (r_star**2)
-
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
         # Eddy current term: applied to all conductive regions (including workpiece)
-        a += 1j * kappa * sigma * r * A * v * ng.dx
+        a += 1j * sigma * r * A * v * ng.dx
         Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
         Js_phi = Js_phi / J_star  # Normalize current density
@@ -878,10 +877,9 @@ if __name__ == "__main__":
     if np.iscomplexobj(gfA):
         gfA_real = np.real(gfA)
         gfA_imag = np.imag(gfA)
-        residual_int = fem_solver.compute_pi_abs_loss(
+        residual_int = fem_solver.compute_complex_residual(
             torch.tensor(gfA_real, dtype=torch.float64),
             torch.tensor(gfA_imag, dtype=torch.float64),
-            squared=True, normalize="ndof",
         )
         print(f"Complex energy residual: {residual_int.item()}")
     else:

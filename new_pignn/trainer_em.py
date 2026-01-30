@@ -50,7 +50,6 @@ class PIMGNTrainerEM:
         # Create sample graph to get dimensions
         material_field = getattr(first_problem, "material_field", None)
         sigma_field = getattr(first_problem, "sigma_field", None)
-        neumann_vals = getattr(first_problem, "neumann_values_array", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
         current_density = getattr(first_problem, "current_density_field", None)
 
@@ -82,12 +81,14 @@ class PIMGNTrainerEM:
             input_dim_edge=input_dim_edge,
             hidden_dim=128,
             output_dim=output_dim,
+            # input_dim_global=2,
             num_layers=12,
         ).to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
         self.scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=1000, gamma=0.9)
+            self.optimizer, step_size=1000, gamma=0.95
+        )
 
         # Training history
         self.losses = []
@@ -232,7 +233,6 @@ class PIMGNTrainerEM:
         )
 
         # Get the values for this problem
-        neumann_vals = getattr(problem, "neumann_values_array", None)
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
@@ -372,7 +372,6 @@ class PIMGNTrainerEM:
         )
 
         # Get the values for this problem
-        neumann_vals = getattr(problem, "neumann_values_array", None)
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
@@ -601,7 +600,7 @@ def train_pimgn_on_single_problem(resume_from: str = None):
 def train_pimgn_em_complex(resume_from: str = None):
     problem = create_em_problem_complex()
     config = {
-        "epochs": 1000,
+        "epochs": 10000,
         "lr": 1e-4,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem_complex",
