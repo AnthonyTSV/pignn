@@ -191,6 +191,39 @@ class MeshGraphNet(nn.Module):
                 nn.Linear(self.hidden_dim, 2),
             )
             self.output_dim = 4  # [A_real, A_imag, phi_real, phi_imag]
+            
+            # Learnable output scales - initialized to expected solution magnitude
+            # This helps with gradient flow when starting from near-zero outputs
+            # Default: A ~ 1.0, phi ~ 0.4
+            self.output_scale_A = nn.Parameter(torch.tensor([1.0, 1.0]))
+            self.output_scale_phi = nn.Parameter(torch.tensor([0.4, 0.4]))
+            
+            # Initialize decoder biases to small non-zero values for symmetry breaking
+            # This ensures gradients flow from the start
+            self._init_complex_decoders()
+
+    def _init_complex_decoders(self):
+        """
+        Initialize decoders for complex EM to ensure proper gradient flow.
+        
+        The key insight: At zero output, the A equation has zero residual (no source term),
+        so gradients for A_real are zero. We initialize with small non-zero biases
+        to break this symmetry and allow learning from the start.
+        """
+        # Get the final linear layers
+        final_A = self.decoder_A[-1]
+        final_phi = self.decoder_phi[-1]
+        
+        # Initialize biases to small random values (not zero)
+        # This breaks symmetry and provides gradients for all components
+        with torch.no_grad():
+            # Small random initialization centered at 0.1 for real parts, 0 for imag
+            final_A.bias.data = torch.tensor([0.1, 0.05])
+            final_phi.bias.data = torch.tensor([0.05, 0.02])
+            
+            # Slightly increase weight magnitude for better gradient flow
+            final_A.weight.data *= 2.0
+            final_phi.weight.data *= 2.0
 
     def forward(self, data: Data, coil_mask = None) -> torch.Tensor:
         """
@@ -241,12 +274,17 @@ class MeshGraphNet(nn.Module):
             else:
                 A_out = self.decoder_A(x)  # [N, 2] -> (A_real, A_imag)
                 phi_out = self.decoder_phi(x)  # [N, 2] -> (phi_real, phi_imag)
-                out = torch.zeros((x.size(0), self.output_dim), device=x.device)
+                
+                # Apply learnable output scaling for proper magnitude
+                A_scaled = A_out * self.output_scale_A
+                phi_scaled = phi_out * self.output_scale_phi
+                
+                out = torch.zeros((x.size(0), self.output_dim), device=x.device, dtype=x.dtype)
                 # Match trainer expectation: [A_real, A_imag, phi_real, phi_imag]
-                out[:, 0] = A_out[:, 0]
-                out[:, 1] = A_out[:, 1]
-                out[:, 2] = phi_out[:, 0]
-                out[:, 3] = phi_out[:, 1]
+                out[:, 0] = A_scaled[:, 0]
+                out[:, 1] = A_scaled[:, 1]
+                out[:, 2] = phi_scaled[:, 0]
+                out[:, 3] = phi_scaled[:, 1]
 
         return out
 
