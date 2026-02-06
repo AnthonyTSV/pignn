@@ -100,6 +100,10 @@ class PIMGNTrainerEM:
         # Populated during training when physics loss is computed.
         # Can remain None if training loop is skipped (e.g., resume at final epoch).
         self.last_residuals = None
+        
+        # Component losses for mixed A-phi formulation (for logging)
+        self._last_loss_A = 0.0
+        self._last_loss_phi = 0.0
 
         # Initialize logger
         save_dir = config.get("save_dir", "results/physics_informed_em")
@@ -231,13 +235,18 @@ class PIMGNTrainerEM:
             phi_real_dofs = prediction_full_phireal[coil_node_indices]  # [n_dofs_phi]
             phi_imag_dofs = prediction_full_phiimag[coil_node_indices]  # [n_dofs_phi]
 
-            # Compute complex residual with proper DOF structure
-            residual = fem_solver.compute_mixed_energy_norm_loss(
+            # Use balanced loss computation that separates A and phi
+            phi_weight = self.config.get("phi_weight", 1.0)
+            loss_A, loss_phi, residual = fem_solver.compute_mixed_energy_norm_loss_balanced(
                 prediction_full_Areal,   # [n_dofs_A]
                 prediction_full_Aimag,   # [n_dofs_A]
                 phi_real_dofs,           # [n_dofs_phi]
                 phi_imag_dofs,           # [n_dofs_phi]
+                phi_weight=phi_weight,
             )
+            # Store component losses for logging
+            self._last_loss_A = loss_A.item()
+            self._last_loss_phi = loss_phi.item()
         else:
             prediction_full_real = torch.zeros(
                 n_total, dtype=torch.float64, device=self.device
@@ -370,8 +379,13 @@ class PIMGNTrainerEM:
             if epoch % 10 == 0:
                 elapsed = time.time() - epoch_start
                 val_str = f" | Val Loss: {val_loss:.3e}" if val_loss is not None else ""
+                # Show component losses for complex/mixed EM problems
+                if self.is_complex and hasattr(self, '_last_loss_A'):
+                    loss_A_str = f" | L_A: {self._last_loss_A:.3e} | L_φ: {self._last_loss_phi:.3e}"
+                else:
+                    loss_A_str = ""
                 print(
-                    f"Epoch {epoch+1:4d} | Train Loss: {physics_loss:.3e}{val_str} | Time: {elapsed:.2f}s"
+                    f"Epoch {epoch+1:4d} | Train Loss: {physics_loss:.3e}{loss_A_str}{val_str} | Time: {elapsed:.2f}s"
                 )
 
             # Evaluate L2 error every 100 epochs
@@ -700,6 +714,9 @@ def train_pimgn_em_mixed(resume_from: str = None):
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem_mixed",
         "resume_from": resume_from,  # Path to checkpoint to resume from
+        # Phi weight for balanced loss: increase if phi doesn't converge
+        # phi_weight=10 means phi loss contributes 10x more to total loss
+        "phi_weight": 10.0,
     }
     _run_single_problem_experiment(problem, config, "First order EM Mixed")
 

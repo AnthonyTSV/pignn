@@ -998,6 +998,108 @@ class FEMSolverEM:
 
         raise ValueError(f"Unknown normalize mode: {normalize}")
 
+    def compute_mixed_energy_norm_loss_balanced(
+        self,
+        pred_sol_a_real,
+        pred_sol_a_imag,
+        pred_sol_phi_real,
+        pred_sol_phi_imag,
+        *,
+        phi_weight: float = 1.0,
+        eps: float = 1e-12,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute SEPARATE residual losses for A and phi components.
+        
+        This helps with the scale imbalance between A and phi by:
+        1. Computing residuals for A and phi DOFs separately
+        2. Normalizing each by their own DOF count
+        3. Returning both so they can be weighted in the trainer
+        
+        Args:
+            pred_sol_a_real: Real part of A prediction [n_dofs_A]
+            pred_sol_a_imag: Imaginary part of A prediction [n_dofs_A]
+            pred_sol_phi_real: Real part of phi prediction [n_dofs_phi]
+            pred_sol_phi_imag: Imaginary part of phi prediction [n_dofs_phi]
+            phi_weight: Weight for phi loss relative to A loss
+            eps: Small value to avoid division by zero
+            
+        Returns:
+            (loss_A, loss_phi, total_loss): Losses for A, phi, and weighted total
+        """
+        n_A = self.n_dofs_A
+        n_phi = self.n_dofs_phi
+        n_total = n_A + n_phi
+
+        # Convert inputs to tensors
+        ar_A = self._to_tensor64(pred_sol_a_real)
+        ai_A = self._to_tensor64(pred_sol_a_imag)
+        ar_phi = self._to_tensor64(pred_sol_phi_real)
+        ai_phi = self._to_tensor64(pred_sol_phi_imag)
+
+        # Concatenate into full DOF vectors: [A_dofs | phi_dofs]
+        ar = torch.zeros(n_total, device=self.device, dtype=torch.float64)
+        ai = torch.zeros(n_total, device=self.device, dtype=torch.float64)
+
+        ar[:n_A] = ar_A
+        ar[n_A:] = ar_phi
+        ai[:n_A] = ai_A
+        ai[n_A:] = ai_phi
+
+        # Get free DOFs mask for the product space
+        free_mask = self._free_dofs_mask()
+
+        Kr, Ki = self.bilinear_form
+
+        # Residual blocks (full): r = K*u - f
+        Kr_ar = torch.sparse.mm(Kr, ar.unsqueeze(1)).squeeze(1)
+        Ki_ai = torch.sparse.mm(Ki, ai.unsqueeze(1)).squeeze(1)
+        r_real = Kr_ar - Ki_ai - self.linear_form
+
+        Kr_ai = torch.sparse.mm(Kr, ai.unsqueeze(1)).squeeze(1)
+        Ki_ar = torch.sparse.mm(Ki, ar.unsqueeze(1)).squeeze(1)
+        r_imag = Kr_ai + Ki_ar
+
+        # Build diagonal preconditioner
+        diag_kr = _sparse_diag(Kr).to(dtype=torch.float64, device=self.device)
+        diag_ki = _sparse_diag(Ki).to(dtype=torch.float64, device=self.device)
+        diag_abs = torch.sqrt(diag_kr ** 2 + diag_ki ** 2).clamp_min(eps)
+
+        # Separate masks for A and phi free DOFs
+        free_mask_A = free_mask[:n_A]
+        free_mask_phi = free_mask[n_A:]
+
+        # --- A component loss ---
+        rr_A = r_real[:n_A][free_mask_A]
+        ri_A = r_imag[:n_A][free_mask_A]
+        diag_A = diag_abs[:n_A][free_mask_A]
+        
+        n_free_A = rr_A.numel()
+        if n_free_A > 0:
+            wr_A = rr_A / diag_A
+            wi_A = ri_A / diag_A
+            loss_A = 0.5 * (torch.dot(rr_A, wr_A) + torch.dot(ri_A, wi_A)) / float(n_free_A)
+        else:
+            loss_A = torch.zeros((), dtype=torch.float64, device=self.device)
+
+        # --- Phi component loss ---
+        rr_phi = r_real[n_A:][free_mask_phi]
+        ri_phi = r_imag[n_A:][free_mask_phi]
+        diag_phi = diag_abs[n_A:][free_mask_phi]
+        
+        n_free_phi = rr_phi.numel()
+        if n_free_phi > 0:
+            wr_phi = rr_phi / diag_phi
+            wi_phi = ri_phi / diag_phi
+            loss_phi = 0.5 * (torch.dot(rr_phi, wr_phi) + torch.dot(ri_phi, wi_phi)) / float(n_free_phi)
+        else:
+            loss_phi = torch.zeros((), dtype=torch.float64, device=self.device)
+
+        # Weighted total: equal weight means A and phi contribute equally
+        total_loss = loss_A + phi_weight * loss_phi
+
+        return loss_A, loss_phi, total_loss
+
     def _create_boundary_dofs_vector(
         self, problem: MeshProblemEM, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
