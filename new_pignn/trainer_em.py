@@ -52,6 +52,7 @@ class PIMGNTrainerEM:
         sigma_field = getattr(first_problem, "sigma_field", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
         current_density = getattr(first_problem, "current_density_field", None)
+        coil_node_mask = getattr(first_problem, "coil_node_mask", None)
 
         sample_data, aux = graph_creator.create_graph(
             A_current=None,
@@ -59,6 +60,7 @@ class PIMGNTrainerEM:
             sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
             current_density=current_density,
+            coil_node_mask=coil_node_mask,
         )
 
         free_node_data, mapping, new_aux = graph_creator.create_free_node_subgraph(
@@ -268,6 +270,7 @@ class PIMGNTrainerEM:
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
         current_density = getattr(problem, "current_density_field", None)
+        coil_node_mask = getattr(problem, "coil_node_mask", None)
 
         self.optimizer.zero_grad()
 
@@ -278,6 +281,7 @@ class PIMGNTrainerEM:
             sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
             current_density=current_density,
+            coil_node_mask=coil_node_mask,
         )
 
         # Create free node subgraph (only non-Dirichlet nodes)
@@ -421,6 +425,7 @@ class PIMGNTrainerEM:
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
         current_density = getattr(problem, "current_density_field", None)
+        coil_node_mask = getattr(problem, "coil_node_mask", None)
 
         with torch.no_grad():
             # Build graph
@@ -430,6 +435,7 @@ class PIMGNTrainerEM:
                 sigma_field=sigma_field,
                 dirichlet_values=dirichlet_vals,
                 current_density=current_density,
+                coil_node_mask=coil_node_mask,
             )
 
             free_graph, node_mapping, free_aux = (
@@ -689,7 +695,7 @@ def train_pimgn_em_complex(resume_from: str = None):
 def train_pimgn_em_mixed(resume_from: str = None):
     problem = create_em_mixed()
     config = {
-        "epochs": 5000,
+        "epochs": 10000,
         "lr": 1e-4,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem_mixed",

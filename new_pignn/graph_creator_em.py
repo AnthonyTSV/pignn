@@ -584,9 +584,10 @@ class GraphCreatorEM:
             "current_density": current_density,
             "mesh": self.mesh,
             "connectivity_method": self.connectivity_method,
-            # "coil_mask": coil_node_mask,
-            # "coil_node_indices": np.where(coil_node_mask)[0]
         }
+        if coil_node_mask is not None:
+            aux["coil_mask"] = coil_node_mask
+            aux["coil_node_indices"] = np.where(coil_node_mask)[0]
 
         # 8. Create PyTorch Geometric Data object
         data = Data(

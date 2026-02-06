@@ -180,8 +180,17 @@ class MeshGraphNet(nn.Module):
         self.output_head = nn.Linear(self.hidden_dim, T)
 
         if self.complex_em:
-            self.decoder_A = nn.Linear(self.hidden_dim, 2)
-            self.decoder_phi = nn.Linear(self.hidden_dim, 2)
+            self.decoder_A = nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.hidden_dim, 2),
+            )
+            self.decoder_phi = nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.hidden_dim, 2),
+            )
+            self.output_dim = 4  # [A_real, A_imag, phi_real, phi_imag]
 
     def forward(self, data: Data, coil_mask = None) -> torch.Tensor:
         """
@@ -232,7 +241,7 @@ class MeshGraphNet(nn.Module):
             else:
                 A_out = self.decoder_A(x)  # [N, 2] -> (A_real, A_imag)
                 phi_out = self.decoder_phi(x)  # [N, 2] -> (phi_real, phi_imag)
-                out = torch.zeros((x.size(0), 2 * self.output_dim), device=x.device)
+                out = torch.zeros((x.size(0), self.output_dim), device=x.device)
                 # Match trainer expectation: [A_real, A_imag, phi_real, phi_imag]
                 out[:, 0] = A_out[:, 0]
                 out[:, 1] = A_out[:, 1]
