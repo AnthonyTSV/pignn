@@ -112,6 +112,7 @@ class MeshGraphNet(nn.Module):
         output_dim: int = 1,
         input_dim_global: int = 0,
         num_layers: int = 12,
+        complex_em: bool = False,
     ):
         super(MeshGraphNet, self).__init__()
 
@@ -136,6 +137,7 @@ class MeshGraphNet(nn.Module):
         self.gnn_layers = nn.ModuleList(
             [MeshGraphNetLayer(hidden_dim) for _ in range(self.num_layers)]
         )
+        self.complex_em = complex_em
         self._build_output_head()
 
     def _build_output_head(self):
@@ -177,7 +179,11 @@ class MeshGraphNet(nn.Module):
         self.use_cnn = False
         self.output_head = nn.Linear(self.hidden_dim, T)
 
-    def forward(self, data: Data) -> torch.Tensor:
+        if self.complex_em:
+            self.decoder_A = nn.Linear(self.hidden_dim, 2)
+            self.decoder_phi = nn.Linear(self.hidden_dim, 2)
+
+    def forward(self, data: Data, coil_mask = None) -> torch.Tensor:
         """
         Args:
             data.x:          [N, input_dim_node]
@@ -221,7 +227,17 @@ class MeshGraphNet(nn.Module):
         if self.use_cnn:
             out = self.output_head(x.unsqueeze(1)).squeeze(1)  # [N, T]
         else:
-            out = self.output_head(x)  # [N, T]
+            if not self.complex_em:
+                out = self.output_head(x)  # [N, T]
+            else:
+                A_out = self.decoder_A(x)  # [N, 2] -> (A_real, A_imag)
+                phi_out = self.decoder_phi(x)  # [N, 2] -> (phi_real, phi_imag)
+                out = torch.zeros((x.size(0), 2 * self.output_dim), device=x.device)
+                # Match trainer expectation: [A_real, A_imag, phi_real, phi_imag]
+                out[:, 0] = A_out[:, 0]
+                out[:, 1] = A_out[:, 1]
+                out[:, 2] = phi_out[:, 0]
+                out[:, 3] = phi_out[:, 1]
 
         return out
 

@@ -13,11 +13,12 @@ EnergyInvMode = Literal["jacobi", "cg"]
 
 r_star = 70 * 1e-3  # m
 A_star = 4.8 * 1e-4  # Wb/m
-mu_star = 4 * 3.1415926535e-7 # H/m
+mu_star = 4 * 3.1415926535e-7  # H/m
 J_star = A_star / (r_star**2 * mu_star)
 frequency = 1000  # Hz
 omega = 2 * ng.pi * frequency  # rad/s
 sigma_star = J_star / (omega * A_star)
+
 
 def _sparse_diag(A: torch.Tensor) -> torch.Tensor:
     """
@@ -84,6 +85,7 @@ def _cg_solve(
 
     return x
 
+
 class FEMSolverEM:
     def __init__(
         self,
@@ -103,11 +105,12 @@ class FEMSolverEM:
         self.fes = None
 
         self.problem = problem
-        if problem is not None:
-            if problem.complex:
-                self.init_complex_matrices()
-            else:
-                self.init_matrices()
+        # if problem is not None:
+        #     if problem.complex:
+        #         self.init_complex_matrices()
+        #     else:
+        #         self.init_matrices()
+        self.init_mixed_matrices()
 
     def init_matrices(self):
         if self.problem is None:
@@ -231,22 +234,151 @@ class FEMSolverEM:
         ).to(self.device)
         self.fes = fes
 
+    def init_mixed_matrices(self):
+        """Initialize matrices for A-φ mixed formulation."""
+        # FE spaces
+        fes_a = ng.H1(
+            self.mesh,
+            order=self.order,
+            complex=True,
+            dirichlet=self.problem.mesh_config.dirichlet_pipe,
+        )
+        fes_phi = ng.H1(
+            self.mesh,
+            order=self.order,
+            complex=True,
+            definedon=self.mesh.Materials("mat_coil"),
+        )
+
+        fes = ng.FESpace([fes_a, fes_phi])
+
+        trials = fes.TrialFunction()
+        tests = fes.TestFunction()
+        A, phi_coil = trials[0], trials[1]
+        v, psi = tests[0], tests[1]
+
+        mu_r = self.mesh.MaterialCF(
+            {
+                "mat_workpiece": self.problem.mu_r_workpiece,
+                "mat_air": self.problem.mu_r_air,
+                "mat_coil": self.problem.mu_r_coil,
+            },
+            default=1.0,
+        )
+
+        sigma = self.mesh.MaterialCF(
+            {
+                "mat_workpiece": self.problem.sigma_workpiece,
+                "mat_air": self.problem.sigma_air,
+                "mat_coil": self.problem.sigma_coil,
+            },
+            default=0.0,
+        )
+
+        r = ng.x
+        r1 = ng.IfPos(r, 1.0 / r, 0.0)
+
+        dr_rA = r * ng.grad(A)[0] + A
+        dr_rv = r * ng.grad(v)[0] + v
+        dzA, dzv = ng.grad(A)[1], ng.grad(v)[1]
+
+        nu = 1.0 / (self.problem.mu0 * mu_r)
+
+        a = ng.BilinearForm(fes, symmetric=False)
+        a += nu * (r * dzA * dzv + r1 * dr_rA * dr_rv) * ng.dx
+
+        A_eff = A + phi_coil * r1
+        v_eff = v + psi * r1
+        a += 1j * sigma * r * A_eff * v_eff * ng.dx
+
+        I_spec = self.problem.N_turns * self.problem.I_coil
+        area_coil = self.problem.profile_width_phys * self.problem.profile_height_phys
+        Js_phi = I_spec / area_coil
+        Js_phi = Js_phi / J_star  # Normalize current density
+        print("Normalized current density Js_phi:", Js_phi)
+
+        f = ng.LinearForm(fes)
+        f += (-Js_phi) * psi * ng.dx("mat_coil")
+
+        a.Assemble()
+        f.Assemble()
+
+        # Store DOF info
+        self.n_dofs_A = fes_a.ndof
+        self.n_dofs_phi = fes_phi.ndof
+        self.fes = fes
+        self.fes_a = fes_a
+        self.fes_phi = fes_phi
+
+        # Build mapping from graph nodes to phi DOFs
+        # phi is only defined on coil nodes, so we need to know which graph nodes
+        # correspond to which phi DOFs
+        self._build_node_to_phi_dof_mapping()
+
+        k_real, k_imag = self._ngsolve_to_torch(a.mat)
+        self.bilinear_form = (k_real, k_imag)
+        self.linear_form = torch.tensor(
+            f.vec.FV().NumPy().copy(), dtype=torch.float64
+        ).to(self.device)
+
+    def _build_node_to_phi_dof_mapping(self):
+        """
+        Build mapping from graph node indices to phi DOF indices.
+
+        In NGSolve, for order=1 H1 space, DOFs correspond to mesh vertices.
+        For the phi space (defined only on mat_coil), we need to identify
+        which vertices are in the coil region and their corresponding DOF indices.
+        """
+        import ngsolve as ng
+        
+        # Get the number of mesh vertices (graph nodes)
+        n_vertices = len(list(self.mesh.ngmesh.Points()))
+        
+        # Build mapping using NGSolve's DOF structure
+        # For each vertex, check if it has a DOF in fes_phi
+        node_to_phi_dof = np.full(n_vertices, -1, dtype=np.int64)
+        coil_node_indices = []
+        
+        for v_idx in range(n_vertices):
+            # Get DOF numbers for this vertex in the phi space
+            # NodeId(VERTEX, v_idx) gives the vertex node
+            try:
+                dof_nrs = self.fes_phi.GetDofNrs(ng.NodeId(ng.VERTEX, v_idx))
+                if len(dof_nrs) > 0 and dof_nrs[0] >= 0:
+                    phi_dof = dof_nrs[0]
+                    node_to_phi_dof[v_idx] = phi_dof
+                    coil_node_indices.append((phi_dof, v_idx))  # (dof_idx, node_idx)
+            except:
+                # Vertex not in phi domain
+                pass
+        
+        # Sort by DOF index to get correct ordering
+        coil_node_indices.sort(key=lambda x: x[0])
+        
+        # coil_node_indices[i] = node_idx for phi DOF i
+        self.coil_node_indices = np.array([node_idx for _, node_idx in coil_node_indices], dtype=np.int64)
+        self.node_to_phi_dof = node_to_phi_dof
+        self.coil_vertex_mask = node_to_phi_dof >= 0
+        self.n_coil_nodes = len(self.coil_node_indices)
+        
+        # Verify the mapping matches fes_phi.ndof
+        if self.n_coil_nodes != self.n_dofs_phi:
+            print(f"Warning: n_coil_nodes ({self.n_coil_nodes}) != n_dofs_phi ({self.n_dofs_phi})")
+            print(f"This may cause dimension mismatches in loss computation.")
+
     def _ngsolve_to_torch(self, ngsolve_matrix):
         """Convert NGSolve matrix to torch tensor."""
 
         def _coo_to_tensor(rows, cols, vals, shape, dtype):
             indices = torch.tensor([rows, cols], dtype=torch.long)
             values = torch.tensor(vals, dtype=dtype)
-            tensor = torch.sparse_coo_tensor(
-                indices, values, size=shape, dtype=dtype
-            )
+            tensor = torch.sparse_coo_tensor(indices, values, size=shape, dtype=dtype)
             return tensor.to(self.device)
 
         if ngsolve_matrix.is_complex:
             rows, cols, vals = ngsolve_matrix.COO()
             rows_r, cols_r, vals_r = rows, cols, np.real(vals)
             rows_i, cols_i, vals_i = rows, cols, np.imag(vals)
-
 
             shape = (ngsolve_matrix.height, ngsolve_matrix.width)
             tensor_r = _coo_to_tensor(rows_r, cols_r, vals_r, shape, torch.float64)
@@ -320,6 +452,87 @@ class FEMSolverEM:
         # gfa_norm = ng.Norm(gfa_curl)
         return gfA.vec.FV().NumPy().copy()
 
+    def solve_mixed_em(self, problem: MeshProblemEM):
+        mesh = problem.mesh
+        # A_phi space
+        mu_r = mesh.MaterialCF(
+            {
+                "mat_workpiece": problem.mu_r_workpiece,
+                "mat_air": problem.mu_r_air,
+                "mat_coil": problem.mu_r_coil,
+            },
+            default=1.0,
+        )
+
+        sigma = mesh.MaterialCF(
+            {
+                "mat_workpiece": problem.sigma_workpiece,
+                "mat_air": problem.sigma_air,
+                "mat_coil": problem.sigma_coil,
+            },
+            default=0.0,
+        )
+
+        fes_a = ng.H1(
+            mesh,
+            order=1,
+            complex=True,
+            dirichlet="bc_air|bc_axis|bc_workpiece_left",
+        )
+
+        fes_phi = ng.H1(
+            mesh,
+            order=1,
+            complex=True,
+            definedon=mesh.Materials("mat_coil"),
+        )
+
+        fes = ng.FESpace([fes_a, fes_phi])
+
+        trials = fes.TrialFunction()
+        tests = fes.TestFunction()
+
+        A = trials[0]
+        phi_coil = trials[1]
+        v = tests[0]
+        psi = tests[1]
+
+        gfu = ng.GridFunction(fes)
+        gfA = gfu.components[0]
+        gfPhi = gfu.components[1]
+
+        r = ng.x
+        r1 = ng.IfPos(r, 1.0 / r, 0.0)
+
+        dr_rA = r * ng.grad(A)[0] + A
+        dr_rv = r * ng.grad(v)[0] + v
+        dzA = ng.grad(A)[1]
+        dzv = ng.grad(v)[1]
+
+        nu = 1.0 / (problem.mu0 * mu_r)
+
+        a = ng.BilinearForm(fes, symmetric=False)
+        a += nu * (r * dzA * dzv + r1 * dr_rA * dr_rv) * ng.dx
+
+        A_eff = A + phi_coil * r1
+        v_eff = v + psi * r1
+        a += 1j * sigma * r * A_eff * v_eff * ng.dx
+
+        I_spec = problem.N_turns * problem.I_coil
+        area_coil = problem.profile_width_phys * problem.profile_height_phys
+        Js_phi = I_spec / area_coil
+        Js_phi = Js_phi / J_star  # Normalize current density
+
+        f = ng.LinearForm(fes)
+        f += (-Js_phi) * psi * ng.dx("mat_coil")
+
+        a.Assemble()
+        f.Assemble()
+
+        gfu.vec.data = a.mat.Inverse(fes.FreeDofs(), inverse="pardiso") * f.vec
+
+        return gfA, gfPhi, r1
+
     def compute_residual(
         self,
         pred_sol,
@@ -360,9 +573,7 @@ class FEMSolverEM:
         pred_full = pred_sol_tensor.clone()
         pred_full[~free_dofs_mask] = boundary_dofs_vector[~free_dofs_mask]
 
-        Ax = torch.sparse.mm(self.bilinear_form, pred_full.unsqueeze(1)).squeeze(
-            1
-        )
+        Ax = torch.sparse.mm(self.bilinear_form, pred_full.unsqueeze(1)).squeeze(1)
         res = Ax - self.linear_form
 
         res = res[free_dofs_mask]
@@ -455,7 +666,14 @@ class FEMSolverEM:
 
         raise ValueError(f"Unknown normalize mode: {normalize}")
 
-    def compute_complex_residual(self, pred_sol_real, pred_sol_imag, *, normalize: NormalizeMode = "ndof", eps: float = 1e-12) -> torch.Tensor:
+    def compute_complex_residual(
+        self,
+        pred_sol_real,
+        pred_sol_imag,
+        *,
+        normalize: NormalizeMode = "ndof",
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
         """
         Compute the residual for complex-valued solutions.
         """
@@ -477,7 +695,7 @@ class FEMSolverEM:
         r_real_free = r_real[free_mask]
         r_imag_free = r_imag[free_mask]
 
-        loss = (r_real_free.square().mean() + r_imag_free.square().mean())
+        loss = r_real_free.square().mean() + r_imag_free.square().mean()
 
         if normalize == "none":
             return loss
@@ -497,15 +715,18 @@ class FEMSolverEM:
         energy_inv: EnergyInvMode = "jacobi",
         cg_max_iter: int = 30,
         cg_tol: float = 1e-10,
-        normalize: NormalizeMode = "ndof",
+        normalize: NormalizeMode = "rhs",
         eps: float = 1e-12,
     ) -> torch.Tensor:
         """
         Energy-norm minimum residual loss:
-            J = 0.5 * (r_r^T Kr^{-1} r_r + r_i^T Kr^{-1} r_i) / n_free
+            J = 0.5 * (r_r^T |K|^{-1} r_r + r_i^T |K|^{-1} r_i) / n_free
+
+        Uses |diag(K)| = sqrt(diag(Kr)^2 + diag(Ki)^2) for the Jacobi
+        preconditioner to be robust when Kr has zero-diagonal entries.
 
         energy_inv:
-          - "jacobi": Kr^{-1} approx diag(Kr)^{-1}
+          - "jacobi": |K|^{-1} approx diag(|K|)^{-1}
           - "cg":     Kr^{-1} applied by CG solve on free DOFs
         """
         free_mask = self._free_dofs_mask()
@@ -513,7 +734,9 @@ class FEMSolverEM:
         ar = self._to_tensor64(pred_sol_real)
         ai = self._to_tensor64(pred_sol_imag)
 
-        Kr, Ki = self.bilinear_form  # (real stiffness, imag/mass-like) as sparse tensors
+        Kr, Ki = (
+            self.bilinear_form
+        )  # (real stiffness, imag/mass-like) as sparse tensors
 
         # Residual blocks (full)
         Kr_ar = torch.sparse.mm(Kr, ar.unsqueeze(1)).squeeze(1)
@@ -540,25 +763,22 @@ class FEMSolverEM:
             y_full = torch.sparse.mm(Kr, x_full.unsqueeze(1)).squeeze(1)
             return y_full[free_mask]
 
-        # Define approximate inverse application w = Kr_ff^{-1} r
+        # Build diagonal preconditioner using |diag(K)| = sqrt(diag(Kr)^2 + diag(Ki)^2)
+        # for robustness when Kr may have zero diagonal entries.
+        diag_kr = _sparse_diag(Kr).to(dtype=torch.float64, device=rr.device)
+        diag_ki = _sparse_diag(Ki).to(dtype=torch.float64, device=rr.device)
+        diag_abs = torch.sqrt(diag_kr ** 2 + diag_ki ** 2)
+        diag_free = diag_abs[free_mask].clamp_min(eps)
+
+        def Minv(v_free: torch.Tensor) -> torch.Tensor:
+            return v_free / diag_free
+
+        # Define approximate inverse application
         if energy_inv == "jacobi":
-            diag_full = _sparse_diag(Kr).to(dtype=torch.float64, device=rr.device)
-            diag_free = diag_full[free_mask].clamp_min(eps)
-
-            def Minv(v_free: torch.Tensor) -> torch.Tensor:
-                return v_free / diag_free
-
             wr = Minv(rr)
             wi = Minv(ri)
 
         elif energy_inv == "cg":
-            # Preconditioner: Jacobi on Kr_ff (helps CG)
-            diag_full = _sparse_diag(Kr).to(dtype=torch.float64, device=rr.device)
-            diag_free = diag_full[free_mask].clamp_min(eps)
-
-            def Minv(v_free: torch.Tensor) -> torch.Tensor:
-                return v_free / diag_free
-
             wr = _cg_solve(
                 A_mv=Kr_ff_mv,
                 b=rr,
@@ -586,12 +806,7 @@ class FEMSolverEM:
         if normalize == "rhs":
             # Scale by energy-norm of RHS on free DOFs (same inverse approx)
             fr = self.linear_form[free_mask]
-            if energy_inv == "jacobi":
-                rhs_energy = torch.dot(fr, fr / diag_free).clamp_min(eps)
-            else:
-                # CG for rhs norm too (can be expensive); use Jacobi norm here as a stable baseline.
-                rhs_energy = torch.dot(fr, fr / diag_free).clamp_min(eps)
-
+            rhs_energy = torch.dot(fr, Minv(fr)).clamp_min(eps)
             return loss / rhs_energy
 
         if normalize == "ndof":
@@ -609,14 +824,7 @@ class FEMSolverEM:
         eps: float = 1e-12,
     ) -> torch.Tensor:
         """
-        Loss = |Pi(u)|  or |Pi(u)|^2, where
-            Pi(u) = 0.5 * u^H (Kr + i Ki) u - f^H u.
-
-        Notes:
-        - pred_sol_real/pred_sol_imag should already have Dirichlet enforced
-          (or you enforce them before calling).
-        - We compute Pi using the full DOF vectors (recommended), then optionally scale.
-        - If squared=True, returns |Pi|^2 (smoother, avoids sqrt).
+        WORKS PURELY!
         """
         free_mask = self._free_dofs_mask()
 
@@ -665,6 +873,128 @@ class FEMSolverEM:
             rhsn = torch.linalg.norm(f[free_mask]) + eps
             # scale like (|Pi| / ||f||)^2 if squared, else |Pi|/||f||
             return loss / (rhsn * rhsn) if squared else loss / rhsn
+
+        raise ValueError(f"Unknown normalize mode: {normalize}")
+
+    def compute_mixed_energy_norm_loss(
+        self,
+        pred_sol_a_real,
+        pred_sol_a_imag,
+        pred_sol_phi_real,
+        pred_sol_phi_imag,
+        *,
+        energy_inv: EnergyInvMode = "jacobi",
+        cg_max_iter: int = 30,
+        cg_tol: float = 1e-10,
+        normalize: NormalizeMode = "ndof",
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
+        """
+        Compute residual for mixed A-phi formulation.
+
+        Uses |diag(K)| = sqrt(diag(Kr)^2 + diag(Ki)^2) for the Jacobi
+        preconditioner so that phi DOFs (which have zero diagonal in Kr)
+        are handled correctly.
+        """
+        n_A = self.n_dofs_A
+        n_phi = self.n_dofs_phi
+        n_total = n_A + n_phi
+
+        # Convert inputs to tensors
+        ar_A = self._to_tensor64(pred_sol_a_real)
+        ai_A = self._to_tensor64(pred_sol_a_imag)
+        ar_phi = self._to_tensor64(pred_sol_phi_real)
+        ai_phi = self._to_tensor64(pred_sol_phi_imag)
+
+        # Concatenate into full DOF vectors: [A_dofs | phi_dofs]
+        ar = torch.zeros(n_total, device=self.device, dtype=torch.float64)
+        ai = torch.zeros(n_total, device=self.device, dtype=torch.float64)
+
+        ar[:n_A] = ar_A
+        ar[n_A:] = ar_phi
+        ai[:n_A] = ai_A
+        ai[n_A:] = ai_phi
+
+        # Get free DOFs mask for the product space
+        free_mask = self._free_dofs_mask()
+
+        Kr, Ki = self.bilinear_form  # (real stiffness, imag/mass-like) as sparse tensors
+
+        # Residual blocks (full): r = K*u - f
+        # For complex: (Kr + i*Ki)(ar + i*ai) = Kr*ar - Ki*ai + i*(Kr*ai + Ki*ar)
+        Kr_ar = torch.sparse.mm(Kr, ar.unsqueeze(1)).squeeze(1)
+        Ki_ai = torch.sparse.mm(Ki, ai.unsqueeze(1)).squeeze(1)
+        r_real = Kr_ar - Ki_ai - self.linear_form
+
+        Kr_ai = torch.sparse.mm(Kr, ai.unsqueeze(1)).squeeze(1)
+        Ki_ar = torch.sparse.mm(Ki, ar.unsqueeze(1)).squeeze(1)
+        r_imag = Kr_ai + Ki_ar  # assuming f_imag = 0
+
+        # Restrict to free DOFs
+        rr = r_real[free_mask]
+        ri = r_imag[free_mask]
+
+        n_free = rr.numel()
+        if n_free == 0:
+            return torch.zeros((), dtype=torch.float64, device=rr.device)
+
+        # Build an operator for Kr_ff * x (free-free block)
+        def Kr_ff_mv(x_free: torch.Tensor) -> torch.Tensor:
+            x_full = torch.zeros_like(ar)
+            x_full[free_mask] = x_free
+            y_full = torch.sparse.mm(Kr, x_full.unsqueeze(1)).squeeze(1)
+            return y_full[free_mask]
+
+        # Build diagonal preconditioner using |diag(K)| = sqrt(diag(Kr)^2 + diag(Ki)^2).
+        # This is essential for the mixed A-phi formulation because the curl-curl
+        # term only contributes to Kr for A-DOFs, leaving diag(Kr) = 0 for all
+        # phi-DOFs. Using only diag(Kr) would make the Jacobi inverse blow up.
+        diag_kr = _sparse_diag(Kr).to(dtype=torch.float64, device=rr.device)
+        diag_ki = _sparse_diag(Ki).to(dtype=torch.float64, device=rr.device)
+        diag_abs = torch.sqrt(diag_kr ** 2 + diag_ki ** 2)
+        diag_free = diag_abs[free_mask].clamp_min(eps)
+
+        def Minv(v_free: torch.Tensor) -> torch.Tensor:
+            return v_free / diag_free
+
+        # Define approximate inverse application w = |K_ff|^{-1} r
+        if energy_inv == "jacobi":
+            wr = Minv(rr)
+            wi = Minv(ri)
+
+        elif energy_inv == "cg":
+            wr = _cg_solve(
+                A_mv=Kr_ff_mv,
+                b=rr,
+                M_inv=Minv,
+                max_iter=cg_max_iter,
+                tol=cg_tol,
+            )
+            wi = _cg_solve(
+                A_mv=Kr_ff_mv,
+                b=ri,
+                M_inv=Minv,
+                max_iter=cg_max_iter,
+                tol=cg_tol,
+            )
+        else:
+            raise ValueError(f"Unknown energy_inv mode: {energy_inv}")
+
+        # Energy-norm residual (scalar, >= 0)
+        # J = 0.5 * (r^T w) / n_free
+        loss = 0.5 * (torch.dot(rr, wr) + torch.dot(ri, wi)) / float(n_free)
+
+        if normalize == "none":
+            return loss
+
+        if normalize == "rhs":
+            # Scale by energy-norm of RHS on free DOFs (same inverse approx)
+            fr = self.linear_form[free_mask]
+            rhs_energy = torch.dot(fr, Minv(fr)).clamp_min(eps)
+            return loss / rhs_energy
+
+        if normalize == "ndof":
+            return loss  # already / n_free
 
         raise ValueError(f"Unknown normalize mode: {normalize}")
 
@@ -745,9 +1075,9 @@ class FEMSolverEM:
 
         gfu_pred_real.vec.FV().NumPy()[:] = np.real(array_pred)
         gfu_err_abs.vec.FV().NumPy()[:] = np.abs(array_true - array_pred)
-        gfu_err_rel.vec.FV().NumPy()[:] = np.abs(array_true - array_pred) / (np.abs(
-            array_true
-        ) + 1e-10) # avoid division by zero
+        gfu_err_rel.vec.FV().NumPy()[:] = np.abs(array_true - array_pred) / (
+            np.abs(array_true) + 1e-10
+        )  # avoid division by zero
 
         coefs = [
             gfu_true_real,
@@ -787,7 +1117,9 @@ class FEMSolverEM:
         )
         print(f"Results saved as {npz_filename}")
 
-    def export_to_vtk_complex(self, array_true, array_pred, filename="results/vtk/results.vtk"):
+    def export_to_vtk_complex(
+        self, array_true, array_pred, filename="results/vtk/results.vtk"
+    ):
         """
         Export solutions to VTK file for visualization in Paraview.
         """
@@ -809,9 +1141,9 @@ class FEMSolverEM:
         gfu_true.vec.FV().NumPy()[:] = array_true
         gfu_pred.vec.FV().NumPy()[:] = array_pred
         gfu_err_abs.vec.FV().NumPy()[:] = np.abs(array_true - array_pred)
-        gfu_err_rel.vec.FV().NumPy()[:] = np.abs(array_true - array_pred) / (np.abs(
-            array_true
-        ) + 1e-10) # avoid division by zero
+        gfu_err_rel.vec.FV().NumPy()[:] = np.abs(array_true - array_pred) / (
+            np.abs(array_true) + 1e-10
+        )  # avoid division by zero
 
         coefs = [
             gfu_true.real,
@@ -859,9 +1191,115 @@ class FEMSolverEM:
         )
         print(f"Results saved as {npz_filename}")
 
+    def export_to_vtk_mixed(
+        self, array_true, array_pred, filename="results/vtk/results_mixed.vtk"
+    ):
+        out_dir = os.path.dirname(filename)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
 
-if __name__ == "__main__":
+        array_true = np.asarray(array_true, dtype=np.complex128)
+        array_pred = np.asarray(array_pred, dtype=np.complex128)
 
+        n_A = self.n_dofs_A
+        n_phi = self.n_dofs_phi
+
+        # Split into A and phi components
+        A_true = array_true[:n_A]
+        A_pred = array_pred[:n_A]
+        phi_true = array_true[n_A:n_A + n_phi]
+        phi_pred = array_pred[n_A:n_A + n_phi]
+
+        # Create GridFunctions for A (full mesh)
+        fes_A = ng.H1(self.mesh, order=self.order, complex=True)
+        fes_A_real = ng.H1(self.mesh, order=self.order, complex=False)
+        
+        gfA_true = ng.GridFunction(fes_A)
+        gfA_pred = ng.GridFunction(fes_A)
+        gfA_err_abs = ng.GridFunction(fes_A_real)
+        
+        gfA_true.vec.FV().NumPy()[:] = A_true
+        gfA_pred.vec.FV().NumPy()[:] = A_pred
+        gfA_err_abs.vec.FV().NumPy()[:] = np.abs(A_true - A_pred)
+
+        # Create GridFunctions for phi (coil region only)
+        fes_phi = ng.H1(
+            self.mesh, order=self.order, complex=True,
+            definedon=self.mesh.Materials("mat_coil")
+        )
+        fes_phi_real = ng.H1(
+            self.mesh, order=self.order, complex=False,
+            definedon=self.mesh.Materials("mat_coil")
+        )
+        
+        gfPhi_true = ng.GridFunction(fes_phi)
+        gfPhi_pred = ng.GridFunction(fes_phi)
+        gfPhi_err_abs = ng.GridFunction(fes_phi_real)
+        
+        gfPhi_true.vec.FV().NumPy()[:] = phi_true
+        gfPhi_pred.vec.FV().NumPy()[:] = phi_pred
+        gfPhi_err_abs.vec.FV().NumPy()[:] = np.abs(phi_true - phi_pred)
+
+        coefs = [
+            gfA_true.real,
+            gfA_true.imag,
+            ng.Norm(gfA_true),
+            gfA_pred.real,
+            gfA_pred.imag,
+            ng.Norm(gfA_pred),
+            gfA_err_abs,
+            gfPhi_true.real,
+            gfPhi_true.imag,
+            ng.Norm(gfPhi_true),
+            gfPhi_pred.real,
+            gfPhi_pred.imag,
+            ng.Norm(gfPhi_pred),
+            gfPhi_err_abs,
+        ]
+        names = [
+            "A_true_real",
+            "A_true_imag",
+            "A_true_abs",
+            "A_pred_real",
+            "A_pred_imag",
+            "A_pred_abs",
+            "A_error_abs",
+            "Phi_true_real",
+            "Phi_true_imag",
+            "Phi_true_abs",
+            "Phi_pred_real",
+            "Phi_pred_imag",
+            "Phi_pred_abs",
+            "Phi_error_abs",
+        ]
+
+        vtk_out = ng.VTKOutput(
+            self.mesh,
+            coefs=coefs,
+            names=names,
+            filename=str(filename),
+            order=self.order,
+        )
+        vtk_out.Do()
+        print(f"VTK file saved as {filename}")
+
+        # Save mesh and data
+        file_path = Path(filename).parent.parent / "results_data"
+        os.makedirs(file_path, exist_ok=True)
+        mesh_filename = file_path / "mesh.vol"
+        self.mesh.ngmesh.Save(str(mesh_filename))
+
+        npz_filename = file_path / "results_mixed.npz"
+        np.savez_compressed(
+            npz_filename,
+            A_true=A_true,
+            A_pred=A_pred,
+            phi_true=phi_true,
+            phi_pred=phi_pred,
+        )
+        print(f"Mixed results saved as {npz_filename}")
+
+def previous_em():
     import ngsolve as ng
     from containers import MeshProblemEM
     from graph_creator import GraphCreator
@@ -895,3 +1333,39 @@ if __name__ == "__main__":
     #     curl_gfa,
     #     filename="results/fem_tests_em/vtk/result",
     # )
+
+def mixed_em():
+    import ngsolve as ng
+    from containers import MeshProblemEM
+    from graph_creator import GraphCreator
+    from train_problems import create_em_mixed
+
+    problem = create_em_mixed()
+
+    # Initialize FEM solver
+    fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
+
+    gfA, gfPhi, r1 = fem_solver.solve_mixed_em(problem)
+    # E_phi = -1j * problem.omega * (gfA + gfPhi * r1)
+
+    fem_solver.export_to_vtk_complex(
+        gfA.vec.FV().NumPy(),
+        gfA.vec.FV().NumPy(),
+        filename="results/fem_tests_em/vtk/mixed_result",
+    )
+
+    residual = fem_solver.compute_mixed_energy_norm_loss(
+        pred_sol_a_real=gfA.vec.FV().NumPy().real,
+        pred_sol_a_imag=gfA.vec.FV().NumPy().imag,
+        pred_sol_phi_real=gfPhi.vec.FV().NumPy().real,
+        pred_sol_phi_imag=gfPhi.vec.FV().NumPy().imag,
+        energy_inv="jacobi",
+        normalize="ndof",
+    )
+    print(f"Mixed formulation energy norm residual: {residual.item()}")
+
+
+if __name__ == "__main__":
+
+    # previous_em()
+    mixed_em()

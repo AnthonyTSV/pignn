@@ -17,7 +17,7 @@ from graph_creator_em import GraphCreatorEM
 from containers import MeshConfig, MeshProblem, MeshProblemEM
 from torch_geometric.data import Data
 
-from train_problems import create_em_problem, create_em_problem_complex
+from train_problems import create_em_problem, create_em_problem_complex, create_em_mixed
 
 
 class PIMGNTrainerEM:
@@ -83,6 +83,7 @@ class PIMGNTrainerEM:
             output_dim=output_dim,
             # input_dim_global=2,
             num_layers=12,
+            complex_em=self.is_complex,
         ).to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
@@ -149,7 +150,10 @@ class PIMGNTrainerEM:
             self.all_ground_truth = []
             for i, problem in enumerate(problems):
                 print(f"Solving problem {i+1}/{len(problems)} for validation...")
-                ground_truth = self.all_fem_solvers[i].solve(problem)
+                if problem.complex:
+                    ground_truth = self.all_fem_solvers[i].solve_mixed_em(problem)
+                else:
+                    ground_truth = self.all_fem_solvers[i].solve(problem)
                 self.all_ground_truth.append(ground_truth)
         else:
             self.all_ground_truth = None
@@ -164,7 +168,13 @@ class PIMGNTrainerEM:
         """
         Compute FEM loss for steady-state EM problem.
 
-        Loss = MSE over N_test_functions errors
+        For mixed A-φ formulation:
+        - A is predicted for all nodes
+        - φ is predicted for all nodes but only used for coil nodes
+        
+        The FEM DOF structure is [A_dofs | phi_dofs] where:
+        - A_dofs: n_dofs_A values (one per mesh vertex)
+        - phi_dofs: n_dofs_phi values (one per coil vertex only)
         """
         problem: MeshProblemEM = self.problems[problem_idx]
         fem_solver: FEMSolverEM = self.all_fem_solvers[problem_idx]
@@ -181,38 +191,59 @@ class PIMGNTrainerEM:
             )
         else:
             dirichlet_vals_tensor = None
-
-        # Reconstruct full prediction from free nodes
-        # prediction_free has shape [N_free_nodes, 2] for [real, imag]
-        prediction_full_real = torch.zeros(
-            n_total, dtype=torch.float64, device=self.device
-        )
-        prediction_full_imag = torch.zeros(
-            n_total, dtype=torch.float64, device=self.device
-        )
-        prediction_full_real[free_to_original] = prediction_free[:, 0].to(
-            dtype=torch.float64
-        )
-        prediction_full_imag[free_to_original] = prediction_free[:, 1].to(
-            dtype=torch.float64
-        )
-
-        # Enforce Dirichlet BCs on prediction (real and imaginary parts)
-        if dirichlet_vals_tensor is not None:
-            dirichlet_vals_float = dirichlet_vals_tensor.to(dtype=torch.float64)
-            # For complex Dirichlet BCs, the imaginary part is typically 0
-            prediction_full_real[dirichlet_mask] = dirichlet_vals_float[dirichlet_mask].real if dirichlet_vals_float.is_complex() else dirichlet_vals_float[dirichlet_mask]
-            prediction_full_imag[dirichlet_mask] = dirichlet_vals_float[dirichlet_mask].imag if dirichlet_vals_float.is_complex() else 0.0
-
+            
         if self.is_complex:
-            # Compute complex residual
-            residual = fem_solver.compute_complex_energy_norm_loss(
-                prediction_full_real,
-                prediction_full_imag,
+            # Reconstruct full A prediction from free nodes
+            # prediction_free has shape [N_free_nodes, 4] for [Areal, Aimag, phireal, phiimag]
+            prediction_full_Areal = torch.zeros(
+                n_total, dtype=torch.float64, device=self.device
+            )
+            prediction_full_Aimag = torch.zeros(
+                n_total, dtype=torch.float64, device=self.device
+            )
+            prediction_full_Areal[free_to_original] = prediction_free[:, 0].to(dtype=torch.float64)
+            prediction_full_Aimag[free_to_original] = prediction_free[:, 1].to(dtype=torch.float64)
+
+            # Enforce Dirichlet BCs on A prediction
+            if dirichlet_vals_tensor is not None:
+                dirichlet_vals_float = dirichlet_vals_tensor.to(dtype=torch.float64)
+                prediction_full_Areal[dirichlet_mask] = dirichlet_vals_float[dirichlet_mask].real if dirichlet_vals_float.is_complex() else dirichlet_vals_float[dirichlet_mask]
+                prediction_full_Aimag[dirichlet_mask] = 0
+
+            # For phi, we need to extract predictions only for coil nodes
+            # First reconstruct full phi predictions (on all graph nodes)
+            prediction_full_phireal = torch.zeros(
+                n_total, dtype=torch.float64, device=self.device
+            )
+            prediction_full_phiimag = torch.zeros(
+                n_total, dtype=torch.float64, device=self.device
+            )
+            prediction_full_phireal[free_to_original] = prediction_free[:, 2].to(dtype=torch.float64)
+            prediction_full_phiimag[free_to_original] = prediction_free[:, 3].to(dtype=torch.float64)
+            
+            # Extract phi values only for coil nodes (in the order expected by FEM)
+            # fem_solver.coil_node_indices maps phi_dof_idx -> graph_node_idx
+            coil_node_indices = torch.tensor(
+                fem_solver.coil_node_indices, dtype=torch.long, device=self.device
+            )
+            phi_real_dofs = prediction_full_phireal[coil_node_indices]  # [n_dofs_phi]
+            phi_imag_dofs = prediction_full_phiimag[coil_node_indices]  # [n_dofs_phi]
+
+            # Compute complex residual with proper DOF structure
+            residual = fem_solver.compute_mixed_energy_norm_loss(
+                prediction_full_Areal,   # [n_dofs_A]
+                prediction_full_Aimag,   # [n_dofs_A]
+                phi_real_dofs,           # [n_dofs_phi]
+                phi_imag_dofs,           # [n_dofs_phi]
             )
         else:
+            prediction_full_real = torch.zeros(
+                n_total, dtype=torch.float64, device=self.device
+            )
+            prediction_full_real[free_to_original] = prediction_free[:, 0]
+
             residual = fem_solver.compute_energy_loss(
-                prediction_full_real,  # For non-complex, use only real part
+                prediction_full_real,
             )
 
         return residual
@@ -271,7 +302,7 @@ class PIMGNTrainerEM:
         self.optimizer.step()
 
         # Convert prediction to numpy and reconstruct complex values
-        prediction_np = prediction_free.detach().cpu().numpy()  # [N_free, 2]
+        prediction_np = prediction_free.detach().cpu().numpy()  # [N_free, 4]
 
         # Reconstruct full state as complex array
         n_total = int(node_mapping.get("n_original", problem.n_nodes))
@@ -301,9 +332,18 @@ class PIMGNTrainerEM:
         print("Generating ground truth for evaluation...")
         eval_ground_truth = {}
         for prob_idx in train_problems_indices:
-            eval_ground_truth[prob_idx] = self.all_fem_solvers[prob_idx].solve(
-                self.problems[prob_idx]
-            )
+            if self.problems[prob_idx].complex:
+                gfA, gfPhi, r1 = self.all_fem_solvers[prob_idx].solve_mixed_em(
+                    self.problems[prob_idx]
+                )
+                # Extract DOF values from GridFunctions
+                A_dofs = np.array(gfA.vec, dtype=np.complex128)
+                phi_dofs = np.array(gfPhi.vec, dtype=np.complex128)
+                eval_ground_truth[prob_idx] = np.concatenate([A_dofs, phi_dofs])
+            else:
+                eval_ground_truth[prob_idx] = self.all_fem_solvers[prob_idx].solve(
+                    self.problems[prob_idx]
+                )
         print("Ground truth generated.")
 
         for epoch in range(self.start_epoch, self.config["epochs"]):
@@ -336,11 +376,24 @@ class PIMGNTrainerEM:
                 for prob_idx in train_problems_indices:
                     pred = self.predict(problem_idx=prob_idx)
                     gt = eval_ground_truth[prob_idx]
-                    if len(pred) == len(gt):
-                        l2_error = np.linalg.norm(pred - gt) / np.linalg.norm(gt)
+                    if self.is_complex:
+                        # pred and gt are both complex arrays: [A_complex | phi_complex]
+                        # Compare them directly (no real/imag split needed)
+                        fem_s = self.all_fem_solvers[prob_idx]
+                        n_A = fem_s.n_dofs_A
+                        l2_A = np.linalg.norm(pred[:n_A] - gt[:n_A]) / (np.linalg.norm(gt[:n_A]) + 1e-30)
+                        l2_phi = np.linalg.norm(pred[n_A:] - gt[n_A:]) / (np.linalg.norm(gt[n_A:]) + 1e-30)
+                        l2_total = np.linalg.norm(pred - gt) / (np.linalg.norm(gt) + 1e-30)
                         print(
-                            f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} | L2 Error: {l2_error:.6e}"
+                            f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} "
+                            f"| L2 total: {l2_total:.6e} | L2 A: {l2_A:.6e} | L2 phi: {l2_phi:.6e}"
                         )
+                    else:
+                        if len(pred) == len(gt):
+                            l2_error = np.linalg.norm(pred - gt) / np.linalg.norm(gt)
+                            print(
+                                f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} | L2 Error: {l2_error:.6e}"
+                            )
                 self.model.train()
 
             self.scheduler.step()
@@ -356,14 +409,6 @@ class PIMGNTrainerEM:
 
         problem = self.problems[problem_idx]
         fem_solver: FEMSolverEM = self.all_fem_solvers[problem_idx]
-
-        # Initial guess (use complex zeros for consistent graph feature dims)
-        initial_guess = (
-            np.zeros(
-                int(getattr(fem_solver.fes, "ndof", problem.n_nodes)),
-                dtype=np.float64,
-            ),
-        )
 
         graph_creator = GraphCreatorEM(
             mesh=problem.mesh,
@@ -395,19 +440,45 @@ class PIMGNTrainerEM:
             # Predict steady-state solution
             prediction_free = self.model.forward(free_data)
 
-            # Reconstruct full solution as complex array
+            # Reconstruct full solution
             free_idx = node_mapping["free_to_original"].detach().cpu().numpy()
             dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
 
             n_total = int(node_mapping.get("n_original", problem.n_nodes))
+            
             if problem.complex:
-                prediction_real, prediction_imag = prediction_free[:, 0], prediction_free[:, 1]
-                prediction_full = np.zeros(n_total, dtype=np.complex128)
-                pred_real = prediction_real.detach().cpu().numpy()  # [N_free]
-                pred_imag = prediction_imag.detach().cpu().numpy()  # [N_free]
-                prediction_full[free_idx] = pred_real + 1j * pred_imag
+                # Reconstruct A predictions for all nodes
+                pred = prediction_free.detach().cpu().numpy()  # [N_free, 4]
+                
+                prediction_full_Areal = np.zeros(n_total, dtype=np.float64)
+                prediction_full_Aimag = np.zeros(n_total, dtype=np.float64)
+                prediction_full_Areal[free_idx] = pred[:, 0]
+                prediction_full_Aimag[free_idx] = pred[:, 1]
+                
+                # Enforce Dirichlet BCs on A
                 if dirichlet_vals is not None:
-                    prediction_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
+                    dirichlet_vals_real = dirichlet_vals[dirichlet_mask].real if np.iscomplexobj(dirichlet_vals) else dirichlet_vals[dirichlet_mask]
+                    prediction_full_Areal[dirichlet_mask] = dirichlet_vals_real
+                    prediction_full_Aimag[dirichlet_mask] = 0
+                
+                # Reconstruct phi predictions for all nodes (will extract coil-only later)
+                prediction_full_phireal = np.zeros(n_total, dtype=np.float64)
+                prediction_full_phiimag = np.zeros(n_total, dtype=np.float64)
+                prediction_full_phireal[free_idx] = pred[:, 2]
+                prediction_full_phiimag[free_idx] = pred[:, 3]
+                
+                # Extract phi values only for coil nodes (in FEM DOF order)
+                coil_node_indices = fem_solver.coil_node_indices
+                phi_real_dofs = prediction_full_phireal[coil_node_indices]  # [n_dofs_phi]
+                phi_imag_dofs = prediction_full_phiimag[coil_node_indices]  # [n_dofs_phi]
+                
+                # Build full DOF vector in FEM format: [A_dofs | phi_dofs]
+                # A is complex: A_real + 1j * A_imag
+                A_complex = prediction_full_Areal + 1j * prediction_full_Aimag
+                phi_complex = phi_real_dofs + 1j * phi_imag_dofs
+                
+                # Return as concatenated DOF vector matching FEM structure
+                prediction_full = np.concatenate([A_complex, phi_complex])
             else:
                 prediction_full = np.zeros(n_total, dtype=np.float64)
                 pred = prediction_free.detach().cpu().numpy()  # [N_free, 2]
@@ -439,7 +510,14 @@ class PIMGNTrainerEM:
             fem_solver = self.all_fem_solvers[problem_idx]
 
             # Generate ground truth using FEM
-            ground_truth = fem_solver.solve(problem)
+            if problem.complex:
+                gfA, gfPhi, r1 = fem_solver.solve_mixed_em(problem)
+                # Extract DOF values from GridFunctions to match prediction format
+                A_dofs = np.array(gfA.vec, dtype=np.complex128)
+                phi_dofs = np.array(gfPhi.vec, dtype=np.complex128)
+                ground_truth = np.concatenate([A_dofs, phi_dofs])
+            else:
+                ground_truth = fem_solver.solve(problem)
 
             # Get prediction from trained model
             prediction = self.predict(problem_idx=problem_idx)
@@ -569,10 +647,10 @@ def _run_single_problem_experiment(problem: MeshProblemEM, config, experiment_na
                 filename=f"{save_path}/vtk/result",
             )
         else:
-            trainer.all_fem_solvers[0].export_to_vtk_complex(
+            trainer.all_fem_solvers[0].export_to_vtk_mixed(
                 ground_truth[0],
                 predictions[0],
-                filename=f"{save_path}/vtk/result_complex",
+                filename=f"{save_path}/vtk/result_mixed",
             )
     except Exception as e:
         print(f"Ground truth evaluation failed: {e}")
@@ -608,6 +686,18 @@ def train_pimgn_em_complex(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, config, "First order EM Complex")
 
+def train_pimgn_em_mixed(resume_from: str = None):
+    problem = create_em_mixed()
+    config = {
+        "epochs": 5000,
+        "lr": 1e-4,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/test_em_problem_mixed",
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_single_problem_experiment(problem, config, "First order EM Mixed")
+
 if __name__ == "__main__":
     # train_pimgn_on_single_problem()
-    train_pimgn_em_complex()
+    # train_pimgn_em_complex()
+    train_pimgn_em_mixed()

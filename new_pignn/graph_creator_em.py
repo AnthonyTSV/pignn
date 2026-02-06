@@ -253,7 +253,7 @@ def _build_fem_connectivity(
                 if i != j:
                     edges_set.add((vertex_indices[i], vertex_indices[j]))
 
-    # Add self-loops if requested
+    # Add self-loops
     if add_self_loops:
         for i in range(n_nodes):
             edges_set.add((i, i))
@@ -516,6 +516,7 @@ class GraphCreatorEM:
         sigma_field: Optional[np.ndarray] = None,
         dirichlet_values: Optional[np.ndarray] = None,
         omega: Optional[float] = None,
+        coil_node_mask=None,
         add_self_loops: bool = True,
         device: Optional[torch.device] = None,
     ) -> Tuple[Data, Dict]:
@@ -583,6 +584,8 @@ class GraphCreatorEM:
             "current_density": current_density,
             "mesh": self.mesh,
             "connectivity_method": self.connectivity_method,
+            # "coil_mask": coil_node_mask,
+            # "coil_node_indices": np.where(coil_node_mask)[0]
         }
 
         # 8. Create PyTorch Geometric Data object
