@@ -475,10 +475,17 @@ class PIMGNTrainerEM:
                     if self.is_complex:
                         # pred and gt are both complex arrays: [A_complex | phi_complex]
                         # Compare them directly (no real/imag split needed)
-                        fem_s = self.all_fem_solvers[prob_idx]
-                        n_A = fem_s.n_dofs_A
-                        l2_A = np.linalg.norm(pred[:n_A] - gt[:n_A]) / (np.linalg.norm(gt[:n_A]) + 1e-30)
-                        l2_phi = np.linalg.norm(pred[n_A:] - gt[n_A:]) / (np.linalg.norm(gt[n_A:]) + 1e-30)
+                        fem_solver = self.all_fem_solvers[prob_idx]
+                        n_A = fem_solver.n_dofs_A
+                        n_phi = fem_solver.n_dofs_phi
+                        a_pred = pred[:n_A]
+                        a_true = gt[:n_A]
+                        free_mask = fem_solver._free_dofs_mask()
+                        free_mask_phi = free_mask[n_A:].cpu().numpy()
+                        phi_pred = pred[n_A:n_A + n_phi][free_mask_phi]
+                        phi_true = gt[n_A:n_A + n_phi][free_mask_phi]
+                        l2_A = np.linalg.norm(a_pred - a_true) / (np.linalg.norm(a_true) + 1e-30)
+                        l2_phi = np.linalg.norm(phi_pred - phi_true) / (np.linalg.norm(phi_true) + 1e-30)
                         l2_total = np.linalg.norm(pred - gt) / (np.linalg.norm(gt) + 1e-30)
                         print(
                             f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} "
@@ -622,13 +629,30 @@ class PIMGNTrainerEM:
 
             # Compute error
             if len(prediction) == len(ground_truth):
-                l2_error = np.linalg.norm(prediction - ground_truth) / np.linalg.norm(
-                    ground_truth
-                )
-                max_error = np.max(np.abs(prediction - ground_truth))
-                print(
-                    f"Problem {problem_idx + 1} - L2 error: {l2_error:.6f}, Max error: {max_error:.6f}"
-                )
+                if self.is_complex:
+                    n_A = fem_solver.n_dofs_A
+                    n_phi = fem_solver.n_dofs_phi
+                    a_pred = prediction[:n_A]
+                    a_true = ground_truth[:n_A]
+                    free_mask = fem_solver._free_dofs_mask()
+                    free_mask_phi = free_mask[n_A:].cpu().numpy()
+                    phi_pred = prediction[n_A:n_A + n_phi][free_mask_phi]
+                    phi_true = ground_truth[n_A:n_A + n_phi][free_mask_phi]
+                    l2_A = np.linalg.norm(a_pred - a_true) / (np.linalg.norm(a_true) + 1e-30)
+                    l2_phi = np.linalg.norm(phi_pred - phi_true) / (np.linalg.norm(phi_true) + 1e-30)
+                    l2_error = l2_A + l2_phi
+                    # max_error = np.max(np.abs(prediction - ground_truth))
+                    print(
+                        f"Problem {problem_idx + 1} - L2 total: {l2_error:.6f} | L2 A: {l2_A:.6f} | L2 phi: {l2_phi:.6f}"
+                    )
+                else:
+                    l2_error = np.linalg.norm(prediction - ground_truth) / np.linalg.norm(
+                        ground_truth
+                    )
+                    max_error = np.max(np.abs(prediction - ground_truth))
+                    print(
+                        f"Problem {problem_idx + 1} - L2 error: {l2_error:.6f}, Max error: {max_error:.6f}"
+                    )
                 all_errors.append(l2_error)
                 all_predictions.append(prediction)
                 all_ground_truth.append(ground_truth)
@@ -787,14 +811,14 @@ def train_pimgn_em_complex(resume_from: str = None):
 def train_pimgn_em_mixed(resume_from: str = None):
     problem = create_em_mixed()
     config = {
-        "epochs": 5000,
+        "epochs": 100001,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem_mixed",
         "resume_from": resume_from,  # Path to checkpoint to resume from
         # Phi weight for balanced loss: increase if phi doesn't converge
         # phi_weight=10 means phi loss contributes 10x more to total loss
-        "phi_weight": 2.0,
+        "phi_weight": 0.1,
         # Data supervision to avoid trivial solutions (u approx 0)
         # The A equation is homogeneous - physics loss alone allows u=0
         # Data supervision guides to correct solution, then decays
@@ -806,4 +830,4 @@ def train_pimgn_em_mixed(resume_from: str = None):
 if __name__ == "__main__":
     # train_pimgn_on_single_problem()
     # train_pimgn_em_complex()
-    train_pimgn_em_mixed()
+    train_pimgn_em_mixed(resume_from="results/physics_informed/test_em_problem_mixed_from_cluster/pimgn_trained_model.pth")
