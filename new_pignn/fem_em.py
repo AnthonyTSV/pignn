@@ -1450,11 +1450,11 @@ def mixed_em():
     gfA, gfPhi, r1 = fem_solver.solve_mixed_em(problem)
     # E_phi = -1j * problem.omega * (gfA + gfPhi * r1)
 
-    fem_solver.export_to_vtk_complex(
-        gfA.vec.FV().NumPy(),
-        gfA.vec.FV().NumPy(),
-        filename="results/fem_tests_em/vtk/mixed_result",
-    )
+    # fem_solver.export_to_vtk_complex(
+    #     gfA.vec.FV().NumPy(),
+    #     gfA.vec.FV().NumPy(),
+    #     filename="results/fem_tests_em/vtk/mixed_result",
+    # )
 
     residual = fem_solver.compute_mixed_energy_norm_loss(
         pred_sol_a_real=gfA.vec.FV().NumPy().real,

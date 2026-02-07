@@ -45,3 +45,48 @@ def plot_l2(paths: list[Path] = None, save_dir: Path = Path("verification_plots/
     plt.ylabel("Training Loss")
     plt.legend(fancybox=True, frameon=True)
     plt.savefig(save_dir / "train_loss_comparison.pdf", dpi=300)
+
+def epoch_vs_l2(paths: list[Path] = None, save_dir: Path = Path("verification_plots/problem2")):
+    log_paths = paths
+    l2_errors = {}
+    for log_path in log_paths:
+        log_data = load_log(log_path)
+        eval_data = log_data.get("evaluation", {})
+        l2_error = eval_data.get("l2_errors_per_problem", [])[0]
+        maxh_value = log_data["problems"][0]["mesh_config"]["maxh"]
+        l2_errors[maxh_value] = l2_error
+    plt.figure(figsize=(6, 4))
+    for key, l2_error in l2_errors.items():
+        plt.plot(l2_error, label=f"maxh={key}", linewidth=1)
+    plt.yscale("log")
+    plt.xlabel("Epoch")
+    plt.ylabel("L2 Error")
+    plt.legend(fancybox=True, frameon=True)
+    plt.savefig(save_dir / "epoch_vs_l2_error.pdf", dpi=300)
+
+def epoch_vs_train_loss(paths: list[Path] = None, save_dir: Path = Path("verification_plots/problem2"), apply_smoothing: bool = True):
+    """
+    Plot training loss vs epoch for multiple runs. If apply_smoothing is True, applies a moving average filter to smooth the curves
+    and keeps the original curves as well only with opacity 0.5.
+    """
+    log_paths = paths
+    train_losses = {}
+    for log_path in log_paths:
+        log_data = load_log(log_path)
+        train_loss = log_data["training_history"]["train_loss"]
+        maxh_value = log_data["problems"][0]["mesh_config"]["maxh"]
+        train_losses[maxh_value] = train_loss
+    plt.figure(figsize=(6, 4))
+    for key, train_loss in train_losses.items():
+        if apply_smoothing:
+            window_size = max(1, len(train_loss) // 100)  # Adjust window size based on length of train_loss
+            smoothed_loss = np.convolve(train_loss, np.ones(window_size)/window_size, mode='valid')
+            plt.plot(smoothed_loss, label=f"maxh={key} (smoothed)", linewidth=2)
+            plt.plot(train_loss, label=f"maxh={key} (original)", linewidth=1, alpha=0.5)
+        else:
+            plt.plot(train_loss, label=f"maxh={key}", linewidth=1)
+    plt.yscale("log")
+    plt.xlabel("Epoch")
+    plt.ylabel("Training Loss")
+    plt.legend(fancybox=True, frameon=True)
+    plt.savefig(save_dir / "epoch_vs_train_loss.pdf", dpi=300)

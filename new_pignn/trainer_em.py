@@ -487,6 +487,8 @@ class PIMGNTrainerEM:
                         l2_A = np.linalg.norm(a_pred - a_true) / (np.linalg.norm(a_true) + 1e-30)
                         l2_phi = np.linalg.norm(phi_pred - phi_true) / (np.linalg.norm(phi_true) + 1e-30)
                         l2_total = np.linalg.norm(pred - gt) / (np.linalg.norm(gt) + 1e-30)
+                        self.logger.log_evaluation(l2_A, "l2_A")
+                        self.logger.log_evaluation(l2_phi, "l2_phi")
                         print(
                             f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} "
                             f"| L2 total: {l2_total:.6e} | L2 A: {l2_A:.6e} | L2 phi: {l2_phi:.6e}"
@@ -498,6 +500,10 @@ class PIMGNTrainerEM:
                                 f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} | L2 Error: {l2_error:.6e}"
                             )
                 self.model.train()
+            if epoch % self.config.get("save_interval", 1000) == 0:
+                path_to_checkpoint = self.config.get("save_dir", "results/physics_informed_em")
+                model_path = f"{path_to_checkpoint}/pimgn_trained_model.pth"
+                self.save_checkpoint(model_path, epoch)
 
             self.scheduler.step()
 
@@ -811,16 +817,17 @@ def train_pimgn_em_complex(resume_from: str = None):
 def train_pimgn_em_mixed(resume_from: str = None):
     problem = create_em_mixed()
     config = {
-        "epochs": 100001,
+        "epochs": 1010,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem_mixed",
         "resume_from": resume_from,  # Path to checkpoint to resume from
+        "save_interval": 1000,  # Save checkpoint every N epochs
         # Phi weight for balanced loss: increase if phi doesn't converge
         # phi_weight=10 means phi loss contributes 10x more to total loss
         "phi_weight": 0.1,
         # Data supervision to avoid trivial solutions (u approx 0)
-        # The A equation is homogeneous - physics loss alone allows u=0
+        # The A equation is homogeneous - physics loss alone sometimes allows u=0
         # Data supervision guides to correct solution, then decays
         "data_weight": 0.0,       # Initial data supervision weight
         "data_weight_decay": 0.9995,  # Decay per epoch (0.9995^1000 approx 0.6)
@@ -830,4 +837,4 @@ def train_pimgn_em_mixed(resume_from: str = None):
 if __name__ == "__main__":
     # train_pimgn_on_single_problem()
     # train_pimgn_em_complex()
-    train_pimgn_em_mixed(resume_from="results/physics_informed/test_em_problem_mixed_from_cluster/pimgn_trained_model.pth")
+    train_pimgn_em_mixed()

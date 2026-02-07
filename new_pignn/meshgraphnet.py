@@ -276,8 +276,8 @@ class MeshGraphNet(nn.Module):
                 phi_out = self.decoder_phi(x)  # [N, 2] -> (phi_real, phi_imag)
                 
                 # Apply learnable output scaling for proper magnitude
-                A_scaled = A_out * self.output_scale_A
-                phi_scaled = phi_out * self.output_scale_phi
+                A_scaled = A_out # * self.output_scale_A
+                phi_scaled = phi_out # * self.output_scale_phi
                 
                 out = torch.zeros((x.size(0), self.output_dim), device=x.device, dtype=x.dtype)
                 # Match trainer expectation: [A_real, A_imag, phi_real, phi_imag]
