@@ -38,14 +38,20 @@ class PIMGNTrainerEM:
             self.all_fem_solvers.append(fem_solver)
         self.is_complex = any(getattr(problem, "complex", False) for problem in problems)
 
+        # Pre-create GraphCreatorEM instances for all problems (avoid re-creation in train_step)
+        self.all_graph_creators: List[GraphCreatorEM] = []
+        for problem in problems:
+            gc = GraphCreatorEM(
+                mesh=problem.mesh,
+                n_neighbors=2,
+                dirichlet_names=problem.mesh_config.dirichlet_boundaries,
+            )
+            self.all_graph_creators.append(gc)
+
         # Prepare sample data to determine input/output dimensions using first problem
         first_problem = problems[0]
         first_fes = self.all_fem_solvers[0].fes
-        graph_creator = GraphCreatorEM(
-            mesh=first_problem.mesh,
-            n_neighbors=2,
-            dirichlet_names=first_problem.mesh_config.dirichlet_boundaries,
-        )
+        graph_creator = self.all_graph_creators[0]
 
         # Create sample graph to get dimensions
         material_field = getattr(first_problem, "material_field", None)
@@ -276,12 +282,8 @@ class PIMGNTrainerEM:
         problem: MeshProblemEM = self.problems[problem_idx]
         fem_solver: FEMSolverEM = self.all_fem_solvers[problem_idx]
 
-        # Create graph creator for this specific problem
-        graph_creator = GraphCreatorEM(
-            mesh=problem.mesh,
-            n_neighbors=2,
-            dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-        )
+        # Use pre-created graph creator for this problem
+        graph_creator = self.all_graph_creators[problem_idx]
 
         # Get the values for this problem
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
@@ -384,21 +386,22 @@ class PIMGNTrainerEM:
     def train(self, train_problems_indices, val_problems_indices=None):
         """Main training loop for steady-state EM problems with multiple problems."""
         print(f"Starting PIMGN-EM training on {self.device}")
-        print(f"Training on problems: {train_problems_indices}")
+        print(f"Training on {len(train_problems_indices)} problems: {train_problems_indices}")
         if val_problems_indices:
-            print(f"Validation on problems: {val_problems_indices}")
+            print(f"Validation on {len(val_problems_indices)} problems: {val_problems_indices}")
 
-        problem = self.problems[train_problems_indices[0]]
-        # Initialize prediction with zeros instead of random noise
-        # Random noise can lead to huge residuals (due to large system matrix entries)
-        # which can cause the network to collapse to zero output.
-        prediction = np.zeros(problem.n_nodes, dtype=np.float64)
+        # Initialize per-problem predictions with zeros
+        predictions = {}
+        for prob_idx in train_problems_indices:
+            problem = self.problems[prob_idx]
+            predictions[prob_idx] = np.zeros(problem.n_nodes, dtype=np.float64)
 
         # Generate ground truth once for periodic evaluation AND data supervision
         print("Generating ground truth for evaluation and data supervision...")
         eval_ground_truth = {}
         self._ground_truth_tensors = {}  # For data supervision during training
         for prob_idx in train_problems_indices:
+            print(f"  Solving problem {prob_idx} ...")
             if self.problems[prob_idx].complex:
                 gfA, gfPhi, r1 = self.all_fem_solvers[prob_idx].solve_mixed_em(
                     self.problems[prob_idx]
@@ -422,11 +425,13 @@ class PIMGNTrainerEM:
                 eval_ground_truth[prob_idx] = self.all_fem_solvers[prob_idx].solve(
                     self.problems[prob_idx]
                 )
-        print("Ground truth generated.")
+        print(f"Ground truth generated for {len(eval_ground_truth)} problems.")
         
         # Data supervision weight - starts high and decays
         data_weight_init = self.config.get("data_weight", 0.1)
         data_weight_decay = self.config.get("data_weight_decay", 0.9995)  # Decay per epoch
+
+        n_train = len(train_problems_indices)
 
         for epoch in range(self.start_epoch, self.config["epochs"]):
             epoch_start = time.time()
@@ -434,14 +439,31 @@ class PIMGNTrainerEM:
             # Compute current data weight (decay schedule)
             data_weight = data_weight_init * (data_weight_decay ** epoch)
 
-            physics_loss, prediction_next = self.train_step(
-                0, prediction=prediction, 
-                ground_truth=self._ground_truth_tensors.get(0),
-                data_weight=data_weight
-            )
-            prediction = prediction_next
+            # --- Train on ALL problems each epoch ---
+            epoch_loss = 0.0
+            epoch_loss_A = 0.0
+            epoch_loss_phi = 0.0
+            epoch_loss_data = 0.0
+            for prob_idx in train_problems_indices:
+                loss, prediction_next = self.train_step(
+                    prob_idx,
+                    prediction=predictions[prob_idx],
+                    ground_truth=self._ground_truth_tensors.get(prob_idx),
+                    data_weight=data_weight,
+                )
+                predictions[prob_idx] = prediction_next
+                epoch_loss += loss
+                epoch_loss_A += self._last_loss_A
+                epoch_loss_phi += self._last_loss_phi
+                epoch_loss_data += self._last_data_loss
 
-            self.losses.append(physics_loss)
+            # Average loss across problems
+            epoch_loss /= n_train
+            epoch_loss_A /= n_train
+            epoch_loss_phi /= n_train
+            epoch_loss_data /= n_train
+
+            self.losses.append(epoch_loss)
 
             # Validation (if validation problems are provided and ground truth is available)
             val_loss = None
@@ -450,20 +472,21 @@ class PIMGNTrainerEM:
                 self.val_losses.append(val_loss)
 
             elapsed = time.time() - epoch_start
-            self.logger.log_epoch(epoch, physics_loss, val_loss, elapsed)
+            self.logger.log_epoch(epoch, epoch_loss, val_loss, elapsed)
 
             if epoch % 10 == 0:
                 elapsed = time.time() - epoch_start
                 val_str = f" | Val Loss: {val_loss:.3e}" if val_loss is not None else ""
                 # Show component losses for complex/mixed EM problems
-                if self.is_complex and hasattr(self, '_last_loss_A'):
-                    loss_A_str = f" | L_A: {self._last_loss_A:.3e} | L_φ: {self._last_loss_phi:.3e}"
+                if self.is_complex:
+                    loss_A_str = f" | L_A: {epoch_loss_A:.3e} | L_φ: {epoch_loss_phi:.3e}"
                     if data_weight > 0:
-                        loss_A_str += f" | L_data: {self._last_data_loss:.3e} (w={data_weight:.2e})"
+                        loss_A_str += f" | L_data: {epoch_loss_data:.3e} (w={data_weight:.2e})"
                 else:
                     loss_A_str = ""
+                prob_str = f" ({n_train} probs)" if n_train > 1 else ""
                 print(
-                    f"Epoch {epoch+1:4d} | Train Loss: {physics_loss:.3e}{loss_A_str}{val_str} | Time: {elapsed:.2f}s"
+                    f"Epoch {epoch+1:4d} | Train Loss: {epoch_loss:.3e}{loss_A_str}{val_str}{prob_str} | Time: {elapsed:.2f}s"
                 )
 
             # Evaluate L2 error every 100 epochs
@@ -487,8 +510,8 @@ class PIMGNTrainerEM:
                         l2_A = np.linalg.norm(a_pred - a_true) / (np.linalg.norm(a_true) + 1e-30)
                         l2_phi = np.linalg.norm(phi_pred - phi_true) / (np.linalg.norm(phi_true) + 1e-30)
                         l2_total = np.linalg.norm(pred - gt) / (np.linalg.norm(gt) + 1e-30)
-                        self.logger.log_evaluation(l2_A, "l2_A")
-                        self.logger.log_evaluation(l2_phi, "l2_phi")
+                        self.logger.log_evaluation(l2_A, f"l2_A_p{prob_idx}")
+                        self.logger.log_evaluation(l2_phi, f"l2_phi_p{prob_idx}")
                         print(
                             f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} "
                             f"| L2 total: {l2_total:.6e} | L2 A: {l2_A:.6e} | L2 phi: {l2_phi:.6e}"
@@ -519,11 +542,8 @@ class PIMGNTrainerEM:
         problem = self.problems[problem_idx]
         fem_solver: FEMSolverEM = self.all_fem_solvers[problem_idx]
 
-        graph_creator = GraphCreatorEM(
-            mesh=problem.mesh,
-            n_neighbors=2,
-            dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-        )
+        # Use pre-created graph creator for this problem
+        graph_creator = self.all_graph_creators[problem_idx]
 
         # Get the values for this problem
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
@@ -646,7 +666,7 @@ class PIMGNTrainerEM:
                     phi_true = ground_truth[n_A:n_A + n_phi][free_mask_phi]
                     l2_A = np.linalg.norm(a_pred - a_true) / (np.linalg.norm(a_true) + 1e-30)
                     l2_phi = np.linalg.norm(phi_pred - phi_true) / (np.linalg.norm(phi_true) + 1e-30)
-                    l2_error = l2_A + l2_phi
+                    l2_error = np.linalg.norm(prediction - ground_truth) / (np.linalg.norm(ground_truth) + 1e-30)
                     # max_error = np.max(np.abs(prediction - ground_truth))
                     print(
                         f"Problem {problem_idx + 1} - L2 total: {l2_error:.6f} | L2 A: {l2_A:.6f} | L2 phi: {l2_phi:.6f}"
@@ -736,7 +756,18 @@ class PIMGNTrainerEM:
         print(f"Checkpoint saved to: {path}")
 
 
-def _run_single_problem_experiment(problem: MeshProblemEM, config, experiment_name: str):
+def _run_experiment(problems: List[MeshProblemEM], config, experiment_name: str,
+                    train_indices=None, val_indices=None):
+    """Run a PIMGN-EM experiment on one or more problems.
+    
+    Args:
+        problems: List of MeshProblemEM instances to train on.
+        config: Training configuration dict.
+        experiment_name: Human-readable name for logging.
+        train_indices: Indices into ``problems`` to use for training.
+                       Defaults to all problems.
+        val_indices: Optional indices for validation problems.
+    """
     print("=" * 60)
     print(f"PIMGN TEST - {experiment_name.upper()}")
     print("=" * 60)
@@ -744,15 +775,20 @@ def _run_single_problem_experiment(problem: MeshProblemEM, config, experiment_na
     save_path = config.get("save_dir", "results/physics_informed")
     os.makedirs(save_path, exist_ok=True)
 
-    trainer = PIMGNTrainerEM([problem], config)
+    if train_indices is None:
+        train_indices = list(range(len(problems)))
 
-    print("\nStarting physics-informed training...")
-    trainer.train(train_problems_indices=[0])
+    trainer = PIMGNTrainerEM(problems, config)
+
+    print(f"\nStarting physics-informed training on {len(train_indices)} problem(s)...")
+    trainer.train(
+        train_problems_indices=train_indices,
+        val_problems_indices=val_indices,
+    )
 
     print("\nEvaluating trained PIMGN...")
     last_residuals = getattr(trainer, "last_residuals", None)
     if last_residuals is not None:
-        # last_residuals are complex for EM
         trainer.logger.log_evaluation(
             np.atleast_1d(np.abs(last_residuals)).tolist(),
             "residuals_per_time_step_abs",
@@ -761,25 +797,29 @@ def _run_single_problem_experiment(problem: MeshProblemEM, config, experiment_na
         print(
             "Note: No `last_residuals` available (training may have been skipped due to resume epoch >= configured epochs)."
         )
-    pos_data = trainer.problems[0].graph_data.pos.numpy()
+
+    # Evaluate and export results for every training problem
     try:
         predictions, ground_truth, errors = trainer.evaluate_with_ground_truth(
-            problem_indices=[0]
+            problem_indices=train_indices
         )
 
         print("Exporting results...")
-        if not problem.complex:
-            trainer.all_fem_solvers[0].export_to_vtk(
-                ground_truth[0],
-                predictions[0],
-                filename=f"{save_path}/vtk/result",
-            )
-        else:
-            trainer.all_fem_solvers[0].export_to_vtk_mixed(
-                ground_truth[0],
-                predictions[0],
-                filename=f"{save_path}/vtk/result_mixed",
-            )
+        for i, prob_idx in enumerate(train_indices):
+            problem = problems[prob_idx]
+            vtk_suffix = f"_p{prob_idx}" if len(train_indices) > 1 else ""
+            if not problem.complex:
+                trainer.all_fem_solvers[prob_idx].export_to_vtk(
+                    ground_truth[i],
+                    predictions[i],
+                    filename=f"{save_path}/vtk/result{vtk_suffix}",
+                )
+            else:
+                trainer.all_fem_solvers[prob_idx].export_to_vtk_mixed(
+                    ground_truth[i],
+                    predictions[i],
+                    filename=f"{save_path}/vtk/result_mixed{vtk_suffix}",
+                )
     except Exception as e:
         print(f"Ground truth evaluation failed: {e}")
 
@@ -790,6 +830,14 @@ def _run_single_problem_experiment(problem: MeshProblemEM, config, experiment_na
     model_path = f"{save_path}/pimgn_trained_model.pth"
     trainer.save_checkpoint(model_path, epoch=config["epochs"] - 1)
     print(f"Trained model saved to: {model_path}")
+
+    return trainer
+
+
+# Backward-compatible alias
+def _run_single_problem_experiment(problem: MeshProblemEM, config, experiment_name: str):
+    """Convenience wrapper for a single-problem experiment."""
+    return _run_experiment([problem], config, experiment_name, train_indices=[0])
 
 
 def train_pimgn_on_single_problem(resume_from: str = None):
@@ -834,7 +882,37 @@ def train_pimgn_em_mixed(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, config, "First order EM Mixed")
 
+
+def train_pimgn_em_multi(resume_from: str = None):
+    """Train PIMGN-EM on multiple problems simultaneously."""
+    # Create a list of problems with different configurations
+    problems = [
+        create_em_mixed(i_coil=1000),
+        create_em_mixed(i_coil=2000),
+        create_em_mixed(i_coil=3000),
+    ]
+    # Assign unique problem IDs
+    for i, p in enumerate(problems):
+        p.problem_id = i
+
+    config = {
+        "epochs": 10000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/test_em_multi",
+        "resume_from": resume_from,
+        "save_interval": 1000,
+        "phi_weight": 0.1,
+        "data_weight": 0.0,
+        "data_weight_decay": 0.9995,
+    }
+    train_indices = list(range(len(problems)))
+    _run_experiment(problems, config, "Multi-problem EM Mixed",
+                    train_indices=train_indices)
+
+
 if __name__ == "__main__":
     # train_pimgn_on_single_problem()
     # train_pimgn_em_complex()
-    train_pimgn_em_mixed()
+    # train_pimgn_em_mixed()
+    train_pimgn_em_multi()

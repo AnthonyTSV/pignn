@@ -474,15 +474,29 @@ def train_pimgn_on_industrial_problem():
         problem, time_config, config, "Industrial heating problem"
     )
 
+def em_to_thermal():
+    from train_problems import create_em_to_thermal
+    problem, time_config = create_em_to_thermal()
+    config = {
+        "epochs": 5000,
+        "lr": 1e-3,
+        "time_window": 5,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/em_to_thermal",
+    }
+    _run_single_problem_experiment(
+        problem, time_config, config, "EM to thermal problem"
+    )
 
 def main():
     """Main function to run Physics-Informed MeshGraphNet training and evaluation."""
     # Uncomment one of the following lines to run the desired test
     # train_pimgn_on_single_problem("results/physics_informed/verification_test_problem_3_maxh_0.1/pimgn_trained_model.pth")
-    train_pimgn_on_single_problem()
+    # train_pimgn_on_single_problem()
     # train_multiple_problems()
     # train_pimgn_on_multiple_problems()
     # train_pimgn_on_industrial_problem()
+    em_to_thermal()
 
 
 if __name__ == "__main__":

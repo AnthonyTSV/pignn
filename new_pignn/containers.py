@@ -51,7 +51,8 @@ class MeshProblem:
             None  # To be set (tuple of arrays: (h_array, amb_array))
         )
 
-        self.source_function = None  # Default: no source term
+        self.source_function = None  # Default: no source term (nodal array)
+        self.source_coefficient = None  # Optional: NGSolve CoefficientFunction for accurate FEM assembly
         self.nonlinear_source_params = (
             None  # Optional parameters for nonlinear heat sources
         )
@@ -59,6 +60,11 @@ class MeshProblem:
         self.material_field = (
             None  # Optional per-node physical property (e.g., diffusivity)
         )
+
+        # Workpiece-only thermal domain support
+        self.wp_node_mask = None  # Boolean mask: True for workpiece nodes
+        self.material_region = None  # NGSolve material region name (e.g. "mat_workpiece")
+        self.axisymmetric = False  # If True, multiply weak-form integrals by r=ng.x
 
     def set_dirichlet_values(self, boundary_values: dict):
         """Set Dirichlet boundary conditions."""
@@ -87,8 +93,24 @@ class MeshProblem:
         self.dirichlet_values_array = dirichlet_values_array
 
     def set_source_function(self, source_function):
-        """Set source function."""
+        """Set source function (nodal values array for GNN features)."""
         self.source_function = source_function
+
+    def set_source_coefficient(self, source_coefficient):
+        """Set NGSolve CoefficientFunction for accurate FEM source integration."""
+        self.source_coefficient = source_coefficient
+
+    def set_material_region(self, region_name: str):
+        """Set the material region name for domain-restricted FEM integration."""
+        self.material_region = region_name
+
+    def set_axisymmetric(self, axisymmetric: bool = True):
+        """Enable axisymmetric (cylindrical) weak form with Jacobian r = ng.x."""
+        self.axisymmetric = axisymmetric
+
+    def set_wp_node_mask(self, wp_node_mask):
+        """Set workpiece node mask (boolean array)."""
+        self.wp_node_mask = wp_node_mask
 
 
 class MeshProblemEM:

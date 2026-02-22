@@ -11,19 +11,14 @@ from new_pignn.mesh_utils import (
 
 
 def main():
-    mesh = create_rectangular_mesh(maxh=0.3)
+    mesh = create_ih_mesh()
     n_points = len(list(mesh.ngmesh.Points()))
     print(f"   Created mesh with {n_points} nodes")
 
-    dirichlet_names = ["left", "right", "bottom", "top"]
-    dirichlet_boundaries_dict = {
-        "left": 0.0,
-        "right": 0.0,
-        "bottom": 0.0,
-        "top": 0.0,
-    }
-    neumann_names = []
-    neumann_boundaries_dict = {}
+    dirichlet_names = []
+    dirichlet_boundaries_dict = {}
+    neumann_names = ["bc_workpiece_left"]
+    neumann_boundaries_dict = {"bc_workpiece_left": 0}
 
     import ngsolve as ng
 
@@ -138,6 +133,30 @@ def main():
         figsize=(20, 5),
         node_size=30,
         save_path="graph_visualization_free_nodes.png",
+    )
+
+    ngmesh = mesh.ngmesh
+    n_nodes = temp_data.pos.shape[0]
+    wp_node_mask = np.zeros(n_nodes, dtype=bool)  # Track which nodes are in the workpiece
+    for i, elem in enumerate(ngmesh.Elements2D()):
+        mat_index = elem.index
+        mat_name = ngmesh.GetMaterial(mat_index)
+
+        # Get vertices of this element
+        vertices = elem.vertices
+        for v in vertices:
+            node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
+            if 0 <= node_idx < n_nodes:
+                if mat_name == "mat_workpiece":
+                    wp_node_mask[node_idx] = True
+
+    workpiece_graph, node_mapping, new_aux = creator.create_workpiece_subgraph(full_graph, aux, wp_node_mask=wp_node_mask)
+    creator.visualize_graph(
+        workpiece_graph,
+        new_aux,
+        figsize=(20, 5),
+        node_size=30,
+        save_path="graph_visualization_workpiece_nodes.png",
     )
 
     print("Demo completed! Check the generated visualization files:")

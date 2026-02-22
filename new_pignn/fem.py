@@ -19,12 +19,18 @@ class FEMSolver:
         if problem is not None and problem.mesh_config.dirichlet_pipe:
             dirichlet_string = problem.mesh_config.dirichlet_pipe
 
+        # Determine definedon region for workpiece-only problems
+        definedon_kw = {}
+        if problem is not None:
+            region = getattr(problem, "material_region", None)
+            if region:
+                definedon_kw["definedon"] = mesh.Materials(region)
+
         # Create H1 space - only pass dirichlet if we have boundaries
         if dirichlet_string:
-            self.fes = ng.H1(mesh, order=order, dirichlet=dirichlet_string)
+            self.fes = ng.H1(mesh, order=order, dirichlet=dirichlet_string, **definedon_kw)
         else:
-            # No Dirichlet boundaries - all DOFs are free
-            self.fes = ng.H1(mesh, order=order)
+            self.fes = ng.H1(mesh, order=order, **definedon_kw)
         self.problem = problem
         if problem is not None:
             self.init_matrices()
@@ -36,28 +42,40 @@ class FEMSolver:
         u = self.fes.TrialFunction()
         v = self.fes.TestFunction()
 
-        self.stiffness_matrix = ng.BilinearForm(self.fes, symmetric=True)
-        self.stiffness_matrix += self._alpha_weight() * ng.grad(u) * ng.grad(v) * ng.dx
+        dx_r = self._dx_region()
+        jac = self._jac()
 
-        # Add Robin BC contribution to stiffness matrix: + integral(h * u * v) ds
+        self.stiffness_matrix = ng.BilinearForm(self.fes, symmetric=True)
+        self.stiffness_matrix += jac * self._alpha_weight() * ng.grad(u) * ng.grad(v) * dx_r
+
+        # Add Robin BC contribution to stiffness matrix: + integral(jac * h * u * v) ds
         if hasattr(self.problem, "robin_values"):
             for name, (h, _) in self.problem.robin_values.items():
-                self.stiffness_matrix += h * u * v * ng.ds(definedon=name)
+                self.stiffness_matrix += jac * h * u * v * ng.ds(definedon=name)
 
         self.stiffness_matrix.Assemble()
 
         self.mass_matrix = ng.BilinearForm(self.fes, symmetric=True)
-        self.mass_matrix += u * v * ng.dx
+        self.mass_matrix += jac * u * v * dx_r
         self.mass_matrix.Assemble()
 
         self.neumann_matrix = ng.LinearForm(self.fes)
         for name, value in self.problem.neumann_values.items():
-            self.neumann_matrix += value * v * ng.ds(definedon=name)
+            self.neumann_matrix += jac * value * v * ng.ds(definedon=name)
 
-        # Add Robin BC contribution to RHS: + integral(h * T_amb * v) ds
+        # Add Robin BC contribution to RHS: + integral(jac * h * T_amb * v) ds
         if hasattr(self.problem, "robin_values"):
             for name, (h, t_amb) in self.problem.robin_values.items():
-                self.neumann_matrix += h * t_amb * v * ng.ds(definedon=name)
+                self.neumann_matrix += jac * h * t_amb * v * ng.ds(definedon=name)
+
+        # Add source term — prefer CoefficientFunction for accurate quadrature integration
+        source_cf = getattr(self.problem, "source_coefficient", None)
+        if source_cf is not None:
+            self.neumann_matrix += jac * source_cf * v * dx_r
+        elif self.problem.source_function is not None:
+            gfu_source = ng.GridFunction(self.fes)
+            gfu_source.vec.FV().NumPy()[:] = self.problem.source_function
+            self.neumann_matrix += jac * gfu_source * v * dx_r
 
         self.neumann_matrix.Assemble()
 
@@ -68,6 +86,31 @@ class FEMSolver:
             self.neumann_matrix.vec.FV().NumPy().copy(), dtype=torch.float64
         )
 
+        # Compute lumped mass diagonal for residual normalization.
+        # Row-sum of M converts weak-form residual to strong (pointwise) form,
+        # making the loss scale-invariant w.r.t. mesh size.
+        ones = torch.ones(
+            self.mass_matrix_mat.shape[1], 1, dtype=torch.float64
+        )
+        self.mass_lumped_diag = torch.sparse.mm(
+            self.mass_matrix_mat, ones
+        ).squeeze()  # [N_dofs]
+
+        # Pre-compute the system matrix diagonal for Jacobi-style normalization.
+        # Using diag(M/dt + K) instead of just M_lumped ensures that Robin BC
+        # contributions (large surface terms relative to volumetric mass) are
+        # properly scaled, preventing O(10^3) amplification at boundary nodes.
+        dt = self.problem.time_config.dt
+        sys_mat = (self.mass_matrix_mat / dt + self.stiffness_matrix_mat).coalesce()
+        # Efficiently extract diagonal from sparse COO tensor
+        indices = sys_mat.indices()  # [2, nnz]
+        values = sys_mat.values()    # [nnz]
+        n_dofs = sys_mat.shape[0]
+        sys_diag = torch.zeros(n_dofs, dtype=torch.float64)
+        diag_mask = indices[0] == indices[1]
+        sys_diag[indices[0, diag_mask]] = values[diag_mask]
+        self.system_diag = sys_diag  # [N_dofs]
+
     def _alpha_weight(self):
         if self.problem is None:
             return 1.0
@@ -75,6 +118,19 @@ class FEMSolver:
         if alpha_cf is not None:
             return alpha_cf
         return getattr(self.problem, "alpha", 1.0)
+
+    def _jac(self):
+        """Return the axisymmetric Jacobian factor r = ng.x if enabled, else 1."""
+        if self.problem and getattr(self.problem, "axisymmetric", False):
+            return ng.x
+        return 1.0
+
+    def _dx_region(self):
+        """Return ng.dx restricted to the material region if set, otherwise full domain."""
+        region = getattr(self.problem, "material_region", None) if self.problem else None
+        if region is not None:
+            return ng.dx(definedon=self.mesh.Materials(region))
+        return ng.dx
 
     def _ngsolve_to_torch(self, ngsolve_matrix):
         """Convert NGSolve matrix to torch tensor."""
@@ -91,13 +147,15 @@ class FEMSolver:
 
         states = []
         u, v = self.fes.TnT()
-        mform = u * v * ng.dx
-        aform = self._alpha_weight() * ng.grad(u) * ng.grad(v) * ng.dx
+        dx_r = self._dx_region()
+        jac = self._jac()
+        mform = jac * u * v * dx_r
+        aform = jac * self._alpha_weight() * ng.grad(u) * ng.grad(v) * dx_r
 
         # Add Robin BC contribution to stiffness matrix
         if hasattr(problem, "robin_values"):
             for name, (h, _) in problem.robin_values.items():
-                aform += h * u * v * ng.ds(definedon=name)
+                aform += jac * h * u * v * ng.ds(definedon=name)
 
         m = ng.BilinearForm(mform).Assemble()
         a = ng.BilinearForm(aform).Assemble()
@@ -106,18 +164,22 @@ class FEMSolver:
 
         f = ng.LinearForm(self.fes)
         for name, value in problem.neumann_values.items():
-            f += value * v * ng.ds(definedon=name)
+            f += jac * value * v * ng.ds(definedon=name)
 
         # Add Robin BC contribution to RHS
         if hasattr(problem, "robin_values"):
             for name, (h, t_amb) in problem.robin_values.items():
-                f += h * t_amb * v * ng.ds(definedon=name)
+                f += jac * h * t_amb * v * ng.ds(definedon=name)
 
         # add source term if provided
-        if problem.source_function is not None:
+        # Prefer CoefficientFunction (exact at quadrature points) over nodal sampling
+        source_cf = getattr(problem, "source_coefficient", None)
+        if source_cf is not None:
+            f += jac * source_cf * v * dx_r
+        elif problem.source_function is not None:
             gfu_source = ng.GridFunction(self.fes)
             gfu_source.vec.FV().NumPy()[:] = problem.source_function
-            f += gfu_source * v * ng.dx
+            f += jac * gfu_source * v * dx_r
         f.Assemble()
         base_force_vec = f.vec.CreateVector()
         base_force_vec.data = f.vec
@@ -151,13 +213,13 @@ class FEMSolver:
             total_force = base_force_vec.CreateVector()
             total_force.data = base_force_vec
 
-            nonlinear_source = self._compute_nonlinear_source_vector(
-                problem,
-                temperature_values=gfu.vec.FV().NumPy(),
-                current_time=current_time,
-            )
-            if nonlinear_source is not None:
-                total_force.FV().NumPy()[:] += nonlinear_source
+            # nonlinear_source = self._compute_nonlinear_source_vector(
+            #     problem,
+            #     temperature_values=gfu.vec.FV().NumPy(),
+            #     current_time=current_time,
+            # )
+            # if nonlinear_source is not None:
+            #     total_force.FV().NumPy()[:] += nonlinear_source
 
             rhs_vec = total_force.CreateVector()
             rhs_vec.data = m.mat * gfu.vec
@@ -176,7 +238,14 @@ class FEMSolver:
             gfu_next.vec.data += mstarinv * rhs_vec
 
             gfu = gfu_next
-            states.append(gfu.vec.FV().NumPy().copy())
+            state_arr = gfu.vec.FV().NumPy().copy()
+            # For workpiece-only problems, fill non-workpiece DOFs with initial
+            # values so comparisons against predictions (which also fill non-WP
+            # nodes with the initial condition) are consistent.
+            wp_mask = getattr(problem, "wp_node_mask", None)
+            if wp_mask is not None:
+                state_arr[~wp_mask] = problem.initial_condition[~wp_mask]
+            states.append(state_arr)
         return states
 
     def compute_residual(
@@ -264,11 +333,27 @@ class FEMSolver:
         residual = torch.add(residual, -neumann_vec)
         residual = residual.squeeze()  # [N_dofs]
 
+        # Normalize weak-form residual by system matrix diagonal (Jacobi scaling).
+        # Using diag(M/dt + K) rather than M_lumped alone ensures Robin BC
+        # contributions are properly weighted — preventing O(10^3)–O(10^4)
+        # amplification at boundary nodes where K_robin >> M_lumped.
+        sys_diag = self.system_diag.to(device=device, dtype=t_pred_next.dtype)
+        sys_diag_safe = torch.clamp(torch.abs(sys_diag), min=1e-30)
+        residual = residual / sys_diag_safe
+
         # Apply free DOFs mask - only compute loss on free DOFs (following Eq. 9 in paper)
         # The residual on boundary DOFs should be zero by construction since we enforce the BC
-        residual_free = residual[free_dofs_mask]
+        # If workpiece mask is set, further restrict to workpiece nodes only
+        wp_mask = getattr(problem, "wp_node_mask", None)
+        if wp_mask is not None:
+            wp_mask_tensor = torch.tensor(wp_mask, dtype=torch.bool, device=device)
+            effective_mask = free_dofs_mask & wp_mask_tensor
+        else:
+            effective_mask = free_dofs_mask
 
-        return residual_free**2
+        residual_filtered = residual[effective_mask]
+
+        return residual_filtered**2
 
     def _create_boundary_dofs_vector(
         self, problem: MeshProblem, device: torch.device, dtype: torch.dtype
@@ -326,9 +411,18 @@ class FEMSolver:
         time_scalar: Optional[float],
         mass_mat: torch.Tensor,
     ) -> torch.Tensor:
-        """Assemble the source term, supporting nonlinear heating."""
+        """Assemble the source term, supporting nonlinear heating.
+
+        If a source CoefficientFunction was provided, the source is already
+        baked into self.neumann_vec during init_matrices, so we return zero
+        to avoid double-counting.
+        """
         device = temperature_field.device
         dtype = temperature_field.dtype
+
+        # Source already assembled via CoefficientFunction in neumann_vec
+        if getattr(problem, "source_coefficient", None) is not None:
+            return torch.zeros_like(temperature_field, device=device, dtype=dtype)
 
         if problem.source_function is not None:
             if isinstance(problem.source_function, torch.Tensor):
@@ -462,12 +556,13 @@ if __name__ == "__main__":
         create_mms_problem,
         create_industrial_heating_problem,
         create_source_test_problem,
+        create_em_to_thermal
     )
 
-    problem, time_config = create_mms_problem(maxh=0.1)
+    problem, time_config = create_em_to_thermal()
 
     # Initialize FEM solver
-    fem_solver = FEMSolver(problem.mesh, order=2, problem=problem)
+    fem_solver = FEMSolver(problem.mesh, order=1, problem=problem)
 
     # Solve transient problem
     transient_solution = fem_solver.solve_transient_problem(problem)

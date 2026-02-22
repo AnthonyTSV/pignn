@@ -82,9 +82,11 @@ def create_lshape_mesh(
     return ng.Mesh(ngmesh)
 
 
-def create_ih_mesh():
+def create_ih_mesh(overwrite_r_star = False):
     # Normalization constants
     r_star = 70 * 1e-3  # m
+    if overwrite_r_star:
+        r_star = 1
     A_star = 4.8 * 1e-4  # Wb/m
     mu_star = 4 * 3.1415926535e-7 # H/m
     J_star = A_star / (r_star**2 * mu_star)
@@ -93,7 +95,7 @@ def create_ih_mesh():
     workpiece_diameter = 15 * 1e-3 / r_star  # m
     workpiece_height = 70 * 1e-3 / r_star  # m
 
-    coil_diameter = 30 * 1e-3 / r_star  # m outer
+    coil_diameter = 22 * 1e-3 / r_star  # m outer
     profile_width = 7 * 1e-3 / r_star  # m
     profile_height = 7 * 1e-3 / r_star  # m
 
@@ -107,11 +109,13 @@ def create_ih_mesh():
             pmin=(0, workpiece_height),
             pmax=(workpiece_diameter, 2 * workpiece_height),
             mat="mat_workpiece",
-            # bc="bc_workpiece",
             left="bc_workpiece_left",
+            right="bc_workpiece_right",
+            top="bc_workpiece_top",
+            bottom="bc_workpiece_bottom",
         )
         .Mat("mat_workpiece")
-        .Maxh(5e-3 / r_star)
+        .Maxh(5e-4 / r_star)
     )
 
     rect_air = (

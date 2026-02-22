@@ -643,6 +643,167 @@ def create_industrial_heating_problem(maxh=0.1):
 
     return problem, time_config
 
+def create_em_to_thermal():
+    """
+    This function will create an electromagnetic problem, solve it, 
+    and then use the resulting fields to create a thermal problem with
+    a source term based on the electromagnetic solution.
+    """
+    from pathlib import Path
+    import sys
+    project_root = Path(__file__).resolve().parents[1]
+    sys.path.append(str(project_root))
+    from fem_tests.induction_heating import solve_em
+    import ngsolve as ng
+    mesh = create_ih_mesh(overwrite_r_star=True)
+    A, phi, r1 = solve_em()
+    density = 7870  # kg/m^3
+    specific_heat = 461  # J/(kg·K)
+    k = 86  # W/(m·K)
+    # Time configuration
+    time_config = TimeConfig(dt=0.1, t_final=1.0)
+    h_conv_air = 10  # Air convective heat transfer coefficient
+    h_conv = h_conv_air / (density * specific_heat)
+    T_amb = 22  # Ambient temperature
+    alpha = k / (density * specific_heat)  # Thermal diffusivity
+    dirichlet_boundaries = []
+    neumann_boundaries = []
+    robin_boundaries = ["bc_workpiece_top", "bc_workpiece_right", "bc_workpiece_bottom"]
+    dirichlet_boundaries_dict = {}
+    neumann_boundaries_dict = {}
+    robin_boundaries_dict = {"bc_workpiece_top": (h_conv, T_amb), "bc_workpiece_right": (h_conv, T_amb), "bc_workpiece_bottom": (h_conv, T_amb)}
+
+    # Mesh configuration
+    mesh_config = MeshConfig(
+        maxh=1e-3,
+        order=1,
+        dim=2,
+        dirichlet_boundaries=dirichlet_boundaries,
+        neumann_boundaries=neumann_boundaries,
+        robin_boundaries=robin_boundaries,
+        mesh_type="ih",
+    )
+
+    # Create graph to get node positions
+    graph_creator = GraphCreator(
+        mesh=mesh,
+        n_neighbors=2,
+        dirichlet_names=dirichlet_boundaries,
+        neumann_names=neumann_boundaries,
+        robin_names=robin_boundaries,
+        connectivity_method="fem",
+    )
+    # First create a temporary graph to get positions and aux data
+    temp_data, temp_aux = graph_creator.create_graph()
+
+    # Create Neumann values based on the temporary data
+    neumann_vals = graph_creator.create_neumann_values(
+        pos=temp_data.pos,
+        aux_data=temp_aux,
+        neumann_names=neumann_boundaries,
+        flux_values=neumann_boundaries_dict,
+        seed=42,
+    )
+    dirichlet_vals = graph_creator.create_dirichlet_values(
+        pos=temp_data.pos,
+        aux_data=temp_aux,
+        dirichlet_names=dirichlet_boundaries,
+        boundary_values=dirichlet_boundaries_dict,
+    )
+    h_vals, amb_vals = graph_creator.create_robin_values(
+        pos=temp_data.pos,
+        aux_data=temp_aux,
+        robin_names=robin_boundaries,
+        robin_values=robin_boundaries_dict,
+    )
+
+    # Create the final graph with Neumann values
+    temp_data, _ = graph_creator.create_graph(
+        neumann_values=neumann_vals,
+        dirichlet_values=dirichlet_vals,
+        robin_values=(h_vals, amb_vals),
+    )
+
+    initial_condition = np.ones_like(temp_data.pos[:, 0]) * T_amb
+
+    # Create problem
+    problem = MeshProblem(
+        mesh=mesh,
+        graph_data=temp_data,
+        initial_condition=initial_condition,
+        alpha=alpha,  # Thermal diffusivity
+        time_config=time_config,
+        mesh_config=mesh_config,
+        problem_id=0,
+    )
+
+    # Store the Neumann values array for later use
+    problem.set_neumann_values_array(neumann_vals)
+    problem.set_dirichlet_values_array(dirichlet_vals)
+    problem.set_robin_values_array((h_vals, amb_vals))
+
+    # Set boundary conditions
+    problem.set_neumann_values(neumann_boundaries_dict)
+    problem.set_dirichlet_values(dirichlet_boundaries_dict)
+    problem.set_robin_values(robin_boundaries_dict)
+
+    x = temp_data.pos[:, 0]
+    y = temp_data.pos[:, 1]
+    omega = 2 * np.pi * 8000
+    sigma = 6289308
+    E_phi = -1j * omega * (A + phi * r1)
+
+    Q = 0.5 * sigma * ng.Norm(E_phi) ** 2 / (density * specific_heat)
+
+    ngmesh = mesh.ngmesh
+    n_nodes = temp_data.pos.shape[0]
+    source_function = np.zeros(n_nodes, dtype=np.float64)
+    wp_node_mask = np.zeros(n_nodes, dtype=bool)  # Track which nodes are in the workpiece
+    for i, elem in enumerate(ngmesh.Elements2D()):
+        mat_index = elem.index
+        mat_name = ngmesh.GetMaterial(mat_index)
+
+        # Get vertices of this element
+        vertices = elem.vertices
+        for v in vertices:
+            node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
+            if 0 <= node_idx < n_nodes:
+                if mat_name == "mat_workpiece":
+                    p = mesh.ngmesh.Points()[v.nr].p
+                    x, y = p[0], p[1]
+                    q_val = Q(mesh(x, y))
+                    source_function[node_idx] = q_val
+                    wp_node_mask[node_idx] = True
+
+    problem.set_source_function(source_function)
+    problem.set_source_coefficient(Q)  # CF for accurate FEM quadrature integration
+    problem.set_wp_node_mask(wp_node_mask)
+    problem.set_material_region("mat_workpiece")
+    problem.set_axisymmetric(True)
+    if dirichlet_boundaries:
+
+        fes = ng.H1(mesh, order=1, dirichlet=problem.mesh_config.dirichlet_pipe)
+        gfu = ng.GridFunction(fes)
+        gfu_initial = ng.GridFunction(fes)
+
+        # Set initial condition on the interior
+        gfu_initial.vec.FV().NumPy()[:] = problem.initial_condition
+
+        # Set Dirichlet boundary conditions
+        boundary_cf = mesh.BoundaryCF(problem.boundary_values, default=0)
+        gfu.Set(boundary_cf, definedon=mesh.Boundaries(problem.mesh_config.dirichlet_pipe))
+
+        # Copy initial condition values for free DOFs only
+        free_dofs = fes.FreeDofs()
+        for dof in range(fes.ndof):
+            if free_dofs[dof]:
+                gfu.vec[dof] = gfu_initial.vec[dof]
+        problem.initial_condition = gfu.vec.FV().NumPy()
+
+    print(f"Problem created with {problem.n_nodes} nodes and {problem.n_edges} edges")
+    print(f"Time steps: {len(time_config.time_steps)}, dt: {time_config.dt}")
+
+    return problem, time_config
 
 def create_em_problem():
 
@@ -852,7 +1013,7 @@ def create_em_problem_complex():
 
     return problem
 
-def create_em_mixed():
+def create_em_mixed(i_coil: float = 1000):
 
     r_star = 70 * 1e-3  # m
     A_star = 4.8 * 1e-4  # Wb/m
@@ -908,6 +1069,7 @@ def create_em_mixed():
     problem.sigma_air = 0.0
     problem.sigma_coil = 58823529 / sigma_star
     problem.omega = omega
+    problem.I_coil = i_coil
 
     # Create material fields (mu_r at each node) based on material subdomain
     n_nodes = temp_data.pos.shape[0]

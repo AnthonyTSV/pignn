@@ -44,6 +44,7 @@ class PIMGNTrainer:
             n_neighbors=2,
             dirichlet_names=first_problem.mesh_config.dirichlet_boundaries,
             neumann_names=getattr(first_problem.mesh_config, "neumann_boundaries", []),
+            robin_names=getattr(first_problem.mesh_config, "robin_boundaries", []),
             connectivity_method="fem",
             fes=fem_solver.fes,
         )
@@ -52,6 +53,7 @@ class PIMGNTrainer:
         material_field = getattr(first_problem, "material_field", None)
         neumann_vals = getattr(first_problem, "neumann_values_array", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
+        robin_vals = getattr(first_problem, "robin_values_array", None)
         source_vals = getattr(first_problem, "source_function", None)
         sample_data, aux = graph_creator.create_graph(
             T_current=first_problem.initial_condition,
@@ -59,12 +61,20 @@ class PIMGNTrainer:
             material_node_field=material_field,
             neumann_values=neumann_vals,
             dirichlet_values=dirichlet_vals,
+            robin_values=robin_vals,
             source_values=source_vals,
         )
 
-        free_node_data, mapping, new_aux = graph_creator.create_free_node_subgraph(
-            data=sample_data, aux=aux
-        )
+        # Use workpiece subgraph if applicable, otherwise free-node subgraph
+        wp_mask = getattr(first_problem, "wp_node_mask", None)
+        if wp_mask is not None:
+            free_node_data, mapping, new_aux = graph_creator.create_workpiece_subgraph(
+                data=sample_data, aux=aux, wp_node_mask=wp_mask
+            )
+        else:
+            free_node_data, mapping, new_aux = graph_creator.create_free_node_subgraph(
+                data=sample_data, aux=aux
+            )
 
         input_dim_node = free_node_data.x.shape[1]
         input_dim_edge = free_node_data.edge_attr.shape[1]
@@ -86,11 +96,12 @@ class PIMGNTrainer:
         ).to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
-        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.995)
+        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.9995)
 
         # Training history
         self.losses = []
         self.val_losses = []
+        self.last_residuals = None
 
         # Initialize logger
         save_dir = config.get("save_dir", "results/physics_informed")
@@ -147,6 +158,26 @@ class PIMGNTrainer:
                 self.all_ground_truth.append(ground_truth)
         else:
             self.all_ground_truth = None
+
+    def _is_workpiece_problem(self, problem_idx: int) -> bool:
+        """Check if this problem uses workpiece-only domain."""
+        problem = self.problems[problem_idx]
+        return getattr(problem, "wp_node_mask", None) is not None
+
+    def _create_subgraph(self, graph_creator, data, aux, problem_idx):
+        """Create the appropriate subgraph (workpiece or free-node) based on problem type."""
+        problem = self.problems[problem_idx]
+        wp_mask = getattr(problem, "wp_node_mask", None)
+        if wp_mask is not None:
+            wp_data, node_mapping, wp_aux = graph_creator.create_workpiece_subgraph(
+                data=data, aux=aux, wp_node_mask=wp_mask
+            )
+            # Unify mapping keys so downstream code works the same way
+            node_mapping["free_to_original"] = node_mapping["wp_to_original"]
+            node_mapping["n_free"] = node_mapping["n_wp"]
+            return wp_data, node_mapping, wp_aux
+        else:
+            return graph_creator.create_free_node_subgraph(data=data, aux=aux)
 
     def compute_physics_informed_loss(
         self,
@@ -252,6 +283,7 @@ class PIMGNTrainer:
             n_neighbors=2,
             dirichlet_names=problem.mesh_config.dirichlet_boundaries,
             neumann_names=getattr(problem.mesh_config, "neumann_boundaries", []),
+            robin_names=getattr(problem.mesh_config, "robin_boundaries", []),
             connectivity_method="fem",
             fes=self.all_fem_solvers[problem_idx].fes,
         )
@@ -259,6 +291,7 @@ class PIMGNTrainer:
         # Get the Neumann values for this problem
         neumann_vals = getattr(problem, "neumann_values_array", None)
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
+        robin_vals = getattr(problem, "robin_values_array", None)
         material_field = getattr(problem, "material_field", None)
         source_vals = getattr(problem, "source_function", None)
 
@@ -274,12 +307,13 @@ class PIMGNTrainer:
             material_node_field=material_field,
             neumann_values=neumann_vals,
             dirichlet_values=dirichlet_vals,
+            robin_values=robin_vals,
             source_values=source_vals,
         )
 
-        # Create free node subgraph (only non-Dirichlet nodes)
-        free_data, node_mapping, free_aux = graph_creator.create_free_node_subgraph(
-            data=data, aux=aux
+        # Create free node subgraph (workpiece-only or non-Dirichlet nodes)
+        free_data, node_mapping, free_aux = self._create_subgraph(
+            graph_creator, data, aux, problem_idx
         )
         free_data = free_data.to(self.device)
 
@@ -322,6 +356,10 @@ class PIMGNTrainer:
         if dirichlet_vals is not None:
             dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
             next_state_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
+        # For workpiece problems, set non-workpiece nodes to initial condition (e.g. T_amb)
+        wp_mask = getattr(problem, "wp_node_mask", None)
+        if wp_mask is not None:
+            next_state_full[~wp_mask] = problem.initial_condition[~wp_mask]
 
         return physics_loss.item(), next_state_full, predictions_bundled_np
 
@@ -383,6 +421,31 @@ class PIMGNTrainer:
                 print(
                     f"Epoch {epoch+1:4d} | Train Loss: {avg_epoch_loss:.3e}{val_str} | Time: {elapsed:.2f}s"
                 )
+            if (epoch + 1) % 100 == 0:
+                self.model.eval()
+                prob_idx = train_problems_indices[0]
+                predictions = self.rollout(problem_idx=prob_idx)
+
+                # If we have ground truth, compute errors
+                if self.all_ground_truth is not None:
+                    ground_truth = self.all_ground_truth[prob_idx]
+
+                    # Compute errors
+                    problem = self.problems[prob_idx]
+                    wp_mask = getattr(problem, "wp_node_mask", None)
+                    errors = []
+                    for i, (pred, true) in enumerate(zip(predictions, ground_truth)):
+                        if wp_mask is not None:
+                            pred_wp = pred[wp_mask]
+                            true_wp = true[wp_mask]
+                            norm_true = np.linalg.norm(true_wp)
+                            l2_error = np.linalg.norm(pred_wp - true_wp) / norm_true if norm_true > 0 else 0.0
+                        else:
+                            l2_error = np.linalg.norm(pred - true) / np.linalg.norm(true)
+                        errors.append(l2_error)
+                mean_l2_error = np.mean(errors)
+                print(f"Epoch {epoch+1:4d} | Rollout L2 Error: {mean_l2_error:.3e}")
+
 
             self.scheduler.step()
 
@@ -421,7 +484,8 @@ class PIMGNTrainer:
                         mesh=problem.mesh,
                         n_neighbors=2,
                         dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-                        neumann_names=[],
+                        neumann_names=getattr(problem.mesh_config, "neumann_boundaries", []),
+                        robin_names=getattr(problem.mesh_config, "robin_boundaries", []),
                         connectivity_method="fem",
                         fes=self.all_fem_solvers[problem_idx].fes,
                     )
@@ -435,11 +499,12 @@ class PIMGNTrainer:
                         dirichlet_values=getattr(
                             problem, "dirichlet_values_array", None
                         ),
+                        robin_values=getattr(problem, "robin_values_array", None),
                         source_values=getattr(problem, "source_function", None),
                     )
 
                     free_data, node_mapping, free_aux = (
-                        graph_creator.create_free_node_subgraph(data=data, aux=aux)
+                        self._create_subgraph(graph_creator, data, aux, problem_idx)
                     )
                     free_data = free_data.to(self.device)
 
@@ -516,7 +581,7 @@ class PIMGNTrainer:
                     source_values=source_vals,
                 )
                 free_graph, node_mapping, free_aux = (
-                    graph_creator.create_free_node_subgraph(data, aux)
+                    self._create_subgraph(graph_creator, data, aux, problem_idx)
                 )
                 free_data = free_graph.to(self.device)
 
@@ -547,8 +612,9 @@ class PIMGNTrainer:
                 if len(predictions) > 1:
                     T_to_use = predictions[-1]
                     # enforce Dirichlet BCs
-                    dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
-                    T_to_use[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
+                    if dirichlet_vals is not None:
+                        dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
+                        T_to_use[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
                     T_current = T_to_use
 
                 # Move forward to the next batch
@@ -585,9 +651,17 @@ class PIMGNTrainer:
 
             # Compute errors
             errors = []
+            wp_mask = getattr(problem, "wp_node_mask", None)
             for j, (pred, true) in enumerate(zip(predictions, ground_truth)):
                 if len(pred) == len(true):
-                    l2_error = np.linalg.norm(pred - true) / np.linalg.norm(true)
+                    if wp_mask is not None:
+                        # Only evaluate on workpiece nodes
+                        pred_wp = pred[wp_mask]
+                        true_wp = true[wp_mask]
+                        norm_true = np.linalg.norm(true_wp)
+                        l2_error = np.linalg.norm(pred_wp - true_wp) / norm_true if norm_true > 0 else 0.0
+                    else:
+                        l2_error = np.linalg.norm(pred - true) / np.linalg.norm(true)
                     errors.append(l2_error)
                 else:
                     print(
@@ -637,9 +711,17 @@ class PIMGNTrainer:
                 ground_truth = self.all_ground_truth[prob_idx]
 
                 # Compute errors
+                problem = self.problems[prob_idx]
+                wp_mask = getattr(problem, "wp_node_mask", None)
                 errors = []
                 for i, (pred, true) in enumerate(zip(predictions, ground_truth)):
-                    l2_error = np.linalg.norm(pred - true) / np.linalg.norm(true)
+                    if wp_mask is not None:
+                        pred_wp = pred[wp_mask]
+                        true_wp = true[wp_mask]
+                        norm_true = np.linalg.norm(true_wp)
+                        l2_error = np.linalg.norm(pred_wp - true_wp) / norm_true if norm_true > 0 else 0.0
+                    else:
+                        l2_error = np.linalg.norm(pred - true) / np.linalg.norm(true)
                     errors.append(l2_error)
 
                 all_errors.append(errors)

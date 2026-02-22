@@ -24,7 +24,7 @@ def _build_point_index_map(mesh: Mesh) -> tuple[np.ndarray, dict[int, int]]:
     pnum_to_idx: dict[int, int] = {}
 
     for new_idx, pt in enumerate(pts):
-        old_nr = int(getattr(pt, "nr", new_idx + 1))  # pt.nr is typical
+        old_nr = int(getattr(pt, "nr", new_idx + 1))
         pnum_to_idx[old_nr] = new_idx
         coord = pt.p
         if dim == 2:
@@ -568,6 +568,7 @@ class GraphCreator:
         dirichlet_values: Optional[np.ndarray] = None,
         robin_values: Optional[Tuple[np.ndarray, np.ndarray]] = None,
         source_values: Optional[np.ndarray] = None,
+        wp_node_mask: Optional[np.ndarray] = None,
         add_self_loops: bool = True,
         device: Optional[torch.device] = None,
     ) -> Tuple[Data, Dict]:
@@ -642,6 +643,9 @@ class GraphCreator:
             "mesh": self.mesh,
             "connectivity_method": self.connectivity_method,
         }
+        if wp_node_mask is not None:
+            aux["wp_mask"] = wp_node_mask
+            aux["wp_node_indices"] = np.where(wp_node_mask)[0]
 
         # 8. Create PyTorch Geometric Data object
         data = Data(
@@ -783,6 +787,122 @@ class GraphCreator:
         }
 
         return free_data, node_mapping, free_aux
+
+    def create_workpiece_subgraph(
+        self, data: Data, aux: Dict, wp_node_mask: np.ndarray
+    ) -> Tuple[Data, Dict, Dict]:
+        """
+        Create a subgraph containing only workpiece nodes.
+
+        This restricts the graph to nodes in the thermal domain (workpiece),
+        excluding air and coil nodes that don't participate in the heat equation.
+        Boundary nodes (Robin/Neumann on workpiece surfaces) are kept.
+
+        Args:
+            data: Full PyTorch Geometric Data object
+            aux: Auxiliary data dictionary from create_graph
+            wp_node_mask: Boolean array [N_nodes] — True for workpiece nodes
+
+        Returns:
+            wp_data: Subgraph with only workpiece nodes
+            node_mapping: Dict with mapping between workpiece and original indices
+            wp_aux: Updated auxiliary data for the subgraph
+        """
+        device = (
+            data.x.device
+            if hasattr(data.x, "device")
+            else torch.device("cpu")
+        )
+
+        wp_mask_tensor = torch.tensor(wp_node_mask, dtype=torch.bool, device=device)
+        wp_indices = torch.where(wp_mask_tensor)[0]
+        n_wp = len(wp_indices)
+
+        if n_wp == 0:
+            raise ValueError("No workpiece nodes found in wp_node_mask")
+
+        # Create mapping from original indices to workpiece subgraph indices
+        old_to_new = torch.full((data.num_nodes,), -1, dtype=torch.long, device=device)
+        old_to_new[wp_indices] = torch.arange(n_wp, device=device)
+
+        # Extract workpiece node features and positions
+        wp_x = data.x[wp_indices]
+        wp_pos = data.pos[wp_indices]
+
+        # Ensure edge_index is on the same device
+        edge_index = data.edge_index.to(device)
+
+        # Filter edges: only keep connections between workpiece nodes
+        edge_mask = wp_mask_tensor[edge_index[0]] & wp_mask_tensor[edge_index[1]]
+        wp_edges = edge_index[:, edge_mask]
+        wp_edge_attr = data.edge_attr[edge_mask]
+
+        # Remap edge indices to subgraph
+        wp_edge_index = old_to_new[wp_edges]
+
+        # Handle Robin values for subgraph
+        robin_values_sub = None
+        if aux.get("robin_values") is not None:
+            h_vals, amb_vals = aux["robin_values"]
+            wp_cpu = wp_indices.cpu().numpy()
+            robin_values_sub = (h_vals[wp_cpu], amb_vals[wp_cpu])
+
+        # Create subgraph data
+        wp_data = Data(
+            x=wp_x,
+            edge_index=wp_edge_index,
+            edge_attr=wp_edge_attr,
+            pos=wp_pos,
+            global_attr=data.global_attr,
+            num_nodes=n_wp,
+        )
+
+        wp_cpu = wp_indices.cpu().numpy()
+        wp_aux = {
+            "pnum_to_idx": {
+                k: v
+                for k, v in aux["pnum_to_idx"].items()
+                if v in wp_indices.tolist()
+            },
+            "node_types": aux["node_types"][wp_indices],
+            "dirichlet_mask": aux["dirichlet_mask"][wp_indices],
+            "neumann_mask": aux["neumann_mask"][wp_indices],
+            "interior_mask": aux["interior_mask"][wp_indices],
+            "robin_mask": (
+                aux["robin_mask"][wp_indices] if "robin_mask" in aux else None
+            ),
+            "free_mask": torch.ones(n_wp, dtype=torch.bool, device=device),
+            "neumann_values": (
+                aux["neumann_values"][wp_cpu]
+                if aux["neumann_values"] is not None
+                else None
+            ),
+            "dirichlet_values": (
+                aux["dirichlet_values"][wp_cpu]
+                if aux["dirichlet_values"] is not None
+                else None
+            ),
+            "robin_values": robin_values_sub,
+            "source_values": (
+                aux["source_values"][wp_cpu]
+                if aux.get("source_values") is not None
+                else None
+            ),
+            "mesh": aux["mesh"],
+            "connectivity_method": aux["connectivity_method"],
+        }
+        if "wp_mask" in aux:
+            wp_aux["wp_mask"] = aux["wp_mask"][wp_cpu]
+
+        # Node mapping for reconstruction
+        node_mapping = {
+            "wp_to_original": wp_indices,
+            "original_to_wp": old_to_new,
+            "n_original": data.num_nodes,
+            "n_wp": n_wp,
+        }
+
+        return wp_data, node_mapping, wp_aux
 
     def create_neumann_values(
         self,

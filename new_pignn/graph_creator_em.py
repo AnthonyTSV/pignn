@@ -791,7 +791,7 @@ class GraphCreatorEM:
         G = self._pyg_to_networkx(data)
 
         # Create figure with subplots - add fourth subplot for Dirichlet values
-        fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=figsize)
+        fig, ax1 = plt.subplots(1, 1, figsize=figsize)
 
         # Get positions from data
         pos_dict = {i: data.pos[i].numpy() for i in range(data.num_nodes)}
@@ -820,7 +820,6 @@ class GraphCreatorEM:
                     node_colors.append("green")
                     node_type_counts[1] += 1
 
-        # Plot 1: Graph structure with node types
         nx.draw_networkx_nodes(
             G, pos_dict, node_color=node_colors, node_size=node_size, ax=ax1, alpha=0.8
         )
@@ -833,10 +832,10 @@ class GraphCreatorEM:
             if only_free_nodes
             else f"{self.connectivity_method.upper()} Graph"
         )
-        ax1.set_title(
-            f"{graph_type} Structure\\n"
-            f"Nodes: {data.num_nodes}, Edges: {data.num_edges}"
-        )
+        # ax1.set_title(
+        #     f"{graph_type} Structure\\n"
+        #     f"Nodes: {data.num_nodes}, Edges: {data.num_edges}"
+        # )
         ax1.set_aspect("equal")
         ax1.axis("off")
 
@@ -845,110 +844,7 @@ class GraphCreatorEM:
             mpatches.Patch(color="red", label=f"Dirichlet ({node_type_counts[0]})"),
             mpatches.Patch(color="green", label=f"Interior ({node_type_counts[1]})"),
         ]
-        ax1.legend(handles=legend_elements, loc="upper right", bbox_to_anchor=(1, 1))
-
-        # Plot 2: Temperature field visualization (if available)
-        if data.x.shape[1] > 3:  # Has temperature data
-            temp_values = data.x[:, 3].numpy()  # Temperature is 4th feature
-
-            # Create scatter plot colored by temperature
-            scatter = ax2.scatter(
-                data.pos[:, 0].numpy(),
-                data.pos[:, 1].numpy(),
-                c=temp_values,
-                cmap="coolwarm",
-                s=node_size,
-                alpha=0.8,
-            )
-
-            # Add colorbar
-            cbar = plt.colorbar(scatter, ax=ax2)
-            cbar.set_label("Temperature")
-
-            ax2.set_title(
-                f"Temperature Field\\nRange: [{temp_values.min():.3f}, {temp_values.max():.3f}]"
-            )
-        else:
-            ax2.text(
-                0.5,
-                0.5,
-                "No temperature data\\navailable",
-                ha="center",
-                va="center",
-                transform=ax2.transAxes,
-                fontsize=12,
-            )
-            ax2.set_title("Temperature Field (N/A)")
-
-        ax2.set_aspect("equal")
-        ax2.axis("off")
-
-        # Plot 4: Dirichlet values visualization (if available)
-        if data.x.shape[1] > 7:  # Has Dirichlet data (8th feature)
-            dirichlet_values = data.x[
-                :, 7
-            ].numpy()  # Dirichlet values are 8th feature (index 7)
-            dirichlet_mask = aux["dirichlet_mask"]
-
-            # Only show non-zero Dirichlet values or Dirichlet boundary nodes
-            if dirichlet_mask.any() or (dirichlet_values != 0).any():
-                # Create scatter plot colored by Dirichlet values
-                scatter = ax4.scatter(
-                    data.pos[:, 0].numpy(),
-                    data.pos[:, 1].numpy(),
-                    c=dirichlet_values,
-                    cmap="plasma",
-                    s=node_size,
-                    alpha=0.8,
-                )
-
-                # Add colorbar
-                cbar = plt.colorbar(scatter, ax=ax4)
-                cbar.set_label("Dirichlet Values")
-
-                # Highlight Dirichlet boundary nodes with blue circles
-                if dirichlet_mask.any():
-                    dirichlet_indices = torch.where(dirichlet_mask)[0]
-                    dirichlet_pos = data.pos[dirichlet_indices].numpy()
-                    ax4.scatter(
-                        dirichlet_pos[:, 0],
-                        dirichlet_pos[:, 1],
-                        s=node_size * 2,
-                        facecolors="none",
-                        edgecolors="blue",
-                        linewidth=2,
-                    )
-
-                ax4.set_title(
-                    f"Dirichlet Values\\nRange: [{dirichlet_values.min():.3f}, {dirichlet_values.max():.3f}]"
-                )
-            else:
-                ax4.text(
-                    0.5,
-                    0.5,
-                    "No Dirichlet values\\navailable",
-                    ha="center",
-                    va="center",
-                    transform=ax4.transAxes,
-                    fontsize=12,
-                )
-                ax4.set_title("Dirichlet Values (N/A)")
-        else:
-            ax4.text(
-                0.5,
-                0.5,
-                "No Dirichlet data\\navailable",
-                ha="center",
-                va="center",
-                transform=ax4.transAxes,
-                fontsize=12,
-            )
-            ax4.set_title("Dirichlet Values (N/A)")
-
-        ax4.set_aspect("equal")
-        ax4.axis("off")
-
-        plt.tight_layout()
+        # ax1.legend(handles=legend_elements, loc="upper right", bbox_to_anchor=(1, 1))
 
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches="tight")
