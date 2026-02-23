@@ -57,7 +57,7 @@ class PIMGNTrainerEM:
         material_field = getattr(first_problem, "material_field", None)
         sigma_field = getattr(first_problem, "sigma_field", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
-        current_density = getattr(first_problem, "current_density_field", None)
+        current = getattr(first_problem, "I_coil", None)
         coil_node_mask = getattr(first_problem, "coil_node_mask", None)
 
         sample_data, aux = graph_creator.create_graph(
@@ -65,7 +65,7 @@ class PIMGNTrainerEM:
             material_node_field=material_field,
             sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
-            current_density=current_density,
+            current=current,
             coil_node_mask=coil_node_mask,
         )
 
@@ -289,7 +289,7 @@ class PIMGNTrainerEM:
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
-        current_density = getattr(problem, "current_density_field", None)
+        current = getattr(problem, "I_coil", None)
         coil_node_mask = getattr(problem, "coil_node_mask", None)
 
         self.optimizer.zero_grad()
@@ -300,7 +300,7 @@ class PIMGNTrainerEM:
             material_node_field=material_field,
             sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
-            current_density=current_density,
+            current=current,
             coil_node_mask=coil_node_mask,
         )
 
@@ -549,7 +549,7 @@ class PIMGNTrainerEM:
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
-        current_density = getattr(problem, "current_density_field", None)
+        current = getattr(problem, "I_coil", None)
         coil_node_mask = getattr(problem, "coil_node_mask", None)
 
         with torch.no_grad():
@@ -559,7 +559,7 @@ class PIMGNTrainerEM:
                 material_node_field=material_field,
                 sigma_field=sigma_field,
                 dirichlet_values=dirichlet_vals,
-                current_density=current_density,
+                current=current,
                 coil_node_mask=coil_node_mask,
             )
 
@@ -887,16 +887,16 @@ def train_pimgn_em_multi(resume_from: str = None):
     """Train PIMGN-EM on multiple problems simultaneously."""
     # Create a list of problems with different configurations
     problems = [
-        create_em_mixed(i_coil=1000),
-        create_em_mixed(i_coil=2000),
-        create_em_mixed(i_coil=3000),
+        create_em_mixed(i_coil=1000, h_workpiece=8e-3, h_air=0.3, h_coil=3e-3),
+        create_em_mixed(i_coil=2000, h_workpiece=8e-3, h_air=0.3, h_coil=3e-3),
+        create_em_mixed(i_coil=3000, h_workpiece=8e-3, h_air=0.3, h_coil=3e-3),
     ]
     # Assign unique problem IDs
     for i, p in enumerate(problems):
         p.problem_id = i
 
     config = {
-        "epochs": 10000,
+        "epochs": 20000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_multi",

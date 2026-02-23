@@ -314,7 +314,7 @@ def _build_node_features(
     node_types: torch.Tensor,
     pos: torch.Tensor,
     A_current: Optional[np.ndarray],
-    current_density: Optional[np.ndarray],
+    current: float,
     material_field: Optional[np.ndarray],
     sigma_field: Optional[np.ndarray],
     dirichlet_values: Optional[np.ndarray],
@@ -348,6 +348,12 @@ def _build_node_features(
     # Omega scalar (broadcasted to all nodes)
     # omega_tensor = torch.full((n_nodes, 1), omega, dtype=torch.float32, device=device)
     # features.append(omega_tensor)
+
+    # current scalar (broadcasted to all nodes)
+    if current is None:
+        current = 0.0
+    current_tensor = torch.ones(n_nodes, 1, device=device) * current
+    features.append(current_tensor)
 
     # Material field
     if material_field is not None:
@@ -511,7 +517,7 @@ class GraphCreatorEM:
     def create_graph(
         self,
         A_current: Optional[np.ndarray] = None,
-        current_density: Optional[np.ndarray] = None,
+        current: Optional[float] = None,
         material_node_field: Optional[np.ndarray] = None,
         sigma_field: Optional[np.ndarray] = None,
         dirichlet_values: Optional[np.ndarray] = None,
@@ -558,7 +564,7 @@ class GraphCreatorEM:
             node_types,
             pos_tensor,
             A_current,
-            current_density,
+            current,
             material_node_field,
             sigma_field,
             dirichlet_values,
@@ -581,7 +587,7 @@ class GraphCreatorEM:
             "interior_mask": node_types == 1,
             "free_mask": node_types != 0,  # Non-Dirichlet nodes (i.e., interior)
             "dirichlet_values": dirichlet_values,
-            "current_density": current_density,
+            "current": current,
             "mesh": self.mesh,
             "connectivity_method": self.connectivity_method,
         }

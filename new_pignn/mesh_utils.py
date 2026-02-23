@@ -82,7 +82,7 @@ def create_lshape_mesh(
     return ng.Mesh(ngmesh)
 
 
-def create_ih_mesh(overwrite_r_star = False):
+def create_ih_mesh(overwrite_r_star = False, h_workpiece = 5e-4, h_air = 60e-3, h_coil = 1e-3):
     # Normalization constants
     r_star = 70 * 1e-3  # m
     if overwrite_r_star:
@@ -115,7 +115,7 @@ def create_ih_mesh(overwrite_r_star = False):
             bottom="bc_workpiece_bottom",
         )
         .Mat("mat_workpiece")
-        .Maxh(5e-4 / r_star)
+        .Maxh(h_workpiece / r_star)
     )
 
     rect_air = (
@@ -127,7 +127,7 @@ def create_ih_mesh(overwrite_r_star = False):
             left="bc_axis",
         )
         .Mat("mat_air")
-        .Maxh(60e-3 / r_star)
+        .Maxh(h_air / r_star)
     )
     rect_coil = (
         Rectangle(
@@ -140,7 +140,7 @@ def create_ih_mesh(overwrite_r_star = False):
             bc="bc_coil",
         )
         .Mat("mat_coil")
-        .Maxh(1e-3 / r_star)
+        .Maxh(h_coil / r_star)
     )
 
     workpiece = rect_workpiece * rect_air

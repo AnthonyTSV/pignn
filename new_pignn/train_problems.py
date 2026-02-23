@@ -1013,7 +1013,7 @@ def create_em_problem_complex():
 
     return problem
 
-def create_em_mixed(i_coil: float = 1000):
+def create_em_mixed(i_coil: float = 1000, h_workpiece = 5e-4, h_air = 60e-3, h_coil = 1e-3):
 
     r_star = 70 * 1e-3  # m
     A_star = 4.8 * 1e-4  # Wb/m
@@ -1025,7 +1025,7 @@ def create_em_mixed(i_coil: float = 1000):
 
     from graph_creator_em import GraphCreatorEM
 
-    mesh = create_ih_mesh()
+    mesh = create_ih_mesh(h_workpiece=h_workpiece, h_air=h_air, h_coil=h_coil)
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
