@@ -903,7 +903,7 @@ def create_em_problem_complex():
 
     from graph_creator_em import GraphCreatorEM
 
-    mesh = create_ih_mesh(h_workpiece=2e-3, h_air=60e-3, h_coil=0.693e-3)
+    mesh = create_ih_mesh(h_workpiece=5e-3, h_air=60e-3, h_coil=1e-3)
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}

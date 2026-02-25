@@ -307,10 +307,9 @@ class PIMGNTrainerEM:
                     else dirichlet_vals_float[dirichlet_mask]
                 )
                 prediction_full_Aimag[dirichlet_mask] = 0
-            residual = fem_solver.compute_complex_energy_norm_loss(
+            residual = fem_solver.compute_complex_residual(
                 prediction_full_Areal,
                 prediction_full_Aimag,
-                normalize="rhs",
             )
         else:
             prediction_full_real = torch.zeros(
@@ -1040,7 +1039,7 @@ def train_pimgn_on_single_problem(resume_from: str = None):
 def train_pimgn_em_complex(resume_from: str = None):
     problem = create_em_problem_complex()
     config = {
-        "epochs": 5000,
+        "epochs": 10000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem_complex",
@@ -1071,33 +1070,33 @@ def train_pimgn_em_complex(resume_from: str = None):
 #     _run_single_problem_experiment(problem, config, "First order EM Mixed")
 
 
-def train_pimgn_em_multi(resume_from: str = None):
-    """Train PIMGN-EM on multiple problems simultaneously."""
-    # Create a list of problems with different configurations
-    problems = [
-        create_em_mixed(i_coil=1000, h_workpiece=8e-3, h_air=0.3, h_coil=3e-3),
-        create_em_mixed(i_coil=2000, h_workpiece=8e-3, h_air=0.3, h_coil=3e-3),
-        create_em_mixed(i_coil=3000, h_workpiece=8e-3, h_air=0.3, h_coil=3e-3),
-    ]
-    # Assign unique problem IDs
-    for i, p in enumerate(problems):
-        p.problem_id = i
+# def train_pimgn_em_multi(resume_from: str = None):
+#     """Train PIMGN-EM on multiple problems simultaneously."""
+#     # Create a list of problems with different configurations
+#     problems = [
+#         create_em_mixed(i_coil=1000, h_workpiece=8e-3, h_air=0.3, h_coil=3e-3),
+#         create_em_mixed(i_coil=2000, h_workpiece=8e-3, h_air=0.3, h_coil=3e-3),
+#         create_em_mixed(i_coil=3000, h_workpiece=8e-3, h_air=0.3, h_coil=3e-3),
+#     ]
+#     # Assign unique problem IDs
+#     for i, p in enumerate(problems):
+#         p.problem_id = i
 
-    config = {
-        "epochs": 20000,
-        "lr": 1e-3,
-        "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/test_em_multi",
-        "resume_from": resume_from,
-        "save_interval": 1000,
-        "phi_weight": 0.1,
-        "data_weight": 0.0,
-        "data_weight_decay": 0.9995,
-    }
-    train_indices = list(range(len(problems)))
-    _run_experiment(
-        problems, config, "Multi-problem EM Mixed", train_indices=train_indices
-    )
+#     config = {
+#         "epochs": 20000,
+#         "lr": 1e-3,
+#         "generate_ground_truth_for_validation": False,
+#         "save_dir": "results/physics_informed/test_em_multi",
+#         "resume_from": resume_from,
+#         "save_interval": 1000,
+#         "phi_weight": 0.1,
+#         "data_weight": 0.0,
+#         "data_weight_decay": 0.9995,
+#     }
+#     train_indices = list(range(len(problems)))
+#     _run_experiment(
+#         problems, config, "Multi-problem EM Mixed", train_indices=train_indices
+#     )
 
 
 if __name__ == "__main__":
