@@ -759,6 +759,7 @@ class PIMGNTrainer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "losses": self.losses,
             "val_losses": self.val_losses,
+            "time_window": self.time_window,
         }
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to: {path}")

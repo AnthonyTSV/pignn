@@ -4,11 +4,6 @@ from typing import Optional, Tuple, List
 import torch
 import ngsolve as ng
 
-r_star = 70 * 1e-3  # m
-A_star = 4.8 * 1e-4  # Wb/m
-mu_star = 4 * 3.1415926535e-7 # H/m
-J_star = A_star / (r_star**2 * mu_star)
-
 class MeshProblem:
     """Container for a single training problem with mesh, initial condition, and physics parameters."""
 
@@ -134,12 +129,26 @@ class MeshProblemEM:
         self.current_density_field = None  # To be set (current density at each node)
 
         ###
-        
+
+        # Coil parameters
+        self.N_turns = 1  # Number of turns
+        self.I_coil = 1000  # A
+        self.frequency = 8000  # Hz
+        self.fill_factor = 1.0
+
+        # Normalisation factors
+        self.r_star = 70 * 1e-3  # m
+        self.A_star = 4.8 * 1e-4  # Wb/m
+        self.mu_star = 4 * 3.1415926535e-7  # H/m
+        self.J_star = self.A_star / (self.r_star**2 * self.mu_star)
+        self.omega = 2 * ng.pi * self.frequency  # rad/s
+        self.sigma_star = self.J_star / (self.omega * self.A_star)
+
         self.profile_width_phys = 7 * 1e-3
         self.profile_height_phys = 7 * 1e-3
 
-        self.profile_width = 7 * 1e-3 / r_star  # m
-        self.profile_height = 7 * 1e-3 / r_star  # m
+        self.profile_width = 7 * 1e-3  # m
+        self.profile_height = 7 * 1e-3  # m
 
         # In the nondimensionalized system, mu0 = 1 (dimensionless)
         # because we scaled by mu_star = mu0
@@ -152,13 +161,9 @@ class MeshProblemEM:
         self.sigma_air = 0.0
         self.sigma_coil = 5.8e7
 
-        # Coil parameters
-        self.N_turns = 1  # Number of turns
-        self.I_coil = 1000  # A
-        self.frequency = 1000  # Hz
-        self.omega = 2 * ng.pi * self.frequency  # rad/s
-        self.kappa = self.omega * mu_star * (r_star**2)  # Nondimensional frequency
+        self.kappa = self.omega * self.mu_star * (self.r_star**2)  # Nondimensional frequency
         self.complex = True
+        self.mixed = False
 
     def set_material_properties(self, material_properties: dict):
         """Set material properties."""

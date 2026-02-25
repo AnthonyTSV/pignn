@@ -11,14 +11,6 @@ TensorLike = Union[np.ndarray, torch.Tensor]
 NormalizeMode = Literal["none", "ndof", "rhs"]
 EnergyInvMode = Literal["jacobi", "cg"]
 
-r_star = 70 * 1e-3  # m
-A_star = 4.8 * 1e-4  # Wb/m
-mu_star = 4 * 3.1415926535e-7  # H/m
-J_star = A_star / (r_star**2 * mu_star)
-frequency = 1000  # Hz
-omega = 2 * ng.pi * frequency  # rad/s
-sigma_star = J_star / (omega * A_star)
-
 
 def _sparse_diag(A: torch.Tensor) -> torch.Tensor:
     """
@@ -105,12 +97,16 @@ class FEMSolverEM:
         self.fes = None
 
         self.problem = problem
-        # if problem is not None:
-        #     if problem.complex:
-        #         self.init_complex_matrices()
-        #     else:
-        #         self.init_matrices()
-        self.init_mixed_matrices()
+        if problem is not None:
+            if problem.complex:
+                # A only
+                self.init_complex_matrices()
+            elif problem.mixed:
+                # currently not used, as it doesn't converge, but maybe later
+                # A-phi mixed formulation
+                self.init_mixed_matrices()
+            else:
+                self.init_matrices()
 
     def init_matrices(self):
         if self.problem is None:
@@ -140,7 +136,6 @@ class FEMSolverEM:
             dirichlet=self.problem.mesh_config.dirichlet_pipe,
         )
         A, v = fes.TnT()
-        gfA = ng.GridFunction(fes)
 
         r = ng.x
         dr_rA = r * ng.grad(A)[0] + A
@@ -157,7 +152,7 @@ class FEMSolverEM:
         # a += 1j * self.problem.omega * sigma * r * A * v * ng.dx
         Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
-        Js_phi = Js_phi / J_star  # Normalize current density
+        Js_phi = Js_phi / self.problem.J_star  # Normalize current density
         print("Normalized current density Js_phi:", Js_phi)
         f = ng.LinearForm(fes)
         f += r * Js_phi * v * ng.dx("mat_coil")
@@ -166,14 +161,16 @@ class FEMSolverEM:
         f.Assemble()
 
         self.bilinear_form = self._ngsolve_to_torch(a.mat)
+        f_np = f.vec.FV().NumPy().copy()
         self.linear_form = torch.tensor(
-            f.vec.FV().NumPy().copy(), dtype=torch.float64
+            np.real(f_np) if np.iscomplexobj(f_np) else f_np, dtype=torch.float64
         ).to(self.device)
         self.fes = fes
 
     def init_complex_matrices(self):
         if self.problem is None:
             raise ValueError("Problem must be set before initializing matrices")
+
         # Define material properties as coefficient functions
         mu_r = self.mesh.MaterialCF(
             {
@@ -199,29 +196,30 @@ class FEMSolverEM:
             dirichlet=self.problem.mesh_config.dirichlet_pipe,
         )
         A, v = fes.TnT()
-        gfA = ng.GridFunction(fes)
 
+        r_star = self.problem.r_star
+        jac = 1.0 / (r_star**2)
         r = ng.x
+        r_hat = ng.x / r_star
         dr_rA = r * ng.grad(A)[0] + A
         dr_rv = r * ng.grad(v)[0] + v
         dzA, dzv = ng.grad(A)[1], ng.grad(v)[1]
 
         # Avoid 1/r singularity on the symmetry axis (r=0)
         inv_r = ng.IfPos(r, 1.0 / r, 0.0)
+        r1_nd = ng.IfPos(r, 1.0 / (r * r_star), 0.0)
 
         nu = 1.0 / (self.problem.mu0 * mu_r)
 
         a = ng.BilinearForm(fes, symmetric=False)
-        a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
-        # Eddy current term: applied to all conductive regions (including workpiece)
-        # In induction heating, eddy currents are induced in conductive materials
-        a += 1j * sigma * r * A * v * ng.dx
+        a += nu * (r_hat * dzA * dzv + r1_nd * dr_rA * dr_rv) * ng.dx
+        a += 1j * sigma * (r_hat * jac) * A * v * ng.dx
         Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
-        Js_phi = Js_phi / J_star  # Normalize current density
+        Js_phi = Js_phi / self.problem.J_star  # Normalize current density
         print("Normalized current density Js_phi:", Js_phi)
         f = ng.LinearForm(fes)
-        f += r * Js_phi * v * ng.dx("mat_coil")
+        f += (r_hat * jac) * Js_phi * v * ng.dx("mat_coil")
 
         a.Assemble()
         f.Assemble()
@@ -229,13 +227,17 @@ class FEMSolverEM:
         k_real, k_imag = self._ngsolve_to_torch(a.mat)
 
         self.bilinear_form = (k_real, k_imag)
+        f_np = f.vec.FV().NumPy().copy()
         self.linear_form = torch.tensor(
-            f.vec.FV().NumPy().copy(), dtype=torch.float64
+            np.real(f_np), dtype=torch.float64
         ).to(self.device)
         self.fes = fes
 
     def init_mixed_matrices(self):
-        """Initialize matrices for A-φ mixed formulation."""
+        """
+        Initialize matrices for A-φ mixed formulation.
+        NOTE: NOT SCALED CORRECTLY
+        """
         # FE spaces
         fes_a = ng.H1(
             self.mesh,
@@ -294,7 +296,7 @@ class FEMSolverEM:
         I_spec = self.problem.N_turns * self.problem.I_coil
         area_coil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = I_spec / area_coil
-        Js_phi = Js_phi / J_star  # Normalize current density
+        Js_phi = Js_phi / self.problem.J_star  # Normalize current density
         print("Normalized current density Js_phi:", Js_phi)
 
         f = ng.LinearForm(fes)
@@ -317,8 +319,9 @@ class FEMSolverEM:
 
         k_real, k_imag = self._ngsolve_to_torch(a.mat)
         self.bilinear_form = (k_real, k_imag)
+        f_np = f.vec.FV().NumPy().copy()
         self.linear_form = torch.tensor(
-            f.vec.FV().NumPy().copy(), dtype=torch.float64
+            np.real(f_np) if np.iscomplexobj(f_np) else f_np, dtype=torch.float64
         ).to(self.device)
 
     def _build_node_to_phi_dof_mapping(self):
@@ -418,27 +421,31 @@ class FEMSolverEM:
         A, v = fes.TnT()
         gfA = ng.GridFunction(fes)
 
+        r_star = self.problem.r_star
         r = ng.x
+        r_hat = ng.x / r_star
+        jac = 1.0 / (r_star**2)
         dr_rA = r * ng.grad(A)[0] + A
         dr_rv = r * ng.grad(v)[0] + v
         dzA, dzv = ng.grad(A)[1], ng.grad(v)[1]
 
         # Avoid 1/r singularity on the symmetry axis (r=0)
         inv_r = ng.IfPos(r, 1.0 / r, 0.0)
+        r1_nd = ng.IfPos(r, 1.0 / (r * r_star), 0.0)
 
         # In normalized form: nu = 1/(mu0_normalized * mu_r) = 1/(1 * mu_r) = 1/mu_r
         nu = 1.0 / (self.problem.mu0 * mu_r)
 
         a = ng.BilinearForm(fes, symmetric=False)
-        a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
+        a += nu * (r_hat * dzA * dzv + r1_nd * dr_rA * dr_rv) * ng.dx
         # Eddy current term: applied to all conductive regions (including workpiece)
-        a += 1j * sigma * r * A * v * ng.dx
+        a += 1j * sigma * (r_hat * jac) * A * v * ng.dx
         Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
-        Js_phi = Js_phi / J_star  # Normalize current density
+        Js_phi = Js_phi / self.problem.J_star  # Normalize current density
         print("Normalized current density Js_phi:", Js_phi)
         f = ng.LinearForm(fes)
-        f += r * Js_phi * v * ng.dx("mat_coil")
+        f += (r_hat * jac) * Js_phi * v * ng.dx("mat_coil")
 
         a.Assemble()
         f.Assemble()
@@ -521,7 +528,7 @@ class FEMSolverEM:
         I_spec = problem.N_turns * problem.I_coil
         area_coil = problem.profile_width_phys * problem.profile_height_phys
         Js_phi = I_spec / area_coil
-        Js_phi = Js_phi / J_star  # Normalize current density
+        Js_phi = Js_phi / self.problem.J_star  # Normalize current density
 
         f = ng.LinearForm(fes)
         f += (-Js_phi) * psi * ng.dx("mat_coil")
@@ -715,7 +722,7 @@ class FEMSolverEM:
         energy_inv: EnergyInvMode = "jacobi",
         cg_max_iter: int = 30,
         cg_tol: float = 1e-10,
-        normalize: NormalizeMode = "rhs",
+        normalize: NormalizeMode = "ndof",
         eps: float = 1e-12,
     ) -> torch.Tensor:
         """
@@ -763,17 +770,14 @@ class FEMSolverEM:
             y_full = torch.sparse.mm(Kr, x_full.unsqueeze(1)).squeeze(1)
             return y_full[free_mask]
 
-        # Build diagonal preconditioner using |diag(K)| = sqrt(diag(Kr)^2 + diag(Ki)^2)
-        # for robustness when Kr may have zero diagonal entries.
-        diag_kr = _sparse_diag(Kr).to(dtype=torch.float64, device=rr.device)
-        diag_ki = _sparse_diag(Ki).to(dtype=torch.float64, device=rr.device)
-        diag_abs = torch.sqrt(diag_kr ** 2 + diag_ki ** 2)
-        diag_free = diag_abs[free_mask].clamp_min(eps)
+        # Jacobi preconditioner: diag(Kr) — shared by both jacobi and cg branches,
+        # and also used for rhs normalization.
+        diag_full = _sparse_diag(Kr).to(dtype=torch.float64, device=rr.device)
+        diag_free = diag_full[free_mask].clamp_min(eps)
 
         def Minv(v_free: torch.Tensor) -> torch.Tensor:
             return v_free / diag_free
 
-        # Define approximate inverse application
         if energy_inv == "jacobi":
             wr = Minv(rr)
             wi = Minv(ri)
@@ -804,7 +808,7 @@ class FEMSolverEM:
             return loss
 
         if normalize == "rhs":
-            # Scale by energy-norm of RHS on free DOFs (same inverse approx)
+            # Scale by energy-norm of RHS on free DOFs
             fr = self.linear_form[free_mask]
             rhs_energy = torch.dot(fr, Minv(fr)).clamp_min(eps)
             return loss / rhs_energy
@@ -1430,44 +1434,44 @@ def previous_em():
         residuals_abs = np.absolute(residual.cpu().numpy())
         print(f"Mean residual: {np.mean(residuals_abs)}")
 
-    # fem_solver.export_to_vtk(
-    #     curl_gfa,
-    #     curl_gfa,
-    #     filename="results/fem_tests_em/vtk/result",
-    # )
-
-def mixed_em():
-    import ngsolve as ng
-    from containers import MeshProblemEM
-    from graph_creator import GraphCreator
-    from train_problems import create_em_mixed
-
-    problem = create_em_mixed()
-
-    # Initialize FEM solver
-    fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
-
-    gfA, gfPhi, r1 = fem_solver.solve_mixed_em(problem)
-    # E_phi = -1j * problem.omega * (gfA + gfPhi * r1)
-
-    # fem_solver.export_to_vtk_complex(
-    #     gfA.vec.FV().NumPy(),
-    #     gfA.vec.FV().NumPy(),
-    #     filename="results/fem_tests_em/vtk/mixed_result",
-    # )
-
-    residual = fem_solver.compute_mixed_energy_norm_loss(
-        pred_sol_a_real=gfA.vec.FV().NumPy().real,
-        pred_sol_a_imag=gfA.vec.FV().NumPy().imag,
-        pred_sol_phi_real=gfPhi.vec.FV().NumPy().real,
-        pred_sol_phi_imag=gfPhi.vec.FV().NumPy().imag,
-        energy_inv="jacobi",
-        normalize="ndof",
+    fem_solver.export_to_vtk_complex(
+        gfA,
+        gfA,
+        filename="results/fem_tests_em/vtk/result",
     )
-    print(f"Mixed formulation energy norm residual: {residual.item()}")
+
+# def mixed_em():
+#     import ngsolve as ng
+#     from containers import MeshProblemEM
+#     from graph_creator import GraphCreator
+#     from train_problems import create_em_mixed, create_em_problem_complex
+
+#     problem = create_em_mixed()
+
+#     # Initialize FEM solver
+#     fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
+
+#     gfA, gfPhi, r1 = fem_solver.solve_mixed_em(problem)
+#     # E_phi = -1j * problem.omega * (gfA + gfPhi * r1)
+
+#     # fem_solver.export_to_vtk_complex(
+#     #     gfA.vec.FV().NumPy(),
+#     #     gfA.vec.FV().NumPy(),
+#     #     filename="results/fem_tests_em/vtk/mixed_result",
+#     # )
+
+#     residual = fem_solver.compute_mixed_energy_norm_loss(
+#         pred_sol_a_real=gfA.vec.FV().NumPy().real,
+#         pred_sol_a_imag=gfA.vec.FV().NumPy().imag,
+#         pred_sol_phi_real=gfPhi.vec.FV().NumPy().real,
+#         pred_sol_phi_imag=gfPhi.vec.FV().NumPy().imag,
+#         energy_inv="jacobi",
+#         normalize="ndof",
+#     )
+#     print(f"Mixed formulation energy norm residual: {residual.item()}")
 
 
 if __name__ == "__main__":
 
-    # previous_em()
-    mixed_em()
+    previous_em()
+    # mixed_em()

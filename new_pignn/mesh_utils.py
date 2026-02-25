@@ -82,25 +82,17 @@ def create_lshape_mesh(
     return ng.Mesh(ngmesh)
 
 
-def create_ih_mesh(overwrite_r_star = False, h_workpiece = 5e-4, h_air = 60e-3, h_coil = 1e-3):
-    # Normalization constants
-    r_star = 70 * 1e-3  # m
-    if overwrite_r_star:
-        r_star = 1
-    A_star = 4.8 * 1e-4  # Wb/m
-    mu_star = 4 * 3.1415926535e-7 # H/m
-    J_star = A_star / (r_star**2 * mu_star)
+def create_ih_mesh(h_workpiece = 5e-4, h_air = 60e-3, h_coil = 1e-3):
 
+    workpiece_diameter = 15 * 1e-3  # m
+    workpiece_height = 70 * 1e-3  # m
 
-    workpiece_diameter = 15 * 1e-3 / r_star  # m
-    workpiece_height = 70 * 1e-3 / r_star  # m
-
-    coil_diameter = 22 * 1e-3 / r_star  # m outer
-    profile_width = 7 * 1e-3 / r_star  # m
-    profile_height = 7 * 1e-3 / r_star  # m
+    coil_diameter = 25 * 1e-3  # m outer
+    profile_width = 7 * 1e-3  # m
+    profile_height = 7 * 1e-3  # m
 
     air_height = 3 * workpiece_height  # m
-    air_width = 0.12 / r_star  # m
+    air_width = 0.12  # m
 
     geo = CSG2d()
 
@@ -115,7 +107,7 @@ def create_ih_mesh(overwrite_r_star = False, h_workpiece = 5e-4, h_air = 60e-3, 
             bottom="bc_workpiece_bottom",
         )
         .Mat("mat_workpiece")
-        .Maxh(h_workpiece / r_star)
+        .Maxh(h_workpiece)
     )
 
     rect_air = (
@@ -127,7 +119,7 @@ def create_ih_mesh(overwrite_r_star = False, h_workpiece = 5e-4, h_air = 60e-3, 
             left="bc_axis",
         )
         .Mat("mat_air")
-        .Maxh(h_air / r_star)
+        .Maxh(h_air)
     )
     rect_coil = (
         Rectangle(
@@ -140,7 +132,7 @@ def create_ih_mesh(overwrite_r_star = False, h_workpiece = 5e-4, h_air = 60e-3, 
             bc="bc_coil",
         )
         .Mat("mat_coil")
-        .Maxh(h_coil / r_star)
+        .Maxh(h_coil)
     )
 
     workpiece = rect_workpiece * rect_air

@@ -113,6 +113,7 @@ class MeshGraphNet(nn.Module):
         input_dim_global: int = 0,
         num_layers: int = 12,
         complex_em: bool = False,
+        mixed_em: bool = False,
     ):
         super(MeshGraphNet, self).__init__()
 
@@ -120,8 +121,8 @@ class MeshGraphNet(nn.Module):
 
         self.input_dim_node = input_dim_node
         self.input_dim_edge = input_dim_edge
-        self.hidden_dim = hidden_dim # latent dimension
-        self.output_dim = output_dim # predict multiple time steps
+        self.hidden_dim = hidden_dim  # latent dimension
+        self.output_dim = output_dim  # predict multiple time steps
 
         # Number of message passing layers
         self.num_layers = num_layers
@@ -138,6 +139,7 @@ class MeshGraphNet(nn.Module):
             [MeshGraphNetLayer(hidden_dim) for _ in range(self.num_layers)]
         )
         self.complex_em = complex_em
+        self.mixed_em = mixed_em
         self._build_output_head()
 
     def _build_output_head(self):
@@ -180,6 +182,18 @@ class MeshGraphNet(nn.Module):
         self.output_head = nn.Linear(self.hidden_dim, T)
 
         if self.complex_em:
+            # For complex EM, we predict only A
+            self.output_dim = 2  # [A_real, A_imag]
+            self.output_head = nn.Linear(self.hidden_dim, self.output_dim)
+            # self.decoder_A = nn.Sequential(
+            #     nn.Linear(self.hidden_dim, self.hidden_dim),
+            #     nn.ReLU(),
+            #     nn.Linear(self.hidden_dim, 2),
+            # )
+            # # Learnable output scale initialized to expected solution magnitude (A ~ 1.0)
+            # self.output_scale_A = nn.Parameter(torch.tensor([1.0, 1.0]))
+
+        if self.mixed_em:
             self.decoder_A = nn.Sequential(
                 nn.Linear(self.hidden_dim, self.hidden_dim),
                 nn.ReLU(),
@@ -191,13 +205,13 @@ class MeshGraphNet(nn.Module):
                 nn.Linear(self.hidden_dim, 2),
             )
             self.output_dim = 4  # [A_real, A_imag, phi_real, phi_imag]
-            
+
             # Learnable output scales - initialized to expected solution magnitude
             # This helps with gradient flow when starting from near-zero outputs
             # Default: A ~ 1.0, phi ~ 0.4
             self.output_scale_A = nn.Parameter(torch.tensor([1.0, 1.0]))
             self.output_scale_phi = nn.Parameter(torch.tensor([0.4, 0.4]))
-            
+
             # Initialize decoder biases to small non-zero values for symmetry breaking
             # This ensures gradients flow from the start
             self._init_complex_decoders()
@@ -205,7 +219,7 @@ class MeshGraphNet(nn.Module):
     def _init_complex_decoders(self):
         """
         Initialize decoders for complex EM to ensure proper gradient flow.
-        
+
         The key insight: At zero output, the A equation has zero residual (no source term),
         so gradients for A_real are zero. We initialize with small non-zero biases
         to break this symmetry and allow learning from the start.
@@ -213,19 +227,19 @@ class MeshGraphNet(nn.Module):
         # Get the final linear layers
         final_A = self.decoder_A[-1]
         final_phi = self.decoder_phi[-1]
-        
+
         # Initialize biases to small random values (not zero)
         # This breaks symmetry and provides gradients for all components
         with torch.no_grad():
             # Small random initialization centered at 0.1 for real parts, 0 for imag
             final_A.bias.data = torch.tensor([0.1, 0.05])
             final_phi.bias.data = torch.tensor([0.05, 0.02])
-            
+
             # Slightly increase weight magnitude for better gradient flow
             final_A.weight.data *= 2.0
             final_phi.weight.data *= 2.0
 
-    def forward(self, data: Data, coil_mask = None) -> torch.Tensor:
+    def forward(self, data: Data, coil_mask=None) -> torch.Tensor:
         """
         Args:
             data.x:          [N, input_dim_node]
@@ -257,9 +271,7 @@ class MeshGraphNet(nn.Module):
                 g_in = g_in.unsqueeze(0)
             g = self.global_encoder(g_in)  # [B, 128]
         else:
-            g = x.new_zeros(
-                (B, self.hidden_dim)
-            )
+            g = x.new_zeros((B, self.hidden_dim))
 
         # Processor stack
         for layer in self.gnn_layers:
@@ -269,17 +281,22 @@ class MeshGraphNet(nn.Module):
         if self.use_cnn:
             out = self.output_head(x.unsqueeze(1)).squeeze(1)  # [N, T]
         else:
-            if not self.complex_em:
+            if self.complex_em:
+                out = self.output_head(x)  # [N, 2] -> (A_real, A_imag)
+                # A_out = self.decoder_A(x)  # [N, 2] -> (A_real, A_imag)
+                # out = A_out * self.output_scale_A  # For complex EM, we only predict A
+            if self.mixed_em:
                 out = self.output_head(x)  # [N, T]
-            else:
                 A_out = self.decoder_A(x)  # [N, 2] -> (A_real, A_imag)
                 phi_out = self.decoder_phi(x)  # [N, 2] -> (phi_real, phi_imag)
-                
+
                 # Apply learnable output scaling for proper magnitude
-                A_scaled = A_out # * self.output_scale_A
-                phi_scaled = phi_out # * self.output_scale_phi
-                
-                out = torch.zeros((x.size(0), self.output_dim), device=x.device, dtype=x.dtype)
+                A_scaled = A_out  # * self.output_scale_A
+                phi_scaled = phi_out  # * self.output_scale_phi
+
+                out = torch.zeros(
+                    (x.size(0), self.output_dim), device=x.device, dtype=x.dtype
+                )
                 # Match trainer expectation: [A_real, A_imag, phi_real, phi_imag]
                 out[:, 0] = A_scaled[:, 0]
                 out[:, 1] = A_scaled[:, 1]

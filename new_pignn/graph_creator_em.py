@@ -313,13 +313,10 @@ def _build_knn_connectivity(
 def _build_node_features(
     node_types: torch.Tensor,
     pos: torch.Tensor,
-    A_current: Optional[np.ndarray],
-    current: float,
     material_field: Optional[np.ndarray],
-    sigma_field: Optional[np.ndarray],
     dirichlet_values: Optional[np.ndarray],
-    omega: float,
     n_nodes: int,
+    r_star: float,
     device: torch.device = None,
 ) -> torch.Tensor:
     if device is None:
@@ -329,31 +326,12 @@ def _build_node_features(
 
     # Position features (r, z coordinates)
     # pos is already a torch tensor on the correct device
-    features.append(pos)
+    features.append(pos / r_star)
 
     # One-hot encoding of node types (Dirichlet=0, Interior=1)
     node_type_onehot = torch.zeros(n_nodes, 2, device=device)
     node_type_onehot[torch.arange(n_nodes, device=device), node_types] = 1.0
     features.append(node_type_onehot)
-
-    # Current temperature field
-    # if A_current is not None:
-    #     T_tensor = torch.tensor(
-    #         A_current, dtype=torch.float32, device=device
-    #     ).unsqueeze(1)
-    # else:
-    #     T_tensor = torch.zeros(n_nodes, 1, device=device)
-    # features.append(T_tensor)
-
-    # Omega scalar (broadcasted to all nodes)
-    # omega_tensor = torch.full((n_nodes, 1), omega, dtype=torch.float32, device=device)
-    # features.append(omega_tensor)
-
-    # current scalar (broadcasted to all nodes)
-    if current is None:
-        current = 0.0
-    current_tensor = torch.ones(n_nodes, 1, device=device) * current
-    features.append(current_tensor)
 
     # Material field
     if material_field is not None:
@@ -375,47 +353,18 @@ def _build_node_features(
         )  # Default: homogeneous Dirichlet
     features.append(dirichlet_tensor)
 
-    # Source term values (volumetric heat source)
-    # if current_density is not None:
-    #     if isinstance(current_density, torch.Tensor):
-    #         source_tensor = (
-    #             current_density.detach()
-    #             .clone()
-    #             .to(dtype=torch.float32, device=device)
-    #             .unsqueeze(1)
-    #         )
-    #     else:
-    #         source_tensor = torch.tensor(
-    #             current_density, dtype=torch.float32, device=device
-    #         ).unsqueeze(1)
-    # else:
-    #     source_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no source
-    # features.append(source_tensor)
-
-    # Sigma (conductivity) field
-    # The neural network needs this information to learn where eddy currents occur
-    # if sigma_field is not None:
-    #     # Normalize sigma for better numerical conditioning (log-scale or relative to max)
-    #     sigma_np = np.array(sigma_field, dtype=np.float32)
-    #     sigma_tensor = torch.tensor(
-    #         sigma_np, dtype=torch.float32, device=device
-    #     ).unsqueeze(1)
-    # else:
-    #     sigma_tensor = torch.zeros(n_nodes, 1, device=device)
-    # features.append(sigma_tensor)
-
     return torch.cat(features, dim=1)
 
 
 def _build_edge_features(
     edge_index: torch.Tensor,
     pos: torch.Tensor,
-    A_current: Optional[np.ndarray],
+    r_star: float = 1.0,
     device: torch.device = None,
 ) -> torch.Tensor:
     """
     Build edge feature matrix according to PI-MGN methodology.
-    Features: [relative_vector(2/3), euclidean_distance(1), temp_difference(1)]
+    Features: [relative_vector(2/3), euclidean_distance(1)]
     """
     if device is None:
         device = pos.device
@@ -428,19 +377,10 @@ def _build_edge_features(
     dst_pos = pos[edge_index[1]]  # Target node positions
 
     # Relative position vector (target - source)
-    relative_pos = dst_pos - src_pos
+    relative_pos = (dst_pos - src_pos) / r_star
 
     # Euclidean distance
     euclidean_dist = torch.norm(relative_pos, dim=1, keepdim=True)
-
-    # Temperature difference (if available)
-    # if A_current is not None:
-    #     T_tensor = torch.tensor(A_current, dtype=torch.float32, device=device)
-    #     src_temp = T_tensor[edge_index[0]]
-    #     dst_temp = T_tensor[edge_index[1]]
-    #     temp_diff = (dst_temp - src_temp).unsqueeze(1)
-    # else:
-    #     temp_diff = torch.zeros(edge_index.shape[1], 1, device=device)
 
     # Concatenate all edge features
     edge_features = torch.cat([relative_pos, euclidean_dist], dim=1)
@@ -506,6 +446,7 @@ class GraphCreatorEM:
     def __init__(
         self,
         mesh: ng.Mesh,
+        r_star: float = 1,
         n_neighbors: int = 8,
         dirichlet_names: List[str] = None
     ):
@@ -513,6 +454,7 @@ class GraphCreatorEM:
         self.n_neighbors = n_neighbors
         self.dirichlet_names = dirichlet_names or []
         self.connectivity_method = "fem"
+        self.r_star = r_star
 
     def create_graph(
         self,
@@ -563,18 +505,15 @@ class GraphCreatorEM:
         node_features = _build_node_features(
             node_types,
             pos_tensor,
-            A_current,
-            current,
             material_node_field,
-            sigma_field,
             dirichlet_values,
-            omega,
             n_nodes,
+            self.r_star,
             device,
         )
 
         # 5. Build edge features
-        edge_features = _build_edge_features(edge_index, pos_tensor, A_current, device)
+        edge_features = _build_edge_features(edge_index, pos_tensor, self.r_star, device)
 
         # 6. Build global features
         global_features = _build_global_features(omega, n_nodes, device)

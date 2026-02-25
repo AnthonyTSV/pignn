@@ -901,17 +901,9 @@ def create_em_problem():
 
 def create_em_problem_complex():
 
-    r_star = 70 * 1e-3  # m
-    A_star = 4.8 * 1e-4  # Wb/m
-    mu_star = 4 * 3.1415926535e-7  # H/m
-    J_star = A_star / (r_star**2 * mu_star)
-    frequency = 1000  # Hz
-    omega = 2 * ng.pi * frequency  # rad/s
-    sigma_star = J_star / (omega * A_star)
-
     from graph_creator_em import GraphCreatorEM
 
-    mesh = create_ih_mesh()
+    mesh = create_ih_mesh(h_workpiece=2e-3, h_air=60e-3, h_coil=0.693e-3)
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
@@ -951,33 +943,18 @@ def create_em_problem_complex():
     problem.set_dirichlet_values_array(dirichlet_vals)
     problem.set_dirichlet_values(dirichlet_boundaries_dict)
     problem.complex = True
-    problem.sigma_workpiece = 1e6 / sigma_star
-    problem.sigma_air = 0.0 / sigma_star
-    problem.sigma_coil = 5.8e7 / sigma_star
+    problem.mixed = False
+    problem.sigma_workpiece = 6289308 / problem.sigma_star
+    problem.sigma_air = 0
+    problem.sigma_coil = 0
+    problem.frequency = 8000
+    problem.I_coil = 1000
 
     # Create material fields (mu_r at each node) based on material subdomain
     n_nodes = temp_data.pos.shape[0]
     mu_r_field = np.ones(n_nodes, dtype=np.float64)  # Default to air (mu_r = 1)
     sigma_field = np.zeros(n_nodes, dtype=np.float64) # Default to 0 conductivity
     current_density = np.zeros(n_nodes, dtype=np.float64)
-
-    # Calculate current density in the coil: J = N * I / A_coil
-    Acoil = problem.profile_width_phys * problem.profile_height_phys
-    Js_phi = problem.N_turns * problem.I_coil / Acoil
-    Js_phi = Js_phi / J_star  # Normalize current density
-
-    # Material property mapping (mu_r values)
-    mu_r_map = {
-        "mat_workpiece": problem.mu_r_workpiece,
-        "mat_air": problem.mu_r_air,
-        "mat_coil": problem.mu_r_coil,
-    }
-
-    sigma_map = {
-        "mat_workpiece": problem.sigma_workpiece,
-        "mat_air": problem.sigma_air,
-        "mat_coil": problem.sigma_coil,
-    }
 
     material_encode = {
         "mat_workpiece": 2,
@@ -996,15 +973,6 @@ def create_em_problem_complex():
         for v in vertices:
             node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
             if 0 <= node_idx < n_nodes:
-                # # Assign mu_r based on material region
-                # if mat_name in mu_r_map:
-                #     mu_r_field[node_idx] = mu_r_map[mat_name]
-                # if mat_name in sigma_map:
-                #     sigma_field[node_idx] = sigma_map[mat_name]
-
-                # # Assign current density (only in coil)
-                # if mat_name == "mat_coil":
-                #     current_density[node_idx] = Js_phi
                 mu_r_field[node_idx] = material_encode[mat_name]
 
     problem.material_field = mu_r_field
@@ -1014,14 +982,6 @@ def create_em_problem_complex():
     return problem
 
 def create_em_mixed(i_coil: float = 1000, h_workpiece = 5e-4, h_air = 60e-3, h_coil = 1e-3):
-
-    r_star = 70 * 1e-3  # m
-    A_star = 4.8 * 1e-4  # Wb/m
-    mu_star = 4 * 3.1415926535e-7  # H/m
-    J_star = A_star / (r_star**2 * mu_star)
-    frequency = 1000  # Hz
-    omega = 2 * ng.pi * frequency  # rad/s
-    sigma_star = J_star / (omega * A_star)
 
     from graph_creator_em import GraphCreatorEM
 
