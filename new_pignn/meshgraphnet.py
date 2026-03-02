@@ -302,6 +302,8 @@ class MeshGraphNet(nn.Module):
                 out[:, 1] = A_scaled[:, 1]
                 out[:, 2] = phi_scaled[:, 0]
                 out[:, 3] = phi_scaled[:, 1]
+            else:
+                out = self.output_head(x)  # [N, T]
 
         return out
 

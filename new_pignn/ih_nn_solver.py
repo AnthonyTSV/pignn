@@ -62,7 +62,7 @@ class IHNNSolver:
         boundary_conditions_em: dict[str, BoundaryCondition],
         initial_condition: float,
         material_properties: MaterialPropertiesHeat,
-        material_properties_em: dict[MaterialPropertiesEM],
+        material_properties_em: dict[str, MaterialPropertiesEM],
         source_properties: SourceProperties,
         time_config: TimeConfig,
     ):
@@ -193,6 +193,14 @@ class IHNNSolver:
         )
 
         problem.set_source_function(joule_heating)
+        problem.set_neumann_values_array(neumann_vals)
+        problem.set_dirichlet_values_array(dirichlet_vals)
+        problem.set_robin_values_array((h_vals, amb_vals))
+
+        # Set boundary conditions
+        problem.set_neumann_values(neumann_boundaries_dict)
+        problem.set_dirichlet_values(dirichlet_boundaries_dict)
+        problem.set_robin_values(robin_boundaries_dict)
 
         config = {
             "epochs": 10000,
@@ -290,20 +298,48 @@ class IHNNSolver:
         em_solution = self.em_model.predict(problem_idx=0)
         return em_solution
 
-    def compute_joule_heat(self, em_solution):
-        n_nodes = em_solution.shape[0]
-        heat_source = np.zeros(n_nodes)
+    def get_source_function(self, heat_source, n_nodes):
+        source_function = np.zeros(n_nodes, dtype=np.float64)
+        ngmesh = self.mesh.ngmesh
+        for i, elem in enumerate(ngmesh.Elements2D()):
+            mat_index = elem.index
+            mat_name = ngmesh.GetMaterial(mat_index)
+
+            # Get vertices of this element
+            vertices = elem.vertices
+            for v in vertices:
+                node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
+                if 0 <= node_idx < n_nodes:
+                    if mat_name == "mat_workpiece":
+                        p = ngmesh.Points()[v.nr].p
+                        x, y = p[0], p[1]
+                        q_val = heat_source(self.mesh(x, y))
+                        source_function[node_idx] = q_val
+        return source_function
+
+    def compute_joule_heat(self, A):
+        """
+        Compute Joule heating: Q = 1/2 * sigma * |E|^2, 
+        where E is the electric field derived from the potential A.
+        """
+        gfu = ng.GridFunction(self.em_model.all_fem_solvers[0].fes)
+        gfu.vec.data = A
+        omega = 2 * np.pi * self.source_properties.frequency
+        E_phi = -1j * omega * gfu
+        heat_source_gf = 0.5 * self.material_properties_em["mat_workpiece"].sigma * ng.Norm(E_phi)**2
+        heat_source = self.get_source_function(heat_source_gf, self.em_model.problems[0].n_nodes)
         return heat_source
 
-    def solve_thermal(self, heat_source):
+    def solve_thermal(self):
         thermal_solution = self.thermal_model.rollout(problem_idx=0)
         return thermal_solution
 
     def solve_coupled(self):
         self.em_model = self._set_em_model(self.path_to_em_model)
-        joule_heat = self.compute_joule_heat(self.solve_em())
+        em_solution = self.solve_em()
+        joule_heat = self.compute_joule_heat(em_solution)
         self.thermal_model = self._set_thermal_model(self.path_to_thermal_model, joule_heat)
-        thermal_solution = self.solve_thermal(joule_heat)
+        thermal_solution = self.solve_thermal()
         return thermal_solution
 
 if __name__ == "__main__":
@@ -353,3 +389,4 @@ if __name__ == "__main__":
         time_config,
     )
     thermal_solution = solver.solve_coupled()
+    print(thermal_solution)

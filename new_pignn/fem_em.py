@@ -94,6 +94,7 @@ class FEMSolverEM:
 
         self.bilinear_form = None
         self.linear_form = None
+        self.lumped_mass_diag = None
         self.fes = None
 
         self.problem = problem
@@ -137,25 +138,32 @@ class FEMSolverEM:
         )
         A, v = fes.TnT()
 
+        r_star = self.problem.r_star
+        jac = 1.0 / (r_star**2)
         r = ng.x
+        r_hat = ng.x / r_star
         dr_rA = r * ng.grad(A)[0] + A
         dr_rv = r * ng.grad(v)[0] + v
         dzA, dzv = ng.grad(A)[1], ng.grad(v)[1]
 
         # Avoid 1/r singularity on the symmetry axis (r=0)
         inv_r = ng.IfPos(r, 1.0 / r, 0.0)
+        r1_nd = ng.IfPos(r, 1.0 / (r * r_star), 0.0)
 
         nu = 1.0 / (self.problem.mu0 * mu_r)
 
         a = ng.BilinearForm(fes, symmetric=False)
-        a += nu * (r * dzA * dzv + inv_r * dr_rA * dr_rv) * ng.dx
-        # a += 1j * self.problem.omega * sigma * r * A * v * ng.dx
+        a += nu * (r_hat * dzA * dzv + r1_nd * dr_rA * dr_rv) * ng.dx
+        # a += 1j * sigma * (r_hat * jac) * A * v * ng.dx
         Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
         Js_phi = Js_phi / self.problem.J_star  # Normalize current density
         print("Normalized current density Js_phi:", Js_phi)
         f = ng.LinearForm(fes)
-        f += r * Js_phi * v * ng.dx("mat_coil")
+        f += (r_hat * jac) * Js_phi * v * ng.dx("mat_coil")
+
+        a.Assemble()
+        f.Assemble()
 
         a.Assemble()
         f.Assemble()
@@ -232,6 +240,23 @@ class FEMSolverEM:
             np.real(f_np), dtype=torch.float64
         ).to(self.device)
         self.fes = fes
+
+        # Assemble axisymmetric L2 mass matrix M: m_ij = \int \hat{r} \phi_i \phi_j d \Omega
+        # and store its lumped (row-summed) diagonal for Riesz-map weighting.
+        m = ng.BilinearForm(fes, symmetric=True)
+        m += r_hat * A * v * ng.dx
+        m.Assemble()
+        M_torch = self._ngsolve_to_torch(m.mat)
+        # M is real-valued (complex FES but real integrand) – take the real part
+        if isinstance(M_torch, tuple):
+            M_real = M_torch[0]
+        else:
+            M_real = M_torch
+        # Lumped diagonal: sum each row  (equivalent to diag(M * 1))
+        ones = torch.ones(M_real.shape[1], dtype=torch.float64, device=self.device)
+        lumped = torch.sparse.mm(M_real, ones.unsqueeze(1)).squeeze(1)
+        # Clamp to avoid division by zero on Dirichlet / axis nodes
+        self.lumped_mass_diag = lumped.clamp_min(1e-30)
 
     def init_mixed_matrices(self):
         """
@@ -679,10 +704,21 @@ class FEMSolverEM:
         pred_sol_imag,
         *,
         normalize: NormalizeMode = "ndof",
+        use_mass_weighting: bool = True,
         eps: float = 1e-12,
     ) -> torch.Tensor:
         """
         Compute the residual for complex-valued solutions.
+
+        If *use_mass_weighting* is True the residual is measured in the
+        ``M_L^{-1}`` norm (Riesz-map weighting):
+
+            ||r||^2_{M^{-1}} = \sum_i  r_i^2 / m_i
+
+        where ``m_i`` are the entries of the lumped axisymmetric mass matrix
+        ``M_L`` (row-sum of  M_ij = \int \hat{r} \phi_i \phi_j d \Omega).  This is the standard
+        FE way to measure a linear-functional residual in a norm consistent
+        with the L² inner product via the Riesz map.
         """
         free_mask = self._free_dofs_mask()
 
@@ -702,7 +738,19 @@ class FEMSolverEM:
         r_real_free = r_real[free_mask]
         r_imag_free = r_imag[free_mask]
 
-        loss = r_real_free.square().mean() + r_imag_free.square().mean()
+        if use_mass_weighting:
+            if self.lumped_mass_diag is None:
+                raise RuntimeError(
+                    "Lumped mass diagonal not available. "
+                    "Call init_complex_matrices() first."
+                )
+            m_inv_free = 1.0 / self.lumped_mass_diag[free_mask].clamp_min(eps)
+            loss = (
+                (r_real_free.square() * m_inv_free).sum()
+                + (r_imag_free.square() * m_inv_free).sum()
+            )
+        else:
+            loss = r_real_free.square().mean() + r_imag_free.square().mean()
 
         if normalize == "none":
             return loss
@@ -710,6 +758,9 @@ class FEMSolverEM:
             rhsn = torch.linalg.norm(self.linear_form[free_mask]) + eps
             return loss / (rhsn * rhsn)
         if normalize == "ndof":
+            if use_mass_weighting:
+                n_free = free_mask.sum().clamp_min(1).to(dtype=torch.float64)
+                return loss / n_free
             return loss  # already mean()
 
         raise ValueError(f"Unknown normalize mode: {normalize}")
@@ -728,9 +779,6 @@ class FEMSolverEM:
         """
         Energy-norm minimum residual loss:
             J = 0.5 * (r_r^T |K|^{-1} r_r + r_i^T |K|^{-1} r_i) / n_free
-
-        Uses |diag(K)| = sqrt(diag(Kr)^2 + diag(Ki)^2) for the Jacobi
-        preconditioner to be robust when Kr has zero-diagonal entries.
 
         energy_inv:
           - "jacobi": |K|^{-1} approx diag(|K|)^{-1}
@@ -850,10 +898,9 @@ class FEMSolverEM:
         uHKu_real = torch.dot(ur, Ku_r) + torch.dot(ui, Ku_i)
         uHKu_imag = torch.dot(ur, Ku_i) - torch.dot(ui, Ku_r)
 
-        # f^H u parts (assuming f is real)
         f = self.linear_form.to(dtype=torch.float64, device=ur.device)
-        fHu_real = torch.dot(f, ur)
-        fHu_imag = torch.dot(f, ui)
+        fHu_real = torch.dot(ur, f)
+        fHu_imag = torch.dot(ui, f)
 
         Pi_real = 0.5 * uHKu_real - fHu_real
         Pi_imag = 0.5 * uHKu_imag - fHu_imag

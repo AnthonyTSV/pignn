@@ -1,0 +1,46 @@
+Thesis plan:
+
+- Introduction
+- Theoretical background (what is already known, base for the reader)
+    - Governing physics
+        - Heat equation
+        - Thermal boundary and initial conditions
+        - Source term as the bridge to electromagnetics
+        - Electromagnetics model
+    - Finite Element Method
+        - Weak form of the heat equation
+        - Discrete time stepping
+        - Per step residual (move to methods?)
+        - Weak form of EM
+        - Error metrics
+    - Physics-Informed Graph Neural Networks
+        - Why PINNs?
+        - Graph Neural Networks
+        - Mesh based graph representation
+- Methods (what I did, how I did it)
+    - Why physics-informed learning for heat transfer?
+    - Graph representation of the mesh
+    - Why separate EM and thermal models?
+    - Thermal part
+      - Thermal surrogate architecture
+      - Thermal physics-informed loss from weak form
+    - EM part
+      - EM surrogate architecture and output
+      - EM physics-informed loss
+      - Non-dimensionalisation
+    - Coupling algorithm
+- Results
+    - Thermal verification
+    - EM verification
+      - Magnetostatics as a control case
+      - Eddy currents
+    - Main results - coupled EM-thermal
+    - Ablation study
+    - Computational cost
+- Discussion
+    - Interpretation of results
+    - Limitations and validity range
+- Conclusion and future work
+- Appendix
+    - Hyperparameters
+    - Additional results

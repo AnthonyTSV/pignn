@@ -162,6 +162,7 @@ class MeshProblemEM:
         self.sigma_coil = 5.8e7
 
         self.kappa = self.omega * self.mu_star * (self.r_star**2)  # Nondimensional frequency
+        self.normalized_current = self.N_turns * self.I_coil / self.J_star
         self.complex = True
         self.mixed = False
 

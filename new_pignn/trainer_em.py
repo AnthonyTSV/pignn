@@ -61,8 +61,8 @@ class PIMGNTrainerEM:
         material_field = getattr(first_problem, "material_field", None)
         sigma_field = getattr(first_problem, "sigma_field", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
-        current = getattr(first_problem, "I_coil", None)
-        coil_node_mask = getattr(first_problem, "coil_node_mask", None)
+        current = getattr(first_problem, "normalized_current", None)
+        # coil_node_mask = getattr(first_problem, "coil_node_mask", None)
 
         sample_data, aux = graph_creator.create_graph(
             A_current=None,
@@ -70,7 +70,7 @@ class PIMGNTrainerEM:
             sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
             current=current,
-            coil_node_mask=coil_node_mask,
+            # coil_node_mask=coil_node_mask,
         )
 
         free_node_data, mapping, new_aux = graph_creator.create_free_node_subgraph(
@@ -315,7 +315,9 @@ class PIMGNTrainerEM:
             prediction_full_real = torch.zeros(
                 n_total, dtype=torch.float64, device=self.device
             )
-            prediction_full_real[free_to_original] = prediction_free[:, 0]
+            prediction_full_real[free_to_original] = prediction_free[:, 0].to(
+                dtype=torch.float64
+            )
 
             residual = fem_solver.compute_energy_loss(
                 prediction_full_real,
@@ -347,8 +349,8 @@ class PIMGNTrainerEM:
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
-        current = getattr(problem, "I_coil", None)
-        coil_node_mask = getattr(problem, "coil_node_mask", None)
+        current = getattr(problem, "normalized_current", None)
+        # coil_node_mask = getattr(problem, "coil_node_mask", None)
 
         self.optimizer.zero_grad()
 
@@ -359,7 +361,7 @@ class PIMGNTrainerEM:
             sigma_field=sigma_field,
             dirichlet_values=dirichlet_vals,
             current=current,
-            coil_node_mask=coil_node_mask,
+            # coil_node_mask=coil_node_mask,
         )
 
         # Create free node subgraph (only non-Dirichlet nodes)
@@ -676,8 +678,8 @@ class PIMGNTrainerEM:
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
-        current = getattr(problem, "I_coil", None)
-        coil_node_mask = getattr(problem, "coil_node_mask", None)
+        current = getattr(problem, "normalized_current", None)
+        # coil_node_mask = getattr(problem, "coil_node_mask", None)
 
         with torch.no_grad():
             # Build graph
@@ -687,7 +689,7 @@ class PIMGNTrainerEM:
                 sigma_field=sigma_field,
                 dirichlet_values=dirichlet_vals,
                 current=current,
-                coil_node_mask=coil_node_mask,
+                # coil_node_mask=coil_node_mask,
             )
 
             free_graph, node_mapping, free_aux = (
@@ -1026,7 +1028,7 @@ def _run_single_problem_experiment(
 def train_pimgn_on_single_problem(resume_from: str = None):
     problem = create_em_problem()
     config = {
-        "epochs": 2000,
+        "epochs": 1000,
         "lr": 1e-4,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem",
@@ -1039,7 +1041,7 @@ def train_pimgn_on_single_problem(resume_from: str = None):
 def train_pimgn_em_complex(resume_from: str = None):
     problem = create_em_problem_complex()
     config = {
-        "epochs": 10000,
+        "epochs": 5000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/test_em_problem_complex",
@@ -1100,7 +1102,7 @@ def train_pimgn_em_complex(resume_from: str = None):
 
 
 if __name__ == "__main__":
-    # train_pimgn_on_single_problem()
-    train_pimgn_em_complex()
+    train_pimgn_on_single_problem()
+    # train_pimgn_em_complex()
     # train_pimgn_em_mixed()
     # train_pimgn_em_multi()

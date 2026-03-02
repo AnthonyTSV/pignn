@@ -814,7 +814,7 @@ def create_em_problem():
 
     from graph_creator_em import GraphCreatorEM
 
-    mesh = create_ih_mesh()
+    mesh = create_ih_mesh(h_workpiece=5e-3, h_air=60e-3, h_coil=2e-3)
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
@@ -854,6 +854,7 @@ def create_em_problem():
     problem.set_dirichlet_values_array(dirichlet_vals)
     problem.set_dirichlet_values(dirichlet_boundaries_dict)
     problem.complex = False
+    problem.mixed = False
     problem.sigma_workpiece = 0
     problem.sigma_air = 0
     problem.sigma_coil = 0
@@ -895,7 +896,6 @@ def create_em_problem():
                     current_density[node_idx] = Js_phi
 
     problem.material_field = mu_r_field
-    problem.current_density_field = current_density
 
     return problem
 
@@ -903,7 +903,7 @@ def create_em_problem_complex():
 
     from graph_creator_em import GraphCreatorEM
 
-    mesh = create_ih_mesh(h_workpiece=5e-3, h_air=60e-3, h_coil=1e-3)
+    mesh = create_ih_mesh(h_workpiece=5e-3, h_air=60e-3, h_coil=2e-3)
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
@@ -974,6 +974,8 @@ def create_em_problem_complex():
             node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
             if 0 <= node_idx < n_nodes:
                 mu_r_field[node_idx] = material_encode[mat_name]
+                if mat_name == "mat_workpiece":
+                    sigma_field[node_idx] = problem.sigma_workpiece
 
     problem.material_field = mu_r_field
     problem.sigma_field = sigma_field
