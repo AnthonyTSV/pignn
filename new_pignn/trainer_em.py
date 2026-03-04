@@ -18,6 +18,7 @@ from containers import MeshConfig, MeshProblem, MeshProblemEM
 from torch_geometric.data import Data
 
 from train_problems import create_em_problem, create_em_problem_complex, create_em_mixed
+from em_magnetostatic_problems import magnetostatic_problem_1, magnetostatic_problem_2, magnetostatic_problem_3, magnetostatic_problem_4
 
 
 class PIMGNTrainerEM:
@@ -1050,6 +1051,17 @@ def train_pimgn_em_complex(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, config, "First order EM Complex")
 
+def train_pimgn_magnetostatics(resume_from: str = None):
+    problem = magnetostatic_problem_4()
+    config = {
+        "epochs": 5000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/test_magnetostatics",
+        "data_weight": 0.0,
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_single_problem_experiment(problem, config, "Magnetostatics")
 
 # def train_pimgn_em_mixed(resume_from: str = None):
 #     problem = create_em_mixed()
@@ -1102,7 +1114,8 @@ def train_pimgn_em_complex(resume_from: str = None):
 
 
 if __name__ == "__main__":
-    train_pimgn_on_single_problem()
+    # train_pimgn_on_single_problem()
     # train_pimgn_em_complex()
     # train_pimgn_em_mixed()
     # train_pimgn_em_multi()
+    train_pimgn_magnetostatics()

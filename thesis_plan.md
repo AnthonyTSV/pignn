@@ -5,13 +5,14 @@ Thesis plan:
     - Governing physics
         - Heat equation
         - Thermal boundary and initial conditions
+        - Discrete time stepping
         - Source term as the bridge to electromagnetics
         - Electromagnetics model
     - Finite Element Method
         - Weak form of the heat equation
-        - Discrete time stepping
         - Per step residual (move to methods?)
         - Weak form of EM
+        - Method of manufactured solutions
         - Error metrics
     - Physics-Informed Graph Neural Networks
         - Why PINNs?

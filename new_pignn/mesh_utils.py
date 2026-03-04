@@ -150,7 +150,6 @@ def create_ih_mesh(h_workpiece = 5e-4, h_air = 60e-3, h_coil = 1e-3):
     # mesh.Curve(3)
     return mesh
 
-
 def create_gaussian_initial_condition(
     pos,
     num_gaussians=4,
