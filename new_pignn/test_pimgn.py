@@ -9,22 +9,37 @@ import time
 from argparse import Namespace
 from typing import List
 
-# Import our modules
-from logger import TrainingLogger
-from meshgraphnet import MeshGraphNet
-from fem import FEMSolver
-from graph_creator import GraphCreator
-from containers import TimeConfig, MeshConfig, MeshProblem
+try:
+    from .logger import TrainingLogger
+    from .meshgraphnet import MeshGraphNet
+    from .fem import FEMSolver
+    from .graph_creator import GraphCreator
+    from .containers import TimeConfig, MeshConfig, MeshProblem
+    from .train_problems import (
+        create_test_problem,
+        generate_multiple_problems,
+        create_lshaped_problem,
+        create_mms_problem,
+        create_source_test_problem,
+        create_industrial_heating_problem,
+    )
+    from .trainer import PIMGNTrainer
+except ImportError:
+    from logger import TrainingLogger
+    from meshgraphnet import MeshGraphNet
+    from fem import FEMSolver
+    from graph_creator import GraphCreator
+    from containers import TimeConfig, MeshConfig, MeshProblem
+    from train_problems import (
+        create_test_problem,
+        generate_multiple_problems,
+        create_lshaped_problem,
+        create_mms_problem,
+        create_source_test_problem,
+        create_industrial_heating_problem,
+    )
+    from trainer import PIMGNTrainer
 from torch_geometric.data import Data
-from train_problems import (
-    create_test_problem,
-    generate_multiple_problems,
-    create_lshaped_problem,
-    create_mms_problem,
-    create_source_test_problem,
-    create_industrial_heating_problem,
-)
-from trainer import PIMGNTrainer
 
 
 def plot_results(
@@ -441,6 +456,17 @@ def train_pimgn_on_single_problem(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, time_config, config, "First order MMS")
 
+def train_pimgn_temp_dependent_material():
+    from train_problems import create_temp_dependent_material_problem
+    problem, time_config = create_temp_dependent_material_problem(maxh=0.2)
+    config = {
+        "epochs": 500,
+        "lr": 1e-3,
+        "time_window": 20,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/temp_dependent_material_maxh_0.2",
+    }
+    _run_single_problem_experiment(problem, time_config, config, "Temp dependent material")
 
 def train_multiple_problems():
     problems = []
@@ -492,11 +518,11 @@ def main():
     """Main function to run Physics-Informed MeshGraphNet training and evaluation."""
     # Uncomment one of the following lines to run the desired test
     # train_pimgn_on_single_problem("results/physics_informed/verification_test_problem_3_maxh_0.1/pimgn_trained_model.pth")
-    # train_pimgn_on_single_problem()
+    train_pimgn_on_single_problem()
     # train_multiple_problems()
     # train_pimgn_on_multiple_problems()
     # train_pimgn_on_industrial_problem()
-    em_to_thermal()
+    # em_to_thermal()
 
 
 if __name__ == "__main__":

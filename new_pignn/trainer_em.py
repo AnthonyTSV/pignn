@@ -9,25 +9,85 @@ import time
 from argparse import Namespace
 from typing import List
 
-# Import our modules
-from logger import TrainingLogger
-from meshgraphnet import MeshGraphNet
-from fem_em import FEMSolverEM
-from graph_creator_em import GraphCreatorEM
-from containers import MeshConfig, MeshProblem, MeshProblemEM
+try:
+    from .logger import TrainingLogger
+    from .meshgraphnet import MeshGraphNet
+    from .fem_em import FEMSolverEM
+    from .graph_creator_em import GraphCreatorEM
+    from .containers import MeshConfig, MeshProblem, MeshProblemEM
+    from .train_problems import (
+        create_em_problem,
+        create_em_problem_complex,
+        create_em_mixed,
+    )
+    from .em_magnetostatic_problems import (
+        magnetostatic_problem_1,
+        magnetostatic_problem_2,
+        magnetostatic_problem_3,
+        magnetostatic_problem_4,
+    )
+    from .em_eddy_problems import (
+        eddy_current_problem_1,
+        eddy_current_problem_2,
+        eddy_current_problem_different_currents,
+    )
+except ImportError:
+    from logger import TrainingLogger
+    from meshgraphnet import MeshGraphNet
+    from fem_em import FEMSolverEM
+    from graph_creator_em import GraphCreatorEM
+    from containers import MeshConfig, MeshProblem, MeshProblemEM
+    from train_problems import (
+        create_em_problem,
+        create_em_problem_complex,
+        create_em_mixed,
+    )
+    from em_magnetostatic_problems import (
+        magnetostatic_problem_1,
+        magnetostatic_problem_2,
+        magnetostatic_problem_3,
+        magnetostatic_problem_4,
+    )
+    from em_eddy_problems import (
+        eddy_current_problem_1,
+        eddy_current_problem_2,
+        eddy_current_problem_different_currents,
+    )
 from torch_geometric.data import Data
 
-from train_problems import create_em_problem, create_em_problem_complex, create_em_mixed
-from em_magnetostatic_problems import magnetostatic_problem_1, magnetostatic_problem_2, magnetostatic_problem_3, magnetostatic_problem_4
+
+def _load_compatible_model_state(model: nn.Module, state_dict: dict) -> tuple[list[str], list[str]]:
+    """Load only checkpoint tensors whose keys and shapes match the current model."""
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped = []
+
+    for key, value in state_dict.items():
+        if key not in model_state:
+            skipped.append(key)
+            continue
+        if model_state[key].shape != value.shape:
+            skipped.append(key)
+            continue
+        compatible_state[key] = value
+
+    missing, unexpected = model.load_state_dict(compatible_state, strict=False)
+    return list(missing), skipped + list(unexpected)
 
 
 class PIMGNTrainerEM:
     """Trainer for Physics-Informed MeshGraphNet for Steady-State Electromagnetic Problems."""
 
-    def __init__(self, problems: List[MeshProblemEM], config: dict):
+    def __init__(self, problems: List[MeshProblemEM] | MeshProblemEM, config: dict):
+        if isinstance(problems, MeshProblemEM):
+            problems = [problems]
+
         self.problems = problems
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.enforce_axis_regularity = bool(
+            config.get("enforce_axis_regularity", False)
+        )
 
         # Create FEM solvers for physics-informed loss computation for all problems
         self.all_fem_solvers: List[FEMSolverEM] = []
@@ -49,7 +109,7 @@ class PIMGNTrainerEM:
                 mesh=problem.mesh,
                 n_neighbors=2,
                 dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-                r_star=problem.r_star
+                r_star=problem.r_star,
             )
             self.all_graph_creators.append(gc)
 
@@ -59,9 +119,13 @@ class PIMGNTrainerEM:
         graph_creator = self.all_graph_creators[0]
 
         # Create sample graph to get dimensions
+        if hasattr(first_problem, "refresh_derived_quantities"):
+            first_problem.refresh_derived_quantities()
         material_field = getattr(first_problem, "material_field", None)
         sigma_field = getattr(first_problem, "sigma_field", None)
+        current_density_field = getattr(first_problem, "current_density_field", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
+        omega = getattr(first_problem, "omega", None)
         current = getattr(first_problem, "normalized_current", None)
         # coil_node_mask = getattr(first_problem, "coil_node_mask", None)
 
@@ -69,7 +133,9 @@ class PIMGNTrainerEM:
             A_current=None,
             material_node_field=material_field,
             sigma_field=sigma_field,
+            current_density_field=current_density_field,
             dirichlet_values=dirichlet_vals,
+            omega=omega,
             current=current,
             # coil_node_mask=coil_node_mask,
         )
@@ -80,7 +146,12 @@ class PIMGNTrainerEM:
 
         input_dim_node = free_node_data.x.shape[1]
         input_dim_edge = free_node_data.edge_attr.shape[1]
-        
+        input_dim_global = (
+            int(sample_data.global_attr.numel())
+            if getattr(sample_data, "global_attr", None) is not None
+            else 0
+        )
+
         if self.is_mixed:
             output_dim = 4  # [A_real, A_imag, phi_real, phi_imag]
         elif self.is_complex:
@@ -100,10 +171,10 @@ class PIMGNTrainerEM:
             input_dim_edge=input_dim_edge,
             hidden_dim=128,
             output_dim=output_dim,
-            # input_dim_global=2,
+            input_dim_global=input_dim_global,
             num_layers=12,
             complex_em=self.is_complex,
-            mixed_em=self.is_mixed
+            mixed_em=self.is_mixed,
         ).to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
@@ -158,17 +229,45 @@ class PIMGNTrainerEM:
                 checkpoint = torch.load(resume_from, map_location=self.device)
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 # Full checkpoint with optimizer state
-                self.model.load_state_dict(checkpoint["model_state_dict"])
-                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-                self.start_epoch = checkpoint.get("epoch", 0) + 1
-                self.losses = checkpoint.get("losses", [])
-                self.val_losses = checkpoint.get("val_losses", [])
-                print(f"Resumed from epoch {self.start_epoch}")
+                try:
+                    self.model.load_state_dict(checkpoint["model_state_dict"])
+                    self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                    self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                    self.start_epoch = checkpoint.get("epoch", 0) + 1
+                    self.losses = checkpoint.get("losses", [])
+                    self.val_losses = checkpoint.get("val_losses", [])
+                    print(f"Resumed from epoch {self.start_epoch}")
+                except RuntimeError as exc:
+                    print(
+                        "Checkpoint architecture differs from the current model; "
+                        "loading only compatible model weights and resetting optimizer state."
+                    )
+                    missing, skipped = _load_compatible_model_state(
+                        self.model, checkpoint["model_state_dict"]
+                    )
+                    print(f"Checkpoint load note: {exc}")
+                    if skipped:
+                        print(f"Skipped incompatible checkpoint keys: {skipped}")
+                    if missing:
+                        print(f"Model parameters left at initialization: {missing}")
             else:
                 # Just model weights (backward compatibility)
-                self.model.load_state_dict(checkpoint)
-                print("Loaded model weights only (no optimizer state)")
+                try:
+                    self.model.load_state_dict(checkpoint)
+                    print("Loaded model weights only (no optimizer state)")
+                except RuntimeError as exc:
+                    print(
+                        "Checkpoint architecture differs from the current model; "
+                        "loading only compatible model weights."
+                    )
+                    missing, skipped = _load_compatible_model_state(
+                        self.model, checkpoint
+                    )
+                    print(f"Checkpoint load note: {exc}")
+                    if skipped:
+                        print(f"Skipped incompatible checkpoint keys: {skipped}")
+                    if missing:
+                        print(f"Model parameters left at initialization: {missing}")
 
         # Generate ground truth for validation
         if config.get("generate_ground_truth_for_validation", False):
@@ -185,6 +284,32 @@ class PIMGNTrainerEM:
                 self.all_ground_truth.append(ground_truth)
         else:
             self.all_ground_truth = None
+
+    def _apply_axis_regularized_ansatz(
+        self,
+        prediction_free: torch.Tensor,
+        free_pos: torch.Tensor,
+        problem: MeshProblemEM,
+    ) -> torch.Tensor:
+        """Map raw network output A_tilde to A = r_hat * A_tilde on free nodes."""
+        if not self.enforce_axis_regularity or prediction_free.numel() == 0:
+            return prediction_free
+
+        r_hat = (
+            free_pos[:, 0].to(
+                device=prediction_free.device,
+                dtype=prediction_free.dtype,
+            )
+            / float(problem.r_star)
+        ).unsqueeze(1)
+
+        prediction_regularized = prediction_free.clone()
+        if problem.mixed or problem.complex:
+            prediction_regularized[:, :2] = prediction_regularized[:, :2] * r_hat
+        else:
+            prediction_regularized[:, :1] = prediction_regularized[:, :1] * r_hat
+
+        return prediction_regularized
 
     def compute_physics_informed_loss(
         self,
@@ -347,9 +472,13 @@ class PIMGNTrainerEM:
         graph_creator = self.all_graph_creators[problem_idx]
 
         # Get the values for this problem
+        if hasattr(problem, "refresh_derived_quantities"):
+            problem.refresh_derived_quantities()
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
+        current_density_field = getattr(problem, "current_density_field", None)
+        omega = getattr(problem, "omega", None)
         current = getattr(problem, "normalized_current", None)
         # coil_node_mask = getattr(problem, "coil_node_mask", None)
 
@@ -360,7 +489,9 @@ class PIMGNTrainerEM:
             A_current=None,
             material_node_field=material_field,
             sigma_field=sigma_field,
+            current_density_field=current_density_field,
             dirichlet_values=dirichlet_vals,
+            omega=omega,
             current=current,
             # coil_node_mask=coil_node_mask,
         )
@@ -371,8 +502,13 @@ class PIMGNTrainerEM:
         )
         free_data = free_data.to(self.device)
 
-        # Forward pass - get prediction for FREE nodes [N_free_nodes, 4] (A_real, A_imag, phi_real, phi_imag)
+        # Predict the unconstrained field A_tilde and enforce A = r_hat * A_tilde.
         prediction_free = self.model.forward(free_data)
+        prediction_free = self._apply_axis_regularized_ansatz(
+            prediction_free,
+            free_data.pos,
+            problem,
+        )
 
         # Compute physics-informed loss for steady-state
         physics_loss = self.compute_physics_informed_loss(
@@ -516,9 +652,7 @@ class PIMGNTrainerEM:
                     ),
                 }
             elif self.problems[prob_idx].complex:
-                gfA = self.all_fem_solvers[prob_idx].solve(
-                    self.problems[prob_idx]
-                )
+                gfA = self.all_fem_solvers[prob_idx].solve(self.problems[prob_idx])
                 A_dofs = np.array(gfA, dtype=np.complex128)
                 eval_ground_truth[prob_idx] = A_dofs
 
@@ -631,26 +765,60 @@ class PIMGNTrainerEM:
                         l2_total = np.linalg.norm(pred - gt) / (
                             np.linalg.norm(gt) + 1e-30
                         )
-                        self.logger.log_evaluation(l2_A, f"l2_A_p{prob_idx}")
-                        self.logger.log_evaluation(l2_phi, f"l2_phi_p{prob_idx}")
+                        self.logger.log_training_l2(
+                            epoch + 1,
+                            prob_idx,
+                            {
+                                "l2_total": l2_total,
+                                "l2_A": l2_A,
+                                "l2_phi": l2_phi,
+                            },
+                        )
+                        self.logger.log_evaluation(
+                            l2_total, f"l2_total_p{prob_idx}", append=True
+                        )
+                        self.logger.log_evaluation(
+                            l2_A, f"l2_A_p{prob_idx}", append=True
+                        )
+                        self.logger.log_evaluation(
+                            l2_phi, f"l2_phi_p{prob_idx}", append=True
+                        )
                         print(
                             f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} "
                             f"| L2 total: {l2_total:.6e} | L2 A: {l2_A:.6e} | L2 phi: {l2_phi:.6e}"
                         )
                     elif self.is_complex:
                         # pred and gt are complex arrays: [A_complex]
-                        l2_error = np.linalg.norm(pred - gt) / (np.linalg.norm(gt) + 1e-30)
-                        self.logger.log_evaluation(l2_error, f"l2_A_p{prob_idx}")
+                        l2_error = np.linalg.norm(pred - gt) / (
+                            np.linalg.norm(gt) + 1e-30
+                        )
+                        self.logger.log_training_l2(
+                            epoch + 1,
+                            prob_idx,
+                            {"l2_A": l2_error},
+                        )
+                        self.logger.log_evaluation(
+                            l2_error, f"l2_A_p{prob_idx}", append=True
+                        )
                         print(
                             f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} | L2 Error: {l2_error:.6e}"
                         )
                     else:
                         if len(pred) == len(gt):
                             l2_error = np.linalg.norm(pred - gt) / np.linalg.norm(gt)
+                            self.logger.log_training_l2(
+                                epoch + 1,
+                                prob_idx,
+                                {"l2_A": l2_error},
+                            )
                             print(
                                 f"  [Eval] Epoch {epoch+1} | Problem {prob_idx+1} | L2 Error: {l2_error:.6e}"
                             )
+                            self.logger.log_evaluation(
+                                l2_error, f"l2_A_p{prob_idx}", append=True
+                            )
                 self.model.train()
+                self.logger.save()
             if epoch % self.config.get("save_interval", 1000) == 0:
                 path_to_checkpoint = self.config.get(
                     "save_dir", "results/physics_informed_em"
@@ -676,9 +844,13 @@ class PIMGNTrainerEM:
         graph_creator = self.all_graph_creators[problem_idx]
 
         # Get the values for this problem
+        if hasattr(problem, "refresh_derived_quantities"):
+            problem.refresh_derived_quantities()
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
+        current_density_field = getattr(problem, "current_density_field", None)
+        omega = getattr(problem, "omega", None)
         current = getattr(problem, "normalized_current", None)
         # coil_node_mask = getattr(problem, "coil_node_mask", None)
 
@@ -688,7 +860,9 @@ class PIMGNTrainerEM:
                 A_current=None,
                 material_node_field=material_field,
                 sigma_field=sigma_field,
+                current_density_field=current_density_field,
                 dirichlet_values=dirichlet_vals,
+                omega=omega,
                 current=current,
                 # coil_node_mask=coil_node_mask,
             )
@@ -698,8 +872,13 @@ class PIMGNTrainerEM:
             )
             free_data = free_graph.to(self.device)
 
-            # Predict steady-state solution
+            # Predict the unconstrained field A_tilde and enforce A = r_hat * A_tilde.
             prediction_free = self.model.forward(free_data)
+            prediction_free = self._apply_axis_regularized_ansatz(
+                prediction_free,
+                free_data.pos,
+                problem,
+            )
 
             # Reconstruct full solution
             free_idx = node_mapping["free_to_original"].detach().cpu().numpy()
@@ -991,6 +1170,7 @@ def _run_experiment(
                     ground_truth[i],
                     predictions[i],
                     filename=f"{save_path}/vtk/result_complex{vtk_suffix}",
+                    suffix=vtk_suffix,
                 )
             elif problem.mixed:
                 trainer.all_fem_solvers[prob_idx].export_to_vtk_mixed(
@@ -1051,17 +1231,58 @@ def train_pimgn_em_complex(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, config, "First order EM Complex")
 
+
 def train_pimgn_magnetostatics(resume_from: str = None):
     problem = magnetostatic_problem_4()
     config = {
         "epochs": 5000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/test_magnetostatics",
+        "save_dir": "results/physics_informed/magnetostatics_billet_2_rect_coil",
         "data_weight": 0.0,
         "resume_from": resume_from,  # Path to checkpoint to resume from
     }
     _run_single_problem_experiment(problem, config, "Magnetostatics")
+
+
+def train_pimgn_eddy_current(resume_from: str = None):
+    problem = eddy_current_problem_1()
+    config = {
+        "epochs": 20000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/eddy_current_problem_1_rect_coil",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_single_problem_experiment(problem, config, "Eddy Current")
+
+
+def train_pimgn_eddy_current_different_currents(resume_from: str = None):
+    problems = [
+        # eddy_current_problem_different_currents(current=100),
+        # eddy_current_problem_different_currents(current=200),
+        eddy_current_problem_different_currents(current=500),
+        eddy_current_problem_different_currents(current=1000),
+    ]
+    config = {
+        "epochs": 10000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/eddy_current_problem_circ_coil_currents",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    # _run_single_problem_experiment(problem, config, f"Eddy Current (Current: {current})")
+    _run_experiment(
+        problems,
+        config,
+        "Eddy Current with Different Currents",
+        train_indices=list(range(len(problems))),
+    )
+
 
 # def train_pimgn_em_mixed(resume_from: str = None):
 #     problem = create_em_mixed()
@@ -1118,4 +1339,6 @@ if __name__ == "__main__":
     # train_pimgn_em_complex()
     # train_pimgn_em_mixed()
     # train_pimgn_em_multi()
-    train_pimgn_magnetostatics()
+    # train_pimgn_magnetostatics()
+    train_pimgn_eddy_current(resume_from="results/physics_informed/eddy_current_problem_1_rect_coil/pimgn_trained_model.pth")
+    # train_pimgn_eddy_current_different_currents(resume_from="results/physics_informed/eddy_current_problem_circ_coil_currents/pimgn_trained_model.pth")

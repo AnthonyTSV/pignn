@@ -20,7 +20,7 @@ class DataOnLine(BaseModel):
     """Model to store data over line extracted from results"""
     point1: tuple[float, float, float]
     point2: tuple[float, float, float]
-    result_time: float
+    result_time: float | None = None
     data_extracted_on: str
     result_file_path: str
     point_data: list[tuple[float, float, float]]

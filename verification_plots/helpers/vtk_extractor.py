@@ -6,16 +6,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 
+
 class VtuDataExtractor:
     """Implement this class to extract data from vtu result files.
     need to implement get_unstructured_grid and set_time_value."""
+
     def __init__(self, base_path: Path):
         self.result_file = base_path
         self.reader = vtk.vtkXMLUnstructuredGridReader()
         self.reader.SetFileName(str(base_path))
         self.reader.Update()
 
-        self.time_data = self._get_time_data_from_pvd()
+        if base_path.suffix == ".pvd":
+            self.time_data = self._get_time_data_from_pvd()
 
     def _get_time_data_from_pvd(self):
         """
@@ -26,7 +29,9 @@ class VtuDataExtractor:
         dataset_list = []
 
         # Iterate through the DataSet elements and extract timestep and file variables
-        for idx, dataset in enumerate(sorted(root.findall(".//DataSet"), key=lambda x: float(x.get("timestep")))):
+        for idx, dataset in enumerate(
+            sorted(root.findall(".//DataSet"), key=lambda x: float(x.get("timestep")))
+        ):
             timestep = dataset.get("timestep")
             file = dataset.get("file")
             dataset_dict = {"index": idx, "time_step": timestep, "file": file}
@@ -39,7 +44,6 @@ class VtuDataExtractor:
         if ug.GetPointData().GetArray(field_name) is None:
             raise ValueError(f"Field {field_name} not found in VTU file!")
         return ug
-        
 
     def set_time_value(self, time_value: float):
         """VTU files do not support time series, so this use time_data."""
@@ -55,15 +59,21 @@ class VtuDataExtractor:
         self.reader.SetFileName(str(vtu_file_path))
         self.reader.Update()
 
+
 class VTKToPlotConverter(VtuDataExtractor):
-    def __init__(self, result_file: Path, last_time_step: int = 100, val_range: tuple[float, float] = (0.0, 1.0)):
+    def __init__(
+        self,
+        result_file: Path,
+        last_time_step: int = 100,
+        val_range: tuple[float, float] = (0.0, 1.0),
+    ):
         super().__init__(result_file)
         self.last_time_step = last_time_step
         self.val_range = val_range
-    
-    def _plot_mesh(self, ax, points, triangles):
+
+    def _plot_mesh(self, ax, points, triangles, linewidth=0.1):
         tri = mtri.Triangulation(points[:, 0], points[:, 1], triangles)
-        ax.triplot(tri, color="k", linewidth=0.1)
+        ax.triplot(tri, color="k", linewidth=linewidth)
         ax.set_aspect("equal", "box")
         return tri
 
@@ -102,7 +112,9 @@ class VTKToPlotConverter(VtuDataExtractor):
         """
         _, _, initial_condition = self._get_triangles_point_field("ExactSolution")
         self.set_time_value(0.99)
-        points, triangles, predicted = self._get_triangles_point_field("PredictedSolution")
+        points, triangles, predicted = self._get_triangles_point_field(
+            "PredictedSolution"
+        )
         _, _, fem_solution = self._get_triangles_point_field("ExactSolution")
         _, _, difference = self._get_triangles_point_field("Difference, %")
 
@@ -124,14 +136,26 @@ class VTKToPlotConverter(VtuDataExtractor):
                 False,
             ),
             (predicted, "c) PI-GNN $t=0.99$ s", "coolwarm", "Temperature [C]", True),
-            (fem_solution, "d) Analytical $t=0.99$ s", "coolwarm", "Temperature [C]", True),
+            (
+                fem_solution,
+                "d) Analytical $t=0.99$ s",
+                "coolwarm",
+                "Temperature [C]",
+                True,
+            ),
         ]
 
         for ax, (values, title, cmap, cb_label, fixed_range) in zip(axes, panels):
             tri = self._plot_mesh(ax, points, triangles)
             if fixed_range:
                 cmap = plt.get_cmap(cmap)
-                pcm = ax.tripcolor(tri, values, cmap=cmap, vmin=self.val_range[0], vmax=self.val_range[1])
+                pcm = ax.tripcolor(
+                    tri,
+                    values,
+                    cmap=cmap,
+                    vmin=self.val_range[0],
+                    vmax=self.val_range[1],
+                )
             else:
                 pcm = ax.tripcolor(tri, values, cmap=cmap)
             fig.colorbar(pcm, ax=ax, label=cb_label)
@@ -140,3 +164,45 @@ class VTKToPlotConverter(VtuDataExtractor):
 
         # fig.tight_layout()
         fig.savefig(save_path, dpi=600)
+
+    def plot_steady_state(
+        self,
+        save_path: Path,
+        exact_field_name: str = "ExactSolution",
+        predicted_field_name: str = "PredictedSolution",
+        label: str = "Temperature [C]",
+        contours: bool = False,
+        fraction: float = 0.063,
+    ):
+        points, triangles, predicted = self._get_triangles_point_field(
+            predicted_field_name
+        )
+        _, _, fem_solution = self._get_triangles_point_field(exact_field_name)
+
+        fig, axes = plt.subplots(1, 2, figsize=(6, 4))
+        for ax, (values, title) in zip(
+            axes, [(predicted, "a) PI-GNN"), (fem_solution, "b) FEM")]
+        ):
+            tri = self._plot_mesh(ax, points, triangles)
+            if contours:
+                pcm = ax.tricontourf(tri, values, cmap="coolwarm", levels=10)
+            else:
+                pcm = ax.tripcolor(tri, values, cmap="coolwarm", shading='gouraud')
+            ax.set_title(title)
+            ax.set_axis_off()
+        fig.colorbar(pcm, ax=axes, label=label, orientation="horizontal", fraction=fraction)
+        fig.subplots_adjust(wspace=0, bottom=0.2)
+        # fig.tight_layout()
+        fig.savefig(save_path, dpi=600)
+        # plt.subplot_tool(fig)
+        # plt.show()
+
+    def plot_relative_error(self, save_path: Path, field_name: str = "Difference, %"):
+        points, triangles, difference = self._get_triangles_point_field(field_name)
+        fig, ax = plt.subplots(figsize=(6, 4))
+        tri = self._plot_mesh(ax, points, triangles, linewidth=0.05)
+        pcm = ax.tripcolor(tri, difference, cmap="Spectral_r", edgecolors='face', antialiased=True, shading='gouraud')
+        fig.colorbar(pcm, ax=ax, label=r"Relative error $\epsilon_{\text{err}}$ [\%]", shrink=0.9)
+        ax.set_title("c) Relative error")
+        ax.set_axis_off()
+        fig.savefig(save_path, dpi=300)

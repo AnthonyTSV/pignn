@@ -1,5 +1,8 @@
 import numpy as np
-from containers import MeshConfig, MeshProblem, MeshProblemEM
+try:
+    from .containers import MeshConfig, MeshProblem, MeshProblemEM
+except ImportError:
+    from containers import MeshConfig, MeshProblem, MeshProblemEM
 import ngsolve as ng
 from typing import Optional, List, Tuple, Union, Literal, Callable
 import torch
@@ -459,7 +462,7 @@ class FEMSolverEM:
         r1_nd = ng.IfPos(r, 1.0 / (r * r_star), 0.0)
 
         # In normalized form: nu = 1/(mu0_normalized * mu_r) = 1/(1 * mu_r) = 1/mu_r
-        nu = 1.0 / (self.problem.mu0 * mu_r)
+        nu = 1.0 / (mu_r)
 
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r_hat * dzA * dzv + r1_nd * dr_rA * dr_rv) * ng.dx
@@ -707,7 +710,7 @@ class FEMSolverEM:
         use_mass_weighting: bool = True,
         eps: float = 1e-12,
     ) -> torch.Tensor:
-        """
+        r"""
         Compute the residual for complex-valued solutions.
 
         If *use_mass_weighting* is True the residual is measured in the
@@ -718,7 +721,7 @@ class FEMSolverEM:
         where ``m_i`` are the entries of the lumped axisymmetric mass matrix
         ``M_L`` (row-sum of  M_ij = \int \hat{r} \phi_i \phi_j d \Omega).  This is the standard
         FE way to measure a linear-functional residual in a norm consistent
-        with the L² inner product via the Riesz map.
+        with the L^2 inner product via the Riesz map.
         """
         free_mask = self._free_dofs_mask()
 
@@ -1271,7 +1274,7 @@ class FEMSolverEM:
         print(f"Results saved as {npz_filename}")
 
     def export_to_vtk_complex(
-        self, array_true, array_pred, filename="results/vtk/results.vtk"
+        self, array_true, array_pred, filename="results/vtk/results.vtk", suffix=""
     ):
         """
         Export solutions to VTK file for visualization in Paraview.
@@ -1330,13 +1333,13 @@ class FEMSolverEM:
         print(f"VTK file saved as {filename}")
 
         # save mesh
-        file_path = Path(filename).parent.parent / "results_data"
+        file_path = Path(filename).parent.parent / f"results_data{suffix}"
         os.makedirs(file_path, exist_ok=True)
         mesh_filename = file_path / "mesh.vol"
         self.mesh.ngmesh.Save(str(mesh_filename))
 
         # save exact, predicted, difference as npz
-        npz_filename = file_path / "results.npz"
+        npz_filename = file_path / f"results{suffix}.npz"
         np.savez_compressed(
             npz_filename,
             exact=array_true,
@@ -1457,8 +1460,9 @@ def previous_em():
     from containers import MeshProblemEM
     from graph_creator import GraphCreator
     from train_problems import create_em_problem, create_em_problem_complex
+    from em_magnetostatic_problems import magnetostatic_problem_3
 
-    problem = create_em_problem_complex()
+    problem = magnetostatic_problem_3()
 
     # Initialize FEM solver
     fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
@@ -1481,11 +1485,11 @@ def previous_em():
         residuals_abs = np.absolute(residual.cpu().numpy())
         print(f"Mean residual: {np.mean(residuals_abs)}")
 
-    fem_solver.export_to_vtk_complex(
-        gfA,
-        gfA,
-        filename="results/fem_tests_em/vtk/result",
-    )
+    # fem_solver.export_to_vtk_complex(
+    #     gfA,
+    #     gfA,
+    #     filename="results/fem_tests_em/vtk/result",
+    # )
 
 # def mixed_em():
 #     import ngsolve as ng

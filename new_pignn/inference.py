@@ -8,15 +8,27 @@ import time
 from argparse import Namespace
 from typing import List
 
-# Import our modules
-from meshgraphnet import MeshGraphNet
-from fem import FEMSolver
-from mesh_utils import create_dirichlet_values, create_rectangular_mesh, create_free_node_subgraph, create_gaussian_initial_condition
-from graph_creator import GraphCreator
-from containers import TimeConfig, MeshConfig, MeshProblem
+try:
+    from .meshgraphnet import MeshGraphNet
+    from .fem import FEMSolver
+    from .mesh_utils import (
+        create_dirichlet_values,
+        create_rectangular_mesh,
+        create_free_node_subgraph,
+        create_gaussian_initial_condition,
+    )
+    from .graph_creator import GraphCreator
+    from .containers import TimeConfig, MeshConfig, MeshProblem
+    from .train_problems import create_test_problem, create_industrial_heating_problem
+except ImportError:
+    from meshgraphnet import MeshGraphNet
+    from fem import FEMSolver
+    from mesh_utils import create_dirichlet_values, create_rectangular_mesh, create_free_node_subgraph, create_gaussian_initial_condition
+    from graph_creator import GraphCreator
+    from containers import TimeConfig, MeshConfig, MeshProblem
+    from train_problems import create_test_problem, create_industrial_heating_problem
+    from test_pimgn import PIMGNTrainer
 from torch_geometric.data import Data
-from train_problems import create_test_problem, create_industrial_heating_problem
-from test_pimgn import PIMGNTrainer
 
 def load_trained_model(model_path, problem):
     """Load the trained PIMGN model with proper architecture."""

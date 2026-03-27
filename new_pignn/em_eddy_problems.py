@@ -2,24 +2,6 @@ import numpy as np
 import random
 import ngsolve as ng
 try:
-    from .mesh_utils import (
-        create_rectangular_mesh,
-        create_lshape_mesh,
-        create_gaussian_initial_condition,
-        create_ih_mesh,
-    )
-    from .graph_creator_em import GraphCreatorEM
-    from .containers import TimeConfig, MeshConfig, MeshProblem, MeshProblemEM
-    from .ih_geometry_and_mesh import (
-        IHGeometryAndMesh,
-        BilletParams,
-        TubeParams,
-        SteppedShaftParams,
-        MultiBilletParams,
-        CircularInductorParams,
-        RectangularInductorParams,
-    )
-except ImportError:
     from mesh_utils import (
         create_rectangular_mesh,
         create_lshape_mesh,
@@ -37,9 +19,27 @@ except ImportError:
         CircularInductorParams,
         RectangularInductorParams,
     )
+except ImportError:
+    from .mesh_utils import (
+        create_rectangular_mesh,
+        create_lshape_mesh,
+        create_gaussian_initial_condition,
+        create_ih_mesh,
+    )
+    from .graph_creator_em import GraphCreatorEM
+    from .containers import TimeConfig, MeshConfig, MeshProblem, MeshProblemEM
+    from .ih_geometry_and_mesh import (
+        IHGeometryAndMesh,
+        BilletParams,
+        TubeParams,
+        SteppedShaftParams,
+        MultiBilletParams,
+        CircularInductorParams,
+        RectangularInductorParams,
+    )
 
 
-class GenericMagnetostaticProblem:
+class GenericEddyCurrentProblem:
     def __init__(self, mesh, dirichlet_boundaries, dirichlet_boundaries_dict):
         self.r_star = 70 * 1e-3  # m
         self.A_star = 4.8 * 1e-4  # Wb
@@ -49,7 +49,7 @@ class GenericMagnetostaticProblem:
         self.dirichlet_boundaries = dirichlet_boundaries
         self.dirichlet_boundaries_dict = dirichlet_boundaries_dict
 
-    def get_problem(self):
+    def get_problem(self, current=1000, frequency=8000):
         mesh_config = MeshConfig(
             maxh=1,
             order=1,
@@ -83,9 +83,12 @@ class GenericMagnetostaticProblem:
         )
         problem.set_dirichlet_values_array(dirichlet_vals)
         problem.set_dirichlet_values(self.dirichlet_boundaries_dict)
-        problem.complex = False
+        problem.complex = True
         problem.mixed = False
-        problem.sigma_workpiece = 0
+        problem.frequency = frequency
+        problem.I_coil = current
+        problem.refresh_derived_quantities()
+        problem.sigma_workpiece = 6289308 / problem.sigma_star
         problem.sigma_air = 0
         problem.sigma_coil = 0
 
@@ -100,10 +103,15 @@ class GenericMagnetostaticProblem:
         Js_phi = Js_phi / self.J_star  # Normalize current density
 
         # Material property mapping (mu_r values)
-        mu_r_map = {
-            "mat_workpiece": problem.mu_r_workpiece,
-            "mat_air": problem.mu_r_air,
-            "mat_coil": problem.mu_r_coil,
+        n_nodes = temp_data.pos.shape[0]
+        mu_r_field = np.ones(n_nodes, dtype=np.float64)  # Default to air (mu_r = 1)
+        sigma_field = np.zeros(n_nodes, dtype=np.float64) # Default to 0 conductivity
+        current_density = np.zeros(n_nodes, dtype=np.float64)
+
+        material_encode = {
+            "mat_workpiece": 2,
+            "mat_air": 0,
+            "mat_coil": 1,
         }
 
         # Identify nodes in each material region and assign properties
@@ -117,22 +125,22 @@ class GenericMagnetostaticProblem:
             for v in vertices:
                 node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
                 if 0 <= node_idx < n_nodes:
-                    # Assign mu_r based on material region
-                    if mat_name in mu_r_map:
-                        mu_r_field[node_idx] = mu_r_map[mat_name]
-
-                    # Assign current density (only in coil)
-                    if mat_name == "mat_coil":
+                    mu_r_field[node_idx] = material_encode[mat_name]
+                    if mat_name == "mat_workpiece":
+                        sigma_field[node_idx] = problem.sigma_workpiece
+                    elif mat_name == "mat_coil":
                         current_density[node_idx] = Js_phi
 
         problem.material_field = mu_r_field
-
+        problem.sigma_field = sigma_field
         problem.current_density_field = current_density
+
+        problem.material_field = mu_r_field
 
         return problem
 
 
-def magnetostatic_problem_1():
+def eddy_current_problem_1():
 
     wp = BilletParams(diameter=0.030, height=0.070)
     ind = RectangularInductorParams(
@@ -142,14 +150,14 @@ def magnetostatic_problem_1():
         profile_width=0.007,
         profile_height=0.007,
     )
-    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3)
+    kw = dict(h_workpiece=1e-3, h_air=60e-3, h_coil=1e-3)
     builder = IHGeometryAndMesh(wp, ind, **kw)
     mesh = builder.generate()
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
 
-    problem_generator = GenericMagnetostaticProblem(
+    problem_generator = GenericEddyCurrentProblem(
         mesh, dirichlet_boundaries, dirichlet_boundaries_dict
     )
 
@@ -157,22 +165,24 @@ def magnetostatic_problem_1():
 
     return problem
 
-def magnetostatic_problem_2():
+def eddy_current_problem_2():
+
     wp = BilletParams(diameter=0.030, height=0.070)
-    ind = CircularInductorParams(
+    ind = RectangularInductorParams(
         coil_inner_diameter=0.050,
         coil_height=0.040,
-        winding_count=1,
-        profile_diameter=0.007,
+        winding_count=2,
+        profile_width=0.007,
+        profile_height=0.007,
     )
-    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3)
+    kw = dict(h_workpiece=1e-3, h_air=60e-3, h_coil=1e-3)
     builder = IHGeometryAndMesh(wp, ind, **kw)
     mesh = builder.generate()
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
 
-    problem_generator = GenericMagnetostaticProblem(
+    problem_generator = GenericEddyCurrentProblem(
         mesh, dirichlet_boundaries, dirichlet_boundaries_dict
     )
 
@@ -180,8 +190,9 @@ def magnetostatic_problem_2():
 
     return problem
 
-def magnetostatic_problem_3():
-    wp = TubeParams(outer_diameter=0.03, inner_diameter=0.016, height=0.070)
+def eddy_current_problem_different_currents(current=1000):
+
+    wp = BilletParams(diameter=0.030, height=0.070)
     ind = RectangularInductorParams(
         coil_inner_diameter=0.050,
         coil_height=0.040,
@@ -189,38 +200,17 @@ def magnetostatic_problem_3():
         profile_width=0.007,
         profile_height=0.007,
     )
-    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3)
+    kw = dict(h_workpiece=1e-3, h_air=60e-3, h_coil=1e-3)
     builder = IHGeometryAndMesh(wp, ind, **kw)
     mesh = builder.generate()
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
 
-    problem_generator = GenericMagnetostaticProblem(
+    problem_generator = GenericEddyCurrentProblem(
         mesh, dirichlet_boundaries, dirichlet_boundaries_dict
     )
 
-    problem = problem_generator.get_problem()
-
-    return problem
-
-def magnetostatic_problem_4():
-    wp = BilletParams(diameter=0.030, height=0.070)
-    ind = RectangularInductorParams(
-        coil_inner_diameter=0.050, coil_height=0.040,
-        winding_count=2, profile_width=0.007, profile_height=0.007
-    )
-    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3)
-    builder = IHGeometryAndMesh(wp, ind, **kw)
-    mesh = builder.generate()
-
-    dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
-    dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
-
-    problem_generator = GenericMagnetostaticProblem(
-        mesh, dirichlet_boundaries, dirichlet_boundaries_dict
-    )
-
-    problem = problem_generator.get_problem()
+    problem = problem_generator.get_problem(current=current)
 
     return problem

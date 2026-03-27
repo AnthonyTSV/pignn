@@ -1,14 +1,24 @@
 import numpy as np
 import random
 import ngsolve as ng
-from mesh_utils import (
-    create_rectangular_mesh,
-    create_lshape_mesh,
-    create_gaussian_initial_condition,
-    create_ih_mesh,
-)
-from graph_creator import GraphCreator
-from containers import TimeConfig, MeshConfig, MeshProblem, MeshProblemEM
+try:
+    from .mesh_utils import (
+        create_rectangular_mesh,
+        create_lshape_mesh,
+        create_gaussian_initial_condition,
+        create_ih_mesh,
+    )
+    from .graph_creator import GraphCreator
+    from .containers import TimeConfig, MeshConfig, MeshProblem, MeshProblemEM
+except ImportError:
+    from mesh_utils import (
+        create_rectangular_mesh,
+        create_lshape_mesh,
+        create_gaussian_initial_condition,
+        create_ih_mesh,
+    )
+    from graph_creator import GraphCreator
+    from containers import TimeConfig, MeshConfig, MeshProblem, MeshProblemEM
 
 
 def create_test_problem(maxh=0.2, alpha=1.0):
@@ -944,11 +954,12 @@ def create_em_problem_complex():
     problem.set_dirichlet_values(dirichlet_boundaries_dict)
     problem.complex = True
     problem.mixed = False
+    problem.frequency = 8000
+    problem.I_coil = 1000
+    problem.refresh_derived_quantities()
     problem.sigma_workpiece = 6289308 / problem.sigma_star
     problem.sigma_air = 0
     problem.sigma_coil = 0
-    problem.frequency = 8000
-    problem.I_coil = 1000
 
     # Create material fields (mu_r at each node) based on material subdomain
     n_nodes = temp_data.pos.shape[0]

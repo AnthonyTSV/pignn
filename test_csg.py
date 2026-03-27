@@ -33,7 +33,7 @@ mesh = test_case(
     BilletParams(diameter=0.030, height=0.070),
     RectangularInductorParams(
         coil_inner_diameter=0.050, coil_height=0.040,
-        winding_count=1, profile_width=0.007, profile_height=0.007
+        winding_count=2, profile_width=0.007, profile_height=0.007
     ),
     **kw,
 )

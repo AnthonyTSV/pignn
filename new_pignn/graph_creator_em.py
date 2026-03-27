@@ -315,6 +315,7 @@ def _build_node_features(
     pos: torch.Tensor,
     material_field: Optional[np.ndarray],
     sigma_field: Optional[np.ndarray],
+    current_density_field: Optional[np.ndarray],
     dirichlet_values: Optional[np.ndarray],
     n_nodes: int,
     r_star: float,
@@ -354,6 +355,20 @@ def _build_node_features(
         )  # Default: homogeneous Dirichlet
     features.append(dirichlet_tensor)
 
+    if sigma_field is not None:
+        sigma_tensor = torch.tensor(
+            sigma_field, dtype=torch.float32, device=device
+        ).unsqueeze(1)
+        features.append(sigma_tensor)
+
+    if current_density_field is not None:
+        current_density_tensor = torch.tensor(
+            current_density_field, dtype=torch.float32, device=device
+        ).unsqueeze(1)
+    else:
+        current_density_tensor = torch.zeros(n_nodes, 1, device=device)
+    features.append(current_density_tensor)
+
     return torch.cat(features, dim=1)
 
 
@@ -390,7 +405,7 @@ def _build_edge_features(
 
 
 def _build_global_features(
-    omega: Optional[float], n_nodes: int, device: torch.device = None
+    omega: Optional[float], current: Optional[float], n_nodes: int, device: torch.device = None
 ) -> torch.Tensor:
     """
     Build global feature vector.
@@ -399,10 +414,15 @@ def _build_global_features(
         device = torch.device("cpu")
     if omega is None:
         omega = 0.0
+    if current is None:
+        current = 0.0
+    # global_features = torch.tensor(
+    #     [omega, current], dtype=torch.float32, device=device
+    # )
     global_features = torch.tensor(
-        [omega, float(n_nodes)], dtype=torch.float32, device=device
+        [current], dtype=torch.float32, device=device
     )
-    return global_features
+    return global_features.unsqueeze(0)
 
 
 def _get_nodes_on_boundary(
@@ -463,6 +483,7 @@ class GraphCreatorEM:
         current: Optional[float] = None,
         material_node_field: Optional[np.ndarray] = None,
         sigma_field: Optional[np.ndarray] = None,
+        current_density_field: Optional[np.ndarray] = None,
         dirichlet_values: Optional[np.ndarray] = None,
         omega: Optional[float] = None,
         coil_node_mask=None,
@@ -508,6 +529,7 @@ class GraphCreatorEM:
             pos_tensor,
             material_node_field,
             sigma_field,
+            current_density_field,
             dirichlet_values,
             n_nodes,
             self.r_star,
@@ -518,7 +540,7 @@ class GraphCreatorEM:
         edge_features = _build_edge_features(edge_index, pos_tensor, self.r_star, device)
 
         # 6. Build global features
-        global_features = _build_global_features(omega, n_nodes, device)
+        global_features = _build_global_features(omega, current, n_nodes, device)
 
         # 7. Create auxiliary data
         aux = {

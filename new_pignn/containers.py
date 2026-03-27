@@ -141,8 +141,6 @@ class MeshProblemEM:
         self.A_star = 4.8 * 1e-4  # Wb/m
         self.mu_star = 4 * 3.1415926535e-7  # H/m
         self.J_star = self.A_star / (self.r_star**2 * self.mu_star)
-        self.omega = 2 * ng.pi * self.frequency  # rad/s
-        self.sigma_star = self.J_star / (self.omega * self.A_star)
 
         self.profile_width_phys = 7 * 1e-3
         self.profile_height_phys = 7 * 1e-3
@@ -161,10 +159,19 @@ class MeshProblemEM:
         self.sigma_air = 0.0
         self.sigma_coil = 5.8e7
 
-        self.kappa = self.omega * self.mu_star * (self.r_star**2)  # Nondimensional frequency
-        self.normalized_current = self.N_turns * self.I_coil / self.J_star
+        self.refresh_derived_quantities()
         self.complex = True
         self.mixed = False
+
+    def refresh_derived_quantities(self):
+        """Refresh derived nondimensional EM quantities after parameter updates."""
+        self.omega = float(2 * np.pi * self.frequency)  # rad/s
+        if self.omega == 0.0:
+            self.sigma_star = np.inf
+        else:
+            self.sigma_star = self.J_star / (self.omega * self.A_star)
+        self.kappa = self.omega * self.mu_star * (self.r_star**2)
+        self.normalized_current = self.N_turns * self.I_coil / self.J_star
 
     def set_material_properties(self, material_properties: dict):
         """Set material properties."""

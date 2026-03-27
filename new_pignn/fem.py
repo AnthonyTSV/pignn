@@ -1,12 +1,16 @@
 import numpy as np
-from containers import MeshConfig, MeshProblem, TimeConfig
+try:
+    from .containers import MeshConfig, MeshProblem, TimeConfig
+    from .mesh_utils import create_rectangular_mesh
+except ImportError:
+    from containers import MeshConfig, MeshProblem, TimeConfig
+    from mesh_utils import create_rectangular_mesh
 import ngsolve as ng
 from typing import Optional, List, Tuple
 import torch
 import scipy.sparse as sp
 import os
 from pathlib import Path
-from mesh_utils import create_rectangular_mesh
 
 
 class FEMSolver:

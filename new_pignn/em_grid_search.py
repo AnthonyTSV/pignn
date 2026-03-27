@@ -4,10 +4,14 @@ from typing import List, Tuple
 import numpy as np
 import torch
 import torch.optim as optim
-from trainer_em import PIMGNTrainerEM
-from containers import MeshProblemEM
-
-from train_problems import create_em_problem_complex
+try:
+    from .trainer_em import PIMGNTrainerEM
+    from .containers import MeshProblemEM
+    from .train_problems import create_em_problem_complex
+except ImportError:
+    from trainer_em import PIMGNTrainerEM
+    from containers import MeshProblemEM
+    from train_problems import create_em_problem_complex
 
 def grid_search_hyperparameters(
     problem_fn,

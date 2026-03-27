@@ -8,20 +8,33 @@ import time
 from argparse import Namespace
 from typing import List
 
-# Import our modules
-from meshgraphnet import MeshGraphNet
-from fem import FEMSolver
-from mesh_utils import (
-    create_rectangular_mesh,
-    build_graph_from_mesh,
-    create_free_node_subgraph,
-    create_gaussian_initial_condition,
-    create_dirichlet_values,
-)
-from graph_creator import GraphCreator
-from containers import TimeConfig, MeshConfig, MeshProblem
+try:
+    from .meshgraphnet import MeshGraphNet
+    from .fem import FEMSolver
+    from .mesh_utils import (
+        create_rectangular_mesh,
+        build_graph_from_mesh,
+        create_free_node_subgraph,
+        create_gaussian_initial_condition,
+        create_dirichlet_values,
+    )
+    from .graph_creator import GraphCreator
+    from .containers import TimeConfig, MeshConfig, MeshProblem
+    from .train_problems import create_test_problem, generate_multiple_problems
+except ImportError:
+    from meshgraphnet import MeshGraphNet
+    from fem import FEMSolver
+    from mesh_utils import (
+        create_rectangular_mesh,
+        build_graph_from_mesh,
+        create_free_node_subgraph,
+        create_gaussian_initial_condition,
+        create_dirichlet_values,
+    )
+    from graph_creator import GraphCreator
+    from containers import TimeConfig, MeshConfig, MeshProblem
+    from new_pignn.train_problems import create_test_problem, generate_multiple_problems
 from torch_geometric.data import Data
-from new_pignn.train_problems import create_test_problem, generate_multiple_problems
 
 
 class DataDrivenMGNTrainer:

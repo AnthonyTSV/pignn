@@ -5,13 +5,22 @@ import torch
 import ngsolve as ng
 import numpy as np
 from pydantic import BaseModel
-from mesh_utils import create_ih_mesh
-from containers import MeshConfig, MeshProblem, MeshProblemEM, TimeConfig
-from graph_creator import GraphCreator
-from graph_creator_em import GraphCreatorEM
-from meshgraphnet import MeshGraphNet
-from trainer import PIMGNTrainer
-from trainer_em import PIMGNTrainerEM
+try:
+    from .mesh_utils import create_ih_mesh
+    from .containers import MeshConfig, MeshProblem, MeshProblemEM, TimeConfig
+    from .graph_creator import GraphCreator
+    from .graph_creator_em import GraphCreatorEM
+    from .meshgraphnet import MeshGraphNet
+    from .trainer import PIMGNTrainer
+    from .trainer_em import PIMGNTrainerEM
+except ImportError:
+    from mesh_utils import create_ih_mesh
+    from containers import MeshConfig, MeshProblem, MeshProblemEM, TimeConfig
+    from graph_creator import GraphCreator
+    from graph_creator_em import GraphCreatorEM
+    from meshgraphnet import MeshGraphNet
+    from trainer import PIMGNTrainer
+    from trainer_em import PIMGNTrainerEM
 
 class BoundaryCondition(BaseModel):
     type: str
@@ -260,13 +269,14 @@ class IHNNSolver:
         problem.set_dirichlet_values(dirichlet_boundaries_dict)
         problem.complex = True
         problem.mixed = False
-        problem.sigma_workpiece = 6289308 / problem.sigma_star
-        problem.sigma_air = 0
-        problem.sigma_coil = 0
         problem.frequency = self.source_properties.frequency
         problem.I_coil = self.source_properties.current
         problem.N_turns = self.source_properties.n_turns
         problem.fill_factor = self.source_properties.fill_factor
+        problem.refresh_derived_quantities()
+        problem.sigma_workpiece = 6289308 / problem.sigma_star
+        problem.sigma_air = 0
+        problem.sigma_coil = 0
 
         # Create material fields (mu_r at each node) based on material subdomain
         n_nodes = temp_data.pos.shape[0]

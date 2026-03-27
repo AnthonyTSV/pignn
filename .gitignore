@@ -20,6 +20,9 @@ pre-print-images/
 test_ngsolve/
 test_rectangular/
 
+*.vtk
+*.vtu
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 .vscode/

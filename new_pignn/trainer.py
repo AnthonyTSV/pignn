@@ -9,19 +9,28 @@ import time
 from argparse import Namespace
 from typing import List
 
-# Import our modules
-from logger import TrainingLogger
-from meshgraphnet import MeshGraphNet
-from fem import FEMSolver
-from graph_creator import GraphCreator
-from containers import TimeConfig, MeshConfig, MeshProblem
+try:
+    from .logger import TrainingLogger
+    from .meshgraphnet import MeshGraphNet
+    from .fem import FEMSolver
+    from .graph_creator import GraphCreator
+    from .containers import TimeConfig, MeshConfig, MeshProblem
+except ImportError:
+    from logger import TrainingLogger
+    from meshgraphnet import MeshGraphNet
+    from fem import FEMSolver
+    from graph_creator import GraphCreator
+    from containers import TimeConfig, MeshConfig, MeshProblem
 from torch_geometric.data import Data
 
 
 class PIMGNTrainer:
     """Trainer for Physics-Informed MeshGraphNet (PIMGN)."""
 
-    def __init__(self, problems: List[MeshProblem], config: dict):
+    def __init__(self, problems: List[MeshProblem] | MeshProblem, config: dict):
+        if isinstance(problems, MeshProblem):
+            problems = [problems]
+
         self.problems = problems
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

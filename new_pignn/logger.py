@@ -5,7 +5,10 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import dataclasses
 
-from containers import MeshProblem
+try:
+    from .containers import MeshProblem
+except ImportError:
+    from containers import MeshProblem
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -91,9 +94,28 @@ class TrainingLogger:
         if should_save:
             self.save()
 
-    def log_evaluation(self, data: Any, metric_name: str):
+    def log_evaluation(self, data: Any, metric_name: str, append: bool = False):
         """Log evaluation metrics."""
+        if append:
+            existing = self.log_data["evaluation"].get(metric_name)
+            if existing is None:
+                self.log_data["evaluation"][metric_name] = [data]
+            elif isinstance(existing, list):
+                existing.append(data)
+            else:
+                self.log_data["evaluation"][metric_name] = [existing, data]
+            return
+
         self.log_data["evaluation"][metric_name] = data
+
+    def log_training_l2(self, epoch: int, problem_idx: int, metrics: Dict[str, Any]):
+        """Append training-time L2 metrics for periodic evaluation snapshots."""
+        entry = {
+            "epoch": int(epoch),
+            "problem_idx": int(problem_idx),
+        }
+        entry.update(metrics)
+        self.log_data["training_history"]["l2_error"].append(entry)
 
     def log_problems(self, problems: List[Any]):
         """Log problem configurations."""
