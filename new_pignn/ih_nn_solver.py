@@ -1,13 +1,24 @@
-
 from pathlib import Path
 from typing import Optional
 import torch
 import ngsolve as ng
 import numpy as np
-from pydantic import BaseModel
+
 try:
     from .mesh_utils import create_ih_mesh
-    from .containers import MeshConfig, MeshProblem, MeshProblemEM, TimeConfig
+    from .containers import (
+        MeshConfig,
+        MeshProblem,
+        MeshProblemEM,
+        TimeConfig,
+        BoundaryCondition,
+        DirichletBC,
+        NeumannBC,
+        RobinBC,
+        MaterialPropertiesHeat,
+        MaterialPropertiesEM,
+        SourceProperties,
+    )
     from .graph_creator import GraphCreator
     from .graph_creator_em import GraphCreatorEM
     from .meshgraphnet import MeshGraphNet
@@ -15,56 +26,30 @@ try:
     from .trainer_em import PIMGNTrainerEM
 except ImportError:
     from mesh_utils import create_ih_mesh
-    from containers import MeshConfig, MeshProblem, MeshProblemEM, TimeConfig
+    from containers import (
+        MeshConfig,
+        MeshProblem,
+        MeshProblemEM,
+        TimeConfig,
+        BoundaryCondition,
+        DirichletBC,
+        NeumannBC,
+        RobinBC,
+        MaterialPropertiesHeat,
+        MaterialPropertiesEM,
+        SourceProperties,
+    )
     from graph_creator import GraphCreator
     from graph_creator_em import GraphCreatorEM
     from meshgraphnet import MeshGraphNet
     from trainer import PIMGNTrainer
     from trainer_em import PIMGNTrainerEM
 
-class BoundaryCondition(BaseModel):
-    type: str
-
-class DirichletBC(BoundaryCondition):
-    type: str = "Dirichlet"
-    value: float
-
-class NeumannBC(BoundaryCondition):
-    type: str = "Neumann"
-    value: float
-
-class RobinBC(BoundaryCondition):
-    type: str = "Robin"
-    value: tuple # (h, T_amb)
-
-class MaterialPropertiesHeat(BaseModel):
-    rho: float # mass density
-    cp: float # specific heat capacity
-    k: float # thermal conductivity
-    h_conv: Optional[float] = None
-    thermal_diffusivity: Optional[float] = None # alpha = k / (rho * cp)
-
-    def __init__(self, **data):
-        super().__init__(**data)
-        if self.thermal_diffusivity is None:
-            self.thermal_diffusivity = self.k / (self.rho * self.cp)
-        if self.h_conv is None:
-            self.h_conv = 10.0 / (self.rho * self.cp)
-
-class MaterialPropertiesEM(BaseModel):
-    sigma: float # electrical conductivity
-    mu: float # magnetic permeability
-
-class SourceProperties(BaseModel):
-    frequency: float
-    current: float
-    fill_factor: float = 1.0
-    n_turns: int = 1
 
 class IHNNSolver:
     def __init__(
-        self, 
-        path_to_thermal_model: Path, 
+        self,
+        path_to_thermal_model: Path,
         path_to_em_model: Path,
         mesh: ng.Mesh,
         boundary_conditions_heat: dict[str, BoundaryCondition],
@@ -89,7 +74,6 @@ class IHNNSolver:
         self.em_model = None
         self.thermal_model = None
 
-
     def _load_checkpoint(self, path_to_model: Path):
         """
         PyTorch 2.6 changed the default `weights_only` of torch.load from False -> True.
@@ -109,10 +93,16 @@ class IHNNSolver:
         """
         Get time window from checkpoint.
         """
-        state = checkpoint if "model_state_dict" not in checkpoint else checkpoint["model_state_dict"]
+        state = (
+            checkpoint
+            if "model_state_dict" not in checkpoint
+            else checkpoint["model_state_dict"]
+        )
 
         if not "time_window" in checkpoint:
-            print("Warning: time_window not found in checkpoint, inferring from model weights. This may be unreliable.")
+            print(
+                "Warning: time_window not found in checkpoint, inferring from model weights. This may be unreliable."
+            )
         else:
             return checkpoint["time_window"]
 
@@ -128,7 +118,7 @@ class IHNNSolver:
         if key_linear in state:
             return state[key_linear].shape[0]
 
-        return 20 # default
+        return 20  # default
 
     def _set_thermal_model(self, path_to_model: Path, joule_heating: np.ndarray):
         checkpoint = self._load_checkpoint(path_to_model)
@@ -138,9 +128,15 @@ class IHNNSolver:
         neumann_names = [name for name, bc in bcs.items() if bc.type == "Neumann"]
         robin_names = [name for name, bc in bcs.items() if bc.type == "Robin"]
 
-        dirichlet_boundaries_dict = {name: bc.value for name, bc in bcs.items() if bc.type == "Dirichlet"}
-        neumann_boundaries_dict = {name: bc.value for name, bc in bcs.items() if bc.type == "Neumann"}
-        robin_boundaries_dict = {name: bc.value for name, bc in bcs.items() if bc.type == "Robin"}
+        dirichlet_boundaries_dict = {
+            name: bc.value for name, bc in bcs.items() if bc.type == "Dirichlet"
+        }
+        neumann_boundaries_dict = {
+            name: bc.value for name, bc in bcs.items() if bc.type == "Neumann"
+        }
+        robin_boundaries_dict = {
+            name: bc.value for name, bc in bcs.items() if bc.type == "Robin"
+        }
 
         # Create graph to get node positions
         graph_creator = GraphCreator(
@@ -195,7 +191,8 @@ class IHNNSolver:
             mesh=self.mesh,
             graph_data=temp_data,
             initial_condition=initial_condition,
-            alpha=self.material_properties.thermal_diffusivity,  # Thermal diffusivity
+            rho_cp=self.material_properties.rho * self.material_properties.cp,
+            k=self.material_properties.k,
             time_config=self.time_config,
             mesh_config=mesh_config,
             problem_id=0,
@@ -231,8 +228,12 @@ class IHNNSolver:
     def _set_em_model(self, path_to_model: Path):
         bcs = self.boundary_conditions_em
 
-        dirichlet_boundaries = [name for name, bc in bcs.items() if bc.type == "Dirichlet"]
-        dirichlet_boundaries_dict = {name: bc.value for name, bc in bcs.items() if bc.type == "Dirichlet"}
+        dirichlet_boundaries = [
+            name for name, bc in bcs.items() if bc.type == "Dirichlet"
+        ]
+        dirichlet_boundaries_dict = {
+            name: bc.value for name, bc in bcs.items() if bc.type == "Dirichlet"
+        }
         # Mesh configuration
         mesh_config = MeshConfig(
             maxh=1,
@@ -281,7 +282,7 @@ class IHNNSolver:
         # Create material fields (mu_r at each node) based on material subdomain
         n_nodes = temp_data.pos.shape[0]
         mu_r_field = np.ones(n_nodes, dtype=np.float64)  # Default to air (mu_r = 1)
-        sigma_field = np.zeros(n_nodes, dtype=np.float64) # Default to 0 conductivity
+        sigma_field = np.zeros(n_nodes, dtype=np.float64)  # Default to 0 conductivity
         current_density = np.zeros(n_nodes, dtype=np.float64)
 
         # Calculate current density in the coil: J = N * I / A_coil
@@ -329,15 +330,21 @@ class IHNNSolver:
 
     def compute_joule_heat(self, A):
         """
-        Compute Joule heating: Q = 1/2 * sigma * |E|^2, 
+        Compute Joule heating: Q = 1/2 * sigma * |E|^2,
         where E is the electric field derived from the potential A.
         """
         gfu = ng.GridFunction(self.em_model.all_fem_solvers[0].fes)
         gfu.vec.data = A
         omega = 2 * np.pi * self.source_properties.frequency
         E_phi = -1j * omega * gfu
-        heat_source_gf = 0.5 * self.material_properties_em["mat_workpiece"].sigma * ng.Norm(E_phi)**2
-        heat_source = self.get_source_function(heat_source_gf, self.em_model.problems[0].n_nodes)
+        heat_source_gf = (
+            0.5
+            * self.material_properties_em["mat_workpiece"].sigma
+            * ng.Norm(E_phi) ** 2
+        )
+        heat_source = self.get_source_function(
+            heat_source_gf, self.em_model.problems[0].n_nodes
+        )
         return heat_source
 
     def solve_thermal(self):
@@ -348,13 +355,20 @@ class IHNNSolver:
         self.em_model = self._set_em_model(self.path_to_em_model)
         em_solution = self.solve_em()
         joule_heat = self.compute_joule_heat(em_solution)
-        self.thermal_model = self._set_thermal_model(self.path_to_thermal_model, joule_heat)
+        self.thermal_model = self._set_thermal_model(
+            self.path_to_thermal_model, joule_heat
+        )
         thermal_solution = self.solve_thermal()
         return thermal_solution
 
+
 if __name__ == "__main__":
-    path_to_thermal = Path("results/physics_informed/em_to_thermal/pimgn_trained_model.pth")
-    path_to_em = Path("results/physics_informed/test_em_problem_complex/pimgn_trained_model.pth")
+    path_to_thermal = Path(
+        "results/physics_informed/em_to_thermal/pimgn_trained_model.pth"
+    )
+    path_to_em = Path(
+        "results/physics_informed/test_em_problem_complex/pimgn_trained_model.pth"
+    )
     mesh = create_ih_mesh()
     material_properties_heat = MaterialPropertiesHeat(
         rho=7870,

@@ -346,10 +346,27 @@ def _build_node_features(
     source_values: Optional[np.ndarray],
     n_nodes: int,
     device: torch.device = None,
+    k_table_ref_values: Optional[np.ndarray] = None,
 ) -> torch.Tensor:
     """
     Build node feature matrix according to PI-MGN methodology.
-    Features: [one_hot_node_type(4), T_current(1), t_scalar(1), material(1), neumann_value(1), dirichlet_value(1), robin_h(1), robin_amb(1), source(1)]
+
+    Features (constant-k):
+        [one_hot_node_type(4), T_current(1), t_scalar(1), material(1),
+         neumann_value(1), dirichlet_value(1), robin_h(1), robin_amb(1), source(1)]
+        → 12 features
+
+    Features (temperature-dependent k):
+        [one_hot_node_type(4), T_current(1), t_scalar(1), k_at_T(1), k_ref_1..k_ref_N(N_ref),
+         neumann_value(1), dirichlet_value(1), robin_h(1), robin_amb(1), source(1)]
+        → 12 + N_ref features
+
+    Parameters
+    ----------
+    k_table_ref_values : np.ndarray, optional
+        Shape ``(N_ref,)``.  k sampled at fixed reference temperatures.
+        When provided, the material slot is expanded to include both the
+        instantaneous ``k(T_current)`` and the static reference samples.
     """
     if device is None:
         device = node_types.device
@@ -375,7 +392,7 @@ def _build_node_features(
     t_tensor = torch.full((n_nodes, 1), t_scalar, dtype=torch.float32, device=device)
     features.append(t_tensor)
 
-    # Material field
+    # Material field: k(T_current) as the per-node instantaneous conductivity
     if material_field is not None:
         mat_tensor = torch.tensor(
             material_field, dtype=torch.float32, device=device
@@ -383,6 +400,15 @@ def _build_node_features(
     else:
         mat_tensor = torch.ones(n_nodes, 1, device=device)  # Default material
     features.append(mat_tensor)
+
+    # Table reference samples: static per problem, broadcast to all nodes.
+    # Encodes the k(T) curve shape for material generalization.
+    if k_table_ref_values is not None:
+        ref_vals = np.asarray(k_table_ref_values, dtype=np.float32)
+        ref_tensor = torch.tensor(ref_vals, dtype=torch.float32, device=device)
+        # Broadcast [N_ref] → [N_nodes, N_ref]
+        ref_tensor = ref_tensor.unsqueeze(0).expand(n_nodes, -1)
+        features.append(ref_tensor)
 
     # Neumann boundary values (flux values h_N from paper)
     if neumann_values is not None:
@@ -569,6 +595,7 @@ class GraphCreator:
         robin_values: Optional[Tuple[np.ndarray, np.ndarray]] = None,
         source_values: Optional[np.ndarray] = None,
         wp_node_mask: Optional[np.ndarray] = None,
+        k_table_ref_values: Optional[np.ndarray] = None,
         add_self_loops: bool = True,
         device: Optional[torch.device] = None,
     ) -> Tuple[Data, Dict]:
@@ -619,6 +646,7 @@ class GraphCreator:
             source_values,
             n_nodes,
             device,
+            k_table_ref_values=k_table_ref_values,
         )
 
         # 5. Build edge features

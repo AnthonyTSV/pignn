@@ -1,66 +1,28 @@
 import numpy as np
 
-def compute_relative_field_error(
-    exact_field: np.ndarray, predicted_field: np.ndarray
-) -> float:
+def compute_relative_error(exact_field: np.ndarray, predicted_field: np.ndarray) -> np.ndarray:
     r"""
-    Compute the relative L2 error between the exact and predicted fields.
-    \varepsilon_{L^2}(u) =
-    \frac{\left\|u_{\mathrm{pred}} - u_{\mathrm{ref}}\right\|_{L^2(\Omega)}}
-    {\left\|u_{\mathrm{ref}}\right\|_{L^2(\Omega)}}
+    Compute the relative error between the exact and predicted fields.
+    \varepsilon_{\mathrm{rel}}(t_i) =
+    \frac{\left\|u_{\mathrm{pred}}(\cdot, t_i) - u_{\mathrm{ref}}(\cdot, t_i)\right\|_{L^2(\Omega)}}
+    {\left\|u_{\mathrm{ref}}(\cdot, t_i)\right\|_{L^2(\Omega)} + \epsilon} \times 100\%
     """
-    # Compute the L2 norm of the error
-    error = np.linalg.norm(exact_field - predicted_field)
-
-    # Compute the L2 norm of the exact field
-    exact_norm = np.linalg.norm(exact_field)
-
-    # Avoid division by zero
-    if exact_norm == 0:
-        return 0.0
+    # Compute the absolute error
+    abs_err = np.abs(predicted_field - exact_field)
 
     # Compute the relative error
-    relative_error = error / exact_norm
+    rel_err = abs_err / (np.max(exact_field) - np.min(exact_field)) * 100.0
 
-    return relative_error
+    return rel_err
 
 
-def compute_maximum_pointwise_error(
-    exact_field: np.ndarray, predicted_field: np.ndarray
-) -> float:
-    r"""
-    Compute the maximum pointwise error between the exact and predicted fields.
-    \varepsilon_{\infty}(u) =
-    \frac{\left\|u_{\mathrm{pred}} - u_{\mathrm{ref}}\right\|_{L^\infty(\Omega)}}
-    {\left\|u_{\mathrm{ref}}\right\|_{L^\infty(\Omega)} + \epsilon}
+def compute_l2_error(predicted_field: np.ndarray, exact_field: np.ndarray) -> float:
     """
-    # Compute the maximum pointwise error
-    pointwise_error = np.max(np.abs(exact_field - predicted_field))
-
-    # Compute the maximum value of the exact field
-    exact_max = np.max(np.abs(exact_field))
-
-    # Add a small epsilon to avoid division by zero
-    epsilon = 1e-8
-
-    # Compute the relative maximum pointwise error
-    relative_pointwise_error = pointwise_error / (exact_max + epsilon)
-
-    return relative_pointwise_error
-
-
-def compute_probe_point_error(
-    exact_field: np.ndarray, predicted_field: np.ndarray, probe_index: int
-):
-    r"""
-    Compute the pointwise error at a specific probe location.
-    \varepsilon_{\mathrm{probe}}(t_i) =
-    \left|u_{\mathrm{pred}}(\mathbf{x}_p, t_i) - u_{\mathrm{ref}}(\mathbf{x}_p, t_i)\right|
+    Compute normalized L2 error between the predicted and exact fields for all time steps.
     """
-    if probe_index < 0 or probe_index >= len(exact_field):
-        raise ValueError("Probe index is out of bounds.")
-
-    # Compute the pointwise error at the probe location
-    probe_error = np.abs(predicted_field[probe_index] - exact_field[probe_index])
-
-    return probe_error
+    if isinstance(predicted_field, list):
+        predicted_field = np.array(predicted_field)
+    if isinstance(exact_field, list):
+        exact_field = np.array(exact_field)
+    l2_err = np.sqrt(np.mean(np.sum((predicted_field - exact_field) ** 2, axis=tuple(range(1, predicted_field.ndim))))) / np.sqrt(np.mean(np.sum(exact_field ** 2, axis=tuple(range(1, exact_field.ndim)))))
+    return l2_err

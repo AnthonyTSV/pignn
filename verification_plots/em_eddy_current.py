@@ -10,11 +10,11 @@ import vtk
 import ngsolve as ng
 import netgen
 import scienceplots
+from helpers.error_metrics import compute_relative_error
 from helpers.vtk_extractor import VTKToPlotConverter
 from helpers.line_data_extractor import ExtractDataOverLine
 from helpers.plot_helpers import (
     plot_l2,
-    epoch_vs_l2,
     epoch_vs_train_loss,
     epoch_vs_training_l2,
     _get_run_label,
@@ -25,16 +25,9 @@ from new_pignn.plotter import load_log
 
 plt.style.use(["science", "grid"])
 
-plt.rcParams.update(
-    {
-        "font.family": "serif",
-        "font.serif": ["cmr10"],
-        "font.sans-serif": ["cmss10"],
-        "font.monospace": ["cmtt10"],
-        "axes.formatter.use_mathtext": True,
-        "font.size": 14,
-    }
-)
+from helpers.mpl_style import apply_mpl_style
+
+apply_mpl_style()
 
 
 def get_train_loss(log_path: Path) -> np.ndarray:
@@ -128,21 +121,13 @@ diff_e_real2 = ng.GridFunction(space2)
 diff_e_imag2 = ng.GridFunction(space2)
 diff_e_abs2 = ng.GridFunction(space2)
 
-diff_e_real1.vec[:].FV().NumPy()[:] = np.abs(data1["exact"].real - data1["predicted"].real) / (
-    np.abs(data1["exact"].real) + 1e-10
-)
-diff_e_imag1.vec[:].FV().NumPy()[:] = np.abs(data1["exact"].imag - data1["predicted"].imag) / (
-    np.abs(data1["exact"].imag) + 1e-10
-)
-diff_e_abs1.vec[:].FV().NumPy()[:] = np.abs(data1["exact"] - data1["predicted"]) / (np.abs(data1["exact"]) + 1e-10)
+diff_e_real1.vec[:].FV().NumPy()[:] = compute_relative_error(data1["exact"].real, data1["predicted"].real)
+diff_e_imag1.vec[:].FV().NumPy()[:] = compute_relative_error(data1["exact"].imag, data1["predicted"].imag)
+diff_e_abs1.vec[:].FV().NumPy()[:] = compute_relative_error(data1["exact"], data1["predicted"])
 
-diff_e_real2.vec[:].FV().NumPy()[:] = np.abs(data2["exact"].real - data2["predicted"].real) / (
-    np.abs(data2["exact"].real) + 1e-10
-)
-diff_e_imag2.vec[:].FV().NumPy()[:] = np.abs(data2["exact"].imag - data2["predicted"].imag) / (
-    np.abs(data2["exact"].imag) + 1e-10
-)
-diff_e_abs2.vec[:].FV().NumPy()[:] = np.abs(data2["exact"] - data2["predicted"]) / (np.abs(data2["exact"]) + 1e-10)
+diff_e_real2.vec[:].FV().NumPy()[:] = compute_relative_error(data2["exact"].real, data2["predicted"].real)
+diff_e_imag2.vec[:].FV().NumPy()[:] = compute_relative_error(data2["exact"].imag, data2["predicted"].imag)
+diff_e_abs2.vec[:].FV().NumPy()[:] = compute_relative_error(data2["exact"], data2["predicted"])
 # save as vtk
 
 vtk_out = ng.VTKOutput(
@@ -229,7 +214,7 @@ point2 = (0.0149, 0.13970934571534108, 0)
 
 
 def do_for_one(vtk_file, point1, point2, list_field_names=["J_abs_fem", "J_abs_gnn"], axis=1):
-    extract_data = ExtractDataOverLine(vtk_file)
+    extract_data = ExtractDataOverLine(vtk_file, has_time_data=False)
     extract_data.set_points(point1, point2)
     result_data = extract_data.get_data(list_field_names)
     predicted_solution = np.array(result_data.results[list_field_names[1]])
@@ -300,10 +285,6 @@ ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
 ax_err.grid(True)
 ax_err.legend(frameon=True, ncols=2)
 
-for a in (ax, ax_err):
-    a.spines["top"].set_visible(False)
-    a.spines["right"].set_visible(False)
-
 plt.savefig(save_dir / "curr_dens_line_plot_coils.pdf", dpi=300)
 
 # Q line plot
@@ -368,15 +349,11 @@ ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
 ax_err.grid(True)
 ax_err.legend(frameon=True, ncols=2)
 
-for a in (ax, ax_err):
-    a.spines["top"].set_visible(False)
-    a.spines["right"].set_visible(False)
-
 plt.savefig(save_dir / "q_line_plot_coils.pdf", dpi=300)
 
 # Plot over line for thickness
 
-point1 = (0.009, 0.075, 0)
+point1 = (0, 0.075, 0)
 point2 = (0.0149, 0.075, 0)
 
 line, predicted_solution, fem_solution = do_for_one(vtk_file_1_coil, point1, point2, axis=0)
@@ -385,11 +362,8 @@ z_mm = 1e3 * line
 
 _, predicted_solution_2, fem_solution_2 = do_for_one(vtk_file_2_coil, point1, point2, axis=0)
 
-abs_err = np.abs(predicted_solution - fem_solution)
-rel_err = abs_err / np.maximum(np.abs(fem_solution), 1e-12) * 100.0
-
-abs_err_2 = np.abs(predicted_solution_2 - fem_solution_2)
-rel_err_2 = abs_err_2 / np.maximum(np.abs(fem_solution_2), 1e-12) * 100.0
+rel_err = compute_relative_error(fem_solution, predicted_solution)
+rel_err_2 = compute_relative_error(fem_solution_2, predicted_solution_2)
 
 fig, (ax, ax_err) = plt.subplots(
     2,
@@ -440,10 +414,6 @@ ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
 ax_err.grid(True)
 ax_err.legend(frameon=True, ncols=2)
 
-for a in (ax, ax_err):
-    a.spines["top"].set_visible(False)
-    a.spines["right"].set_visible(False)
-
 plt.savefig(save_dir / "curr_dens_line_plot_coils_thickness.pdf", dpi=300)
 
 # Q line plot over thickness
@@ -454,11 +424,8 @@ z_mm = 1e3 * line
 
 _, predicted_solution_2, fem_solution_2 = do_for_one(vtk_file_2_coil, point1, point2, axis=0, list_field_names=["Q_fem", "Q_gnn"])
 
-abs_err = np.abs(predicted_solution - fem_solution)
-rel_err = abs_err / np.maximum(np.abs(fem_solution), 1e-12) * 100.0
-
-abs_err_2 = np.abs(predicted_solution_2 - fem_solution_2)
-rel_err_2 = abs_err_2 / np.maximum(np.abs(fem_solution_2), 1e-12) * 100.0
+rel_err = compute_relative_error(fem_solution, predicted_solution)
+rel_err_2 = compute_relative_error(fem_solution_2, predicted_solution_2)
 
 fig, (ax, ax_err) = plt.subplots(
     2,
@@ -509,13 +476,9 @@ ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
 ax_err.grid(True)
 ax_err.legend(frameon=True, ncols=2)
 
-for a in (ax, ax_err):
-    a.spines["top"].set_visible(False)
-    a.spines["right"].set_visible(False)
-
 plt.savefig(save_dir / "q_line_plot_coils_thickness.pdf", dpi=300)
 
-plotter1 = VTKToPlotConverter(vtk_file_1_coil, last_time_step=0, val_range=(0, 2.5))
+plotter1 = VTKToPlotConverter(vtk_file_1_coil, last_time_step=0, val_range=(0, 2.5), has_time_data=False)
 plotter1.plot_steady_state(
     save_dir / "steady_state_1_coil_real.pdf",
     exact_field_name="E_real_fem",
@@ -556,7 +519,7 @@ plotter1.plot_steady_state(
     contours=True,
 )
 
-plotter2 = VTKToPlotConverter(vtk_file_2_coil, last_time_step=0, val_range=(0, 2.5))
+plotter2 = VTKToPlotConverter(vtk_file_2_coil, last_time_step=0, val_range=(0, 2.5), has_time_data=False)
 plotter2.plot_steady_state(
     save_dir / "steady_state_2_coil_real.pdf",
     exact_field_name="E_real_fem",

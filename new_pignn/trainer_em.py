@@ -53,7 +53,7 @@ except ImportError:
         eddy_current_problem_2,
         eddy_current_problem_different_currents,
     )
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 
 
 def _load_compatible_model_state(model: nn.Module, state_dict: dict) -> tuple[list[str], list[str]]:
@@ -125,7 +125,7 @@ class PIMGNTrainerEM:
         sigma_field = getattr(first_problem, "sigma_field", None)
         current_density_field = getattr(first_problem, "current_density_field", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
-        omega = getattr(first_problem, "omega", None)
+        kappa = getattr(first_problem, "kappa", None)
         current = getattr(first_problem, "normalized_current", None)
         # coil_node_mask = getattr(first_problem, "coil_node_mask", None)
 
@@ -135,7 +135,7 @@ class PIMGNTrainerEM:
             sigma_field=sigma_field,
             current_density_field=current_density_field,
             dirichlet_values=dirichlet_vals,
-            omega=omega,
+            omega=kappa,
             current=current,
             # coil_node_mask=coil_node_mask,
         )
@@ -451,6 +451,161 @@ class PIMGNTrainerEM:
 
         return residual
 
+    def train_step_batched(
+        self,
+        problem_indices: List[int],
+        ground_truths: dict = None,
+        data_weight: float = 0.0,
+    ):
+        """
+        Batched training step: build graphs for multiple problems, run a single
+        forward pass through the model, then compute per-problem physics losses.
+
+        Args:
+            problem_indices: List of problem indices to train on in this batch.
+            ground_truths: Dict mapping problem_idx -> ground truth dict.
+            data_weight: Weight for data supervision loss.
+
+        Returns:
+            Tuple of (avg_loss_value, dict of {prob_idx: prediction_full}).
+        """
+        self.optimizer.zero_grad()
+
+        # ---- Build per-problem free-node graphs ----
+        free_data_list: List[Data] = []
+        per_problem_meta: List[dict] = []  # aux, node_mapping, problem info per graph
+
+        for prob_idx in problem_indices:
+            problem = self.problems[prob_idx]
+            graph_creator = self.all_graph_creators[prob_idx]
+
+            if hasattr(problem, "refresh_derived_quantities"):
+                problem.refresh_derived_quantities()
+
+            data, aux = graph_creator.create_graph(
+                A_current=None,
+                material_node_field=getattr(problem, "material_field", None),
+                sigma_field=getattr(problem, "sigma_field", None),
+                current_density_field=getattr(problem, "current_density_field", None),
+                dirichlet_values=getattr(problem, "dirichlet_values_array", None),
+                omega=getattr(problem, "kappa", None),
+                current=getattr(problem, "normalized_current", None),
+            )
+            free_data, node_mapping, free_aux = graph_creator.create_free_node_subgraph(
+                data=data, aux=aux
+            )
+            free_data_list.append(free_data)
+            per_problem_meta.append({
+                "prob_idx": prob_idx,
+                "aux": aux,
+                "node_mapping": node_mapping,
+                "problem": problem,
+            })
+
+        # ---- Batch all free-node graphs into one ----
+        batched_data = Batch.from_data_list(free_data_list)
+        batched_data = batched_data.to(self.device)
+
+        # ---- Single forward pass ----
+        batched_prediction = self.model.forward(batched_data)
+
+        # ---- Split predictions back per-problem ----
+        batch_tensor = batched_data.batch  # [N_total] graph id per node
+        total_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+        total_loss_A = 0.0
+        total_loss_phi = 0.0
+        total_loss_data = 0.0
+        predictions_out = {}
+
+        for i, meta in enumerate(per_problem_meta):
+            prob_idx = meta["prob_idx"]
+            problem = meta["problem"]
+            aux = meta["aux"]
+            node_mapping = meta["node_mapping"]
+
+            # Extract this problem's nodes from the batched prediction
+            node_mask = batch_tensor == i
+            prediction_free = batched_prediction[node_mask]
+
+            # Apply axis regularisation ansatz
+            free_pos = batched_data.pos[node_mask]
+            prediction_free = self._apply_axis_regularized_ansatz(
+                prediction_free, free_pos, problem,
+            )
+
+            # Physics loss (per-problem, uses its own FEM solver)
+            physics_loss = self.compute_physics_informed_loss(
+                prediction_free, prob_idx, aux, node_mapping,
+            )
+
+            # Optional data supervision loss
+            d_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+            gt = ground_truths.get(prob_idx) if ground_truths else None
+            if gt is not None and data_weight > 0:
+                free_to_original = node_mapping["free_to_original"].to(self.device)
+                n_total = int(node_mapping.get("n_original"))
+
+                pred_A_real = torch.zeros(n_total, dtype=torch.float64, device=self.device)
+                pred_A_imag = torch.zeros(n_total, dtype=torch.float64, device=self.device)
+                pred_A_real[free_to_original] = prediction_free[:, 0].to(dtype=torch.float64)
+                pred_A_imag[free_to_original] = prediction_free[:, 1].to(dtype=torch.float64)
+
+                gt_A_real, gt_A_imag = gt["A_real"], gt["A_imag"]
+                gt_A_norm = torch.sqrt((gt_A_real**2 + gt_A_imag**2).sum()).clamp_min(1e-10)
+                d_loss_A = (
+                    (pred_A_real - gt_A_real) ** 2 + (pred_A_imag - gt_A_imag) ** 2
+                ).mean() / (gt_A_norm**2 / n_total)
+
+                d_loss = d_loss_A
+
+                if self.is_mixed and "coil_node_indices" in gt:
+                    pred_phi_real = torch.zeros(n_total, dtype=torch.float64, device=self.device)
+                    pred_phi_imag = torch.zeros(n_total, dtype=torch.float64, device=self.device)
+                    pred_phi_real[free_to_original] = prediction_free[:, 2].to(dtype=torch.float64)
+                    pred_phi_imag[free_to_original] = prediction_free[:, 3].to(dtype=torch.float64)
+
+                    coil_idx = gt["coil_node_indices"]
+                    gt_phi_norm = torch.sqrt(
+                        (gt["phi_real"]**2 + gt["phi_imag"]**2).sum()
+                    ).clamp_min(1e-10)
+                    n_phi = len(coil_idx)
+                    d_loss_phi = (
+                        (pred_phi_real[coil_idx] - gt["phi_real"]) ** 2
+                        + (pred_phi_imag[coil_idx] - gt["phi_imag"]) ** 2
+                    ).mean() / (gt_phi_norm**2 / n_phi)
+                    d_loss = d_loss + d_loss_phi
+
+            total_loss = total_loss + physics_loss + data_weight * d_loss
+            total_loss_A += self._last_loss_A
+            total_loss_phi += self._last_loss_phi
+            total_loss_data += d_loss.item() if isinstance(d_loss, torch.Tensor) else d_loss
+
+            # Reconstruct full prediction for logging
+            prediction_np = prediction_free.detach().cpu().numpy()
+            n_total = int(node_mapping.get("n_original", problem.n_nodes))
+            prediction_full = np.zeros(n_total, dtype=np.float64)
+            free_to_orig_np = node_mapping["free_to_original"].cpu().numpy()
+            prediction_full[free_to_orig_np] = prediction_np[:, 0]
+            dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
+            if dirichlet_vals is not None:
+                dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
+                prediction_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
+            predictions_out[prob_idx] = prediction_full
+
+        # Average the loss across problems in the batch
+        n_batch = len(problem_indices)
+        total_loss = total_loss / n_batch
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
+        self._last_loss_A = total_loss_A / n_batch
+        self._last_loss_phi = total_loss_phi / n_batch
+        self._last_data_loss = total_loss_data / n_batch
+
+        return total_loss.item(), predictions_out
+
     def train_step(
         self, problem_idx, prediction=None, ground_truth=None, data_weight=0.0
     ):
@@ -478,7 +633,7 @@ class PIMGNTrainerEM:
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
         current_density_field = getattr(problem, "current_density_field", None)
-        omega = getattr(problem, "omega", None)
+        kappa = getattr(problem, "kappa", None)
         current = getattr(problem, "normalized_current", None)
         # coil_node_mask = getattr(problem, "coil_node_mask", None)
 
@@ -491,7 +646,7 @@ class PIMGNTrainerEM:
             sigma_field=sigma_field,
             current_density_field=current_density_field,
             dirichlet_values=dirichlet_vals,
-            omega=omega,
+            omega=kappa,
             current=current,
             # coil_node_mask=coil_node_mask,
         )
@@ -684,29 +839,50 @@ class PIMGNTrainerEM:
             # Compute current data weight (decay schedule)
             data_weight = data_weight_init * (data_weight_decay**epoch)
 
-            # --- Train on ALL problems each epoch ---
+            # --- Train on ALL problems each epoch (batched) ---
+            batch_size = self.config.get("batch_size", 1)
             epoch_loss = 0.0
             epoch_loss_A = 0.0
             epoch_loss_phi = 0.0
             epoch_loss_data = 0.0
-            for prob_idx in train_problems_indices:
-                loss, prediction_next = self.train_step(
-                    prob_idx,
-                    prediction=predictions[prob_idx],
-                    ground_truth=self._ground_truth_tensors.get(prob_idx),
-                    data_weight=data_weight,
-                )
-                predictions[prob_idx] = prediction_next
+            n_batches = 0
+
+            # Split training problems into mini-batches
+            shuffled_indices = list(train_problems_indices)
+            for batch_start in range(0, len(shuffled_indices), batch_size):
+                batch_indices = shuffled_indices[batch_start : batch_start + batch_size]
+
+                if len(batch_indices) > 1:
+                    # Batched training: multiple problems in one forward pass
+                    loss, batch_predictions = self.train_step_batched(
+                        batch_indices,
+                        ground_truths=self._ground_truth_tensors,
+                        data_weight=data_weight,
+                    )
+                    for pidx, pred in batch_predictions.items():
+                        predictions[pidx] = pred
+                else:
+                    # Single problem: use original (slightly cheaper) path
+                    prob_idx = batch_indices[0]
+                    loss, prediction_next = self.train_step(
+                        prob_idx,
+                        prediction=predictions[prob_idx],
+                        ground_truth=self._ground_truth_tensors.get(prob_idx),
+                        data_weight=data_weight,
+                    )
+                    predictions[prob_idx] = prediction_next
+
                 epoch_loss += loss
                 epoch_loss_A += self._last_loss_A
                 epoch_loss_phi += self._last_loss_phi
                 epoch_loss_data += self._last_data_loss
+                n_batches += 1
 
-            # Average loss across problems
-            epoch_loss /= n_train
-            epoch_loss_A /= n_train
-            epoch_loss_phi /= n_train
-            epoch_loss_data /= n_train
+            # Average loss across mini-batches
+            epoch_loss /= n_batches
+            epoch_loss_A /= n_batches
+            epoch_loss_phi /= n_batches
+            epoch_loss_data /= n_batches
 
             self.losses.append(epoch_loss)
 
@@ -850,7 +1026,7 @@ class PIMGNTrainerEM:
         material_field = getattr(problem, "material_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
         current_density_field = getattr(problem, "current_density_field", None)
-        omega = getattr(problem, "omega", None)
+        kappa = getattr(problem, "kappa", None)
         current = getattr(problem, "normalized_current", None)
         # coil_node_mask = getattr(problem, "coil_node_mask", None)
 
@@ -862,7 +1038,7 @@ class PIMGNTrainerEM:
                 sigma_field=sigma_field,
                 current_density_field=current_density_field,
                 dirichlet_values=dirichlet_vals,
-                omega=omega,
+                omega=kappa,
                 current=current,
                 # coil_node_mask=coil_node_mask,
             )
@@ -1260,11 +1436,9 @@ def train_pimgn_eddy_current(resume_from: str = None):
 
 
 def train_pimgn_eddy_current_different_currents(resume_from: str = None):
+    freq_range = np.arange(2000, 7000, 500)
     problems = [
-        # eddy_current_problem_different_currents(current=100),
-        # eddy_current_problem_different_currents(current=200),
-        eddy_current_problem_different_currents(current=500),
-        eddy_current_problem_different_currents(current=1000),
+        eddy_current_problem_different_currents(frequency=freq) for freq in freq_range
     ]
     config = {
         "epochs": 10000,
@@ -1273,6 +1447,7 @@ def train_pimgn_eddy_current_different_currents(resume_from: str = None):
         "save_dir": "results/physics_informed/eddy_current_problem_circ_coil_currents",
         "enforce_axis_regularity": True,
         "data_weight": 0.0,
+        "batch_size": 2,  # Number of problems per mini-batch (paper uses 2)
         "resume_from": resume_from,  # Path to checkpoint to resume from
     }
     # _run_single_problem_experiment(problem, config, f"Eddy Current (Current: {current})")
@@ -1340,5 +1515,5 @@ if __name__ == "__main__":
     # train_pimgn_em_mixed()
     # train_pimgn_em_multi()
     # train_pimgn_magnetostatics()
-    train_pimgn_eddy_current(resume_from="results/physics_informed/eddy_current_problem_1_rect_coil/pimgn_trained_model.pth")
-    # train_pimgn_eddy_current_different_currents(resume_from="results/physics_informed/eddy_current_problem_circ_coil_currents/pimgn_trained_model.pth")
+    # train_pimgn_eddy_current(resume_from="results/physics_informed/eddy_current_problem_1_rect_coil/pimgn_trained_model.pth")
+    train_pimgn_eddy_current_different_currents(resume_from="results/physics_informed/eddy_current_problem_circ_coil_currents/pimgn_trained_model.pth")

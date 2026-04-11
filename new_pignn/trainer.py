@@ -21,7 +21,7 @@ except ImportError:
     from fem import FEMSolver
     from graph_creator import GraphCreator
     from containers import TimeConfig, MeshConfig, MeshProblem
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 
 
 class PIMGNTrainer:
@@ -38,6 +38,8 @@ class PIMGNTrainer:
         # Time bundling configuration
         self.time_window = config.get("time_window", 20)
 
+        self.noise_sigma = config.get("noise_sigma", 1e-2)
+
         # Create FEM solvers for physics-informed loss computation for all problems
         self.all_fem_solvers: List[FEMSolver] = []
         for problem in problems:
@@ -46,17 +48,23 @@ class PIMGNTrainer:
             )
             self.all_fem_solvers.append(fem_solver)
 
+        # Pre-create GraphCreator instances for all problems (avoid re-creation each step)
+        self.all_graph_creators: List[GraphCreator] = []
+        for i, problem in enumerate(problems):
+            gc = GraphCreator(
+                mesh=problem.mesh,
+                n_neighbors=2,
+                dirichlet_names=problem.mesh_config.dirichlet_boundaries,
+                neumann_names=getattr(problem.mesh_config, "neumann_boundaries", []),
+                robin_names=getattr(problem.mesh_config, "robin_boundaries", []),
+                connectivity_method="fem",
+                fes=self.all_fem_solvers[i].fes,
+            )
+            self.all_graph_creators.append(gc)
+
         # Prepare sample data to determine input/output dimensions using first problem
         first_problem = problems[0]
-        graph_creator = GraphCreator(
-            mesh=first_problem.mesh,
-            n_neighbors=2,
-            dirichlet_names=first_problem.mesh_config.dirichlet_boundaries,
-            neumann_names=getattr(first_problem.mesh_config, "neumann_boundaries", []),
-            robin_names=getattr(first_problem.mesh_config, "robin_boundaries", []),
-            connectivity_method="fem",
-            fes=fem_solver.fes,
-        )
+        graph_creator = self.all_graph_creators[0]
 
         # Create sample graph to get dimensions
         material_field = getattr(first_problem, "material_field", None)
@@ -64,6 +72,11 @@ class PIMGNTrainer:
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
         robin_vals = getattr(first_problem, "robin_values_array", None)
         source_vals = getattr(first_problem, "source_function", None)
+        k_table_ref = getattr(first_problem, "k_table_ref_values", None)
+        # For temp-dependent k, evaluate k at initial T for the sample graph
+        k_table = getattr(first_problem, "k_table", None)
+        if k_table is not None:
+            material_field = k_table.evaluate_array(first_problem.initial_condition)
         sample_data, aux = graph_creator.create_graph(
             T_current=first_problem.initial_condition,
             t_scalar=0.0,
@@ -72,6 +85,7 @@ class PIMGNTrainer:
             dirichlet_values=dirichlet_vals,
             robin_values=robin_vals,
             source_values=source_vals,
+            k_table_ref_values=k_table_ref,
         )
 
         # Use workpiece subgraph if applicable, otherwise free-node subgraph
@@ -286,16 +300,8 @@ class PIMGNTrainer:
         """
         problem: MeshProblem = self.problems[problem_idx]
 
-        # Create graph creator for this specific problem
-        graph_creator = GraphCreator(
-            mesh=problem.mesh,
-            n_neighbors=2,
-            dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-            neumann_names=getattr(problem.mesh_config, "neumann_boundaries", []),
-            robin_names=getattr(problem.mesh_config, "robin_boundaries", []),
-            connectivity_method="fem",
-            fes=self.all_fem_solvers[problem_idx].fes,
-        )
+        # Use pre-created graph creator for this problem
+        graph_creator = self.all_graph_creators[problem_idx]
 
         # Get the Neumann values for this problem
         neumann_vals = getattr(problem, "neumann_values_array", None)
@@ -303,21 +309,32 @@ class PIMGNTrainer:
         robin_vals = getattr(problem, "robin_values_array", None)
         material_field = getattr(problem, "material_field", None)
         source_vals = getattr(problem, "source_function", None)
+        k_table_ref = getattr(problem, "k_table_ref_values", None)
+        k_table = getattr(problem, "k_table", None)
 
         self.optimizer.zero_grad()
 
-        # add gaussian noise to current state for regularization
-        # t_current = t_current + np.random.normal(0, 1, size=t_current.shape)
+        # Noise injection (paper Sec. 2.4): add eps ~ N(0, Isigma) to the prediction
+        # to construct the input graph, while the noiseless state is used in the
+        # FEM loss.  Noise is only added during training.
+        t_current_graph = t_current + np.random.normal(
+            0, self.noise_sigma, size=t_current.shape
+        )
+
+        # For temperature-dependent k, evaluate k at the (noisy) current temperature
+        if k_table is not None:
+            material_field = k_table.evaluate_array(t_current_graph)
 
         # Build full graph from current state
         data, aux = graph_creator.create_graph(
-            T_current=t_current,
+            T_current=t_current_graph,
             t_scalar=current_time,
             material_node_field=material_field,
             neumann_values=neumann_vals,
             dirichlet_values=dirichlet_vals,
             robin_values=robin_vals,
             source_values=source_vals,
+            k_table_ref_values=k_table_ref,
         )
 
         # Create free node subgraph (workpiece-only or non-Dirichlet nodes)
@@ -372,12 +389,149 @@ class PIMGNTrainer:
 
         return physics_loss.item(), next_state_full, predictions_bundled_np
 
+    def train_step_batched(self, problem_data: List[dict]):
+        """
+        Batched training step: build graphs for multiple problems, run a single
+        forward pass through the model, then compute per-problem physics losses.
+
+        Args:
+            problem_data: List of dicts with keys:
+                - problem_idx: Index of the problem
+                - t_current: Current temperature state (np.array)
+                - current_time: Current time scalar (float)
+
+        Returns:
+            Tuple of (avg_loss_value, dict of {prob_idx: (next_state_full, predictions_bundled_np)})
+        """
+        self.optimizer.zero_grad()
+
+        # ---- Build per-problem free-node graphs ----
+        free_data_list: List[Data] = []
+        per_problem_meta: List[dict] = []
+
+        for pd in problem_data:
+            problem_idx = pd["problem_idx"]
+            t_current = pd["t_current"]
+            current_time = pd["current_time"]
+            problem = self.problems[problem_idx]
+            graph_creator = self.all_graph_creators[problem_idx]
+
+            neumann_vals = getattr(problem, "neumann_values_array", None)
+            dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
+            robin_vals = getattr(problem, "robin_values_array", None)
+            material_field = getattr(problem, "material_field", None)
+            source_vals = getattr(problem, "source_function", None)
+            k_table_ref = getattr(problem, "k_table_ref_values", None)
+            k_table = getattr(problem, "k_table", None)
+
+            # Noise injection
+            t_current_graph = t_current + np.random.normal(
+                0, self.noise_sigma, size=t_current.shape
+            )
+
+            if k_table is not None:
+                material_field = k_table.evaluate_array(t_current_graph)
+
+            data, aux = graph_creator.create_graph(
+                T_current=t_current_graph,
+                t_scalar=current_time,
+                material_node_field=material_field,
+                neumann_values=neumann_vals,
+                dirichlet_values=dirichlet_vals,
+                robin_values=robin_vals,
+                source_values=source_vals,
+                k_table_ref_values=k_table_ref,
+            )
+
+            free_data, node_mapping, free_aux = self._create_subgraph(
+                graph_creator, data, aux, problem_idx
+            )
+            free_data_list.append(free_data)
+            per_problem_meta.append({
+                "problem_idx": problem_idx,
+                "t_current": t_current,
+                "current_time": current_time,
+                "aux": aux,
+                "node_mapping": node_mapping,
+            })
+
+        # ---- Batch all free-node graphs into one ----
+        batched_data = Batch.from_data_list(free_data_list)
+        batched_data = batched_data.to(self.device)
+
+        # ---- Single forward pass ----
+        batched_prediction = self.model.forward(batched_data)
+
+        # ---- Split predictions back per-problem ----
+        batch_tensor = batched_data.batch
+        total_loss = torch.tensor(0.0, device=self.device)
+        next_states = {}
+
+        for i, meta in enumerate(per_problem_meta):
+            problem_idx = meta["problem_idx"]
+            problem = self.problems[problem_idx]
+            aux = meta["aux"]
+            node_mapping = meta["node_mapping"]
+            t_current = meta["t_current"]
+            current_time = meta["current_time"]
+
+            # Extract this problem's nodes from the batched prediction
+            node_mask = batch_tensor == i
+            predictions_bundled_free = batched_prediction[node_mask]
+
+            # Compute physics loss
+            t_current_tensor = (
+                torch.tensor(t_current, dtype=torch.float32, device=self.device)
+                if not torch.is_tensor(t_current)
+                else t_current
+            )
+            dt = problem.time_config.dt
+            physics_loss = self.compute_physics_informed_loss(
+                predictions_bundled_free,
+                t_current_tensor,
+                dt,
+                problem_idx,
+                aux,
+                node_mapping,
+                start_time=float(current_time),
+            )
+            total_loss = total_loss + physics_loss
+
+            # Reconstruct full state
+            predictions_bundled_np = predictions_bundled_free.detach().cpu().numpy()
+            next_state_free = predictions_bundled_np[:, -1]
+
+            next_state_full = np.zeros(problem.n_nodes, dtype=np.float32)
+            free_to_original = node_mapping["free_to_original"].cpu().numpy()
+            next_state_full[free_to_original] = next_state_free
+            dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
+            if dirichlet_vals is not None:
+                dirichlet_mask = aux["dirichlet_mask"].cpu().numpy()
+                next_state_full[dirichlet_mask] = dirichlet_vals[dirichlet_mask]
+            wp_mask = getattr(problem, "wp_node_mask", None)
+            if wp_mask is not None:
+                next_state_full[~wp_mask] = problem.initial_condition[~wp_mask]
+
+            next_states[problem_idx] = (next_state_full, predictions_bundled_np)
+
+        # Average the loss across problems in the batch
+        n_batch = len(problem_data)
+        total_loss = total_loss / n_batch
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
+        return total_loss.item(), next_states
+
     def train(self, train_problems_indices, val_problems_indices=None):
         """Main training loop following paper's methodology with multiple problems."""
         print(f"Starting PIMGN training on {self.device}")
         print(f"Training on problems: {train_problems_indices}")
         if val_problems_indices:
             print(f"Validation on problems: {val_problems_indices}")
+
+        batch_size = self.config.get("batch_size", 1)
 
         for epoch in range(self.start_epoch, self.config["epochs"]):
             epoch_start = time.time()
@@ -387,30 +541,71 @@ class PIMGNTrainer:
             shuffled_train_indices = train_problems_indices.copy()
             np.random.shuffle(shuffled_train_indices)
 
-            # Train on each problem in the training set
-            for problem_idx in shuffled_train_indices:
-                problem = self.problems[problem_idx]
-
-                # Optimization loop from initial condition for this problem
-                t_current = problem.initial_condition.copy()
-                time_steps = problem.time_config.time_steps
-                time_steps_batched = np.array_split(
+            if batch_size > 1 and len(shuffled_train_indices) > 1:
+                # Batched training: iterate temporal windows, batch across problems
+                first_problem = self.problems[shuffled_train_indices[0]]
+                time_steps = first_problem.time_config.time_steps
+                time_steps_windowed = np.array_split(
                     time_steps, len(time_steps) // self.time_window
                 )
+                dt = first_problem.time_config.dt
 
-                problem_losses = []
-                for batch_times in time_steps_batched:
-                    current_time = batch_times[0]
-                    physics_loss, t_next, _ = self.train_step(
-                        t_current, current_time, problem_idx
+                # Initialize states for all training problems
+                problem_states = {}
+                for idx in shuffled_train_indices:
+                    problem_states[idx] = self.problems[idx].initial_condition.copy()
+
+                for window_times in time_steps_windowed:
+                    current_time = window_times[0] - dt
+
+                    for b_start in range(0, len(shuffled_train_indices), batch_size):
+                        batch_indices = shuffled_train_indices[
+                            b_start : b_start + batch_size
+                        ]
+
+                        if len(batch_indices) > 1:
+                            pdata = [
+                                {
+                                    "problem_idx": idx,
+                                    "t_current": problem_states[idx],
+                                    "current_time": current_time,
+                                }
+                                for idx in batch_indices
+                            ]
+                            loss, next_states = self.train_step_batched(pdata)
+                            for idx, (state, _) in next_states.items():
+                                problem_states[idx] = state
+                        else:
+                            idx = batch_indices[0]
+                            loss, t_next, _ = self.train_step(
+                                problem_states[idx], current_time, idx
+                            )
+                            problem_states[idx] = t_next
+
+                        epoch_losses.append(loss)
+            else:
+                # Original sequential training (batch_size=1 or single problem)
+                for problem_idx in shuffled_train_indices:
+                    problem = self.problems[problem_idx]
+
+                    t_current = problem.initial_condition.copy()
+                    time_steps = problem.time_config.time_steps
+                    time_steps_windowed = np.array_split(
+                        time_steps, len(time_steps) // self.time_window
                     )
-                    problem_losses.append(physics_loss)
-                    t_current = t_next  # Update current state for next batch
 
-                # Average loss over all time steps for this problem
-                if problem_losses:
-                    avg_problem_loss = np.mean(problem_losses)
-                    epoch_losses.append(avg_problem_loss)
+                    problem_losses = []
+                    for window_times in time_steps_windowed:
+                        current_time = window_times[0] - problem.time_config.dt
+                        physics_loss, t_next, _ = self.train_step(
+                            t_current, current_time, problem_idx
+                        )
+                        problem_losses.append(physics_loss)
+                        t_current = t_next
+
+                    if problem_losses:
+                        avg_problem_loss = np.mean(problem_losses)
+                        epoch_losses.append(avg_problem_loss)
 
             avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0.0
             self.losses.append(avg_epoch_loss)
@@ -486,30 +681,28 @@ class PIMGNTrainer:
 
                 for step_idx in range(0, validation_steps, self.time_window):
                     t_current = ground_truth[step_idx]
-                    current_time = problem.time_config.time_steps[step_idx]
+                    # ground_truth[i] is at time i*dt; use export grid for correct alignment
+                    current_time = problem.time_config.time_steps_export[step_idx]
 
-                    # Create graph creator for this specific problem
-                    graph_creator = GraphCreator(
-                        mesh=problem.mesh,
-                        n_neighbors=2,
-                        dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-                        neumann_names=getattr(problem.mesh_config, "neumann_boundaries", []),
-                        robin_names=getattr(problem.mesh_config, "robin_boundaries", []),
-                        connectivity_method="fem",
-                        fes=self.all_fem_solvers[problem_idx].fes,
-                    )
+                    # Use pre-created graph creator
+                    graph_creator = self.all_graph_creators[problem_idx]
 
                     # Build graph and make prediction
                     data, aux = graph_creator.create_graph(
                         T_current=t_current,
                         t_scalar=current_time,
-                        material_node_field=getattr(problem, "material_field", None),
+                        material_node_field=(
+                            k_table.evaluate_array(t_current)
+                            if (k_table := getattr(problem, "k_table", None)) is not None
+                            else getattr(problem, "material_field", None)
+                        ),
                         neumann_values=getattr(problem, "neumann_values_array", None),
                         dirichlet_values=getattr(
                             problem, "dirichlet_values_array", None
                         ),
                         robin_values=getattr(problem, "robin_values_array", None),
                         source_values=getattr(problem, "source_function", None),
+                        k_table_ref_values=getattr(problem, "k_table_ref_values", None),
                     )
 
                     free_data, node_mapping, free_aux = (
@@ -547,7 +740,7 @@ class PIMGNTrainer:
         problem = self.problems[problem_idx]
 
         if n_steps is None:
-            n_steps = len(problem.time_config.time_steps)
+            n_steps = len(problem.time_config.time_steps_export)
 
         time_steps = problem.time_config.time_steps
         time_steps_bundled = np.array_split(
@@ -558,15 +751,7 @@ class PIMGNTrainer:
         T_current = problem.initial_condition.copy()
         predictions = [T_current]
 
-        graph_creator = GraphCreator(
-            mesh=problem.mesh,
-            n_neighbors=2,
-            dirichlet_names=problem.mesh_config.dirichlet_boundaries,
-            neumann_names=problem.mesh_config.neumann_boundaries,
-            robin_names=problem.mesh_config.robin_boundaries,
-            connectivity_method="fem",
-            fes=self.all_fem_solvers[problem_idx].fes,
-        )
+        graph_creator = self.all_graph_creators[problem_idx]
 
         # Get the Neumann values for this problem
         neumann_vals = getattr(problem, "neumann_values_array", None)
@@ -574,20 +759,30 @@ class PIMGNTrainer:
         robin_vals = getattr(problem, "robin_values_array", None)
         material_field = getattr(problem, "material_field", None)
         source_vals = getattr(problem, "source_function", None)
+        k_table_ref = getattr(problem, "k_table_ref_values", None)
+        k_table = getattr(problem, "k_table", None)
 
         with torch.no_grad():
             step_idx = 0
             for batch_idx, batch_times in enumerate(time_steps_bundled):
-                starting_time_step = 0 if step_idx == 0 else batch_times[0]
+                # batch_times are target times; current state is one dt earlier
+                starting_time_step = batch_times[0] - problem.time_config.dt
+                # For temperature-dependent k, evaluate k at current T
+                mat_field_dynamic = (
+                    k_table.evaluate_array(T_current)
+                    if k_table is not None
+                    else material_field
+                )
                 # Build graph
                 data, aux = graph_creator.create_graph(
                     T_current=T_current,
                     t_scalar=starting_time_step,
-                    material_node_field=material_field,
+                    material_node_field=mat_field_dynamic,
                     neumann_values=neumann_vals,
                     dirichlet_values=dirichlet_vals,
                     robin_values=robin_vals,
                     source_values=source_vals,
+                    k_table_ref_values=k_table_ref,
                 )
                 free_graph, node_mapping, free_aux = (
                     self._create_subgraph(graph_creator, data, aux, problem_idx)

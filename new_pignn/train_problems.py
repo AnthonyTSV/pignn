@@ -21,7 +21,7 @@ except ImportError:
     from containers import TimeConfig, MeshConfig, MeshProblem, MeshProblemEM
 
 
-def create_test_problem(maxh=0.2, alpha=1.0):
+def create_test_problem(maxh=0.2, k=1.0, rho_cp=1.0):
     """Create a simple test problem for PIMGN training."""
     print("Creating test problem for Physics-Informed training...")
 
@@ -81,7 +81,7 @@ def create_test_problem(maxh=0.2, alpha=1.0):
         robin_values=robin_boundaries_dict,
         seed=42,
     )
-    material_node_field = np.ones(temp_data.pos.shape[0], dtype=np.float32) * alpha
+    material_node_field = np.ones(temp_data.pos.shape[0], dtype=np.float32) * k
     # Create the final graph with Neumann values
     temp_data, _ = graph_creator.create_graph(
         neumann_values=neumann_vals,
@@ -106,7 +106,8 @@ def create_test_problem(maxh=0.2, alpha=1.0):
         mesh=mesh,
         graph_data=temp_data,
         initial_condition=initial_condition,
-        alpha=alpha,  # Thermal diffusivity
+        rho_cp=rho_cp,
+        k=k,
         time_config=time_config,
         mesh_config=mesh_config,
         problem_id=0,
@@ -255,7 +256,8 @@ def create_lshaped_problem(maxh=0.2):
         mesh=mesh,
         graph_data=temp_data,
         initial_condition=initial_condition,
-        alpha=0.5e-2,  # Thermal diffusivity
+        rho_cp=1.0,
+        k=0.5e-2,
         time_config=time_config,
         mesh_config=mesh_config,
         problem_id=0,
@@ -305,7 +307,7 @@ def create_lshaped_problem(maxh=0.2):
     return problem, time_config
 
 
-def create_mms_problem(maxh=0.2, alpha=0.1, problem_id=0):
+def create_mms_problem(maxh=0.2, k=0.1, rho_cp=1.0, problem_id=0):
     """Create a manufactured solution problem for testing."""
     # Time configuration
     time_config = TimeConfig(dt=0.01, t_final=1.0)
@@ -373,7 +375,8 @@ def create_mms_problem(maxh=0.2, alpha=0.1, problem_id=0):
         mesh=mesh,
         graph_data=temp_data,
         initial_condition=initial_condition,
-        alpha=alpha,  # Thermal diffusivity
+        rho_cp=rho_cp,
+        k=k,
         time_config=time_config,
         mesh_config=mesh_config,
         problem_id=0,
@@ -410,7 +413,7 @@ def create_mms_problem(maxh=0.2, alpha=0.1, problem_id=0):
     return problem, time_config
 
 
-def create_source_test_problem(maxh=0.2, alpha=0.1, problem_id=0):
+def create_source_test_problem(maxh=0.2, k=0.1, rho_cp=1.0, problem_id=0):
     # Time configuration
     time_config = TimeConfig(dt=0.01, t_final=1.0)
     # Create rectangular mesh
@@ -470,7 +473,8 @@ def create_source_test_problem(maxh=0.2, alpha=0.1, problem_id=0):
         mesh=mesh,
         graph_data=temp_data,
         initial_condition=initial_condition,
-        alpha=alpha,  # Thermal diffusivity
+        rho_cp=rho_cp,
+        k=k,
         time_config=time_config,
         mesh_config=mesh_config,
         problem_id=0,
@@ -526,11 +530,11 @@ def create_industrial_heating_problem(maxh=0.1):
     density = 7850  # kg/m^3
     specific_heat = 450  # J/(kg·K)
     k = 45  # W/(m·K)
+    rho_cp = density * specific_heat  # [J/(m^3·K)]
     # Time configuration
     time_config = TimeConfig(dt=0.01, t_final=1.0)
     h_conv = 10  # Air convective heat transfer coefficient
     T_amb = 23  # Ambient temperature
-    alpha = k / (density * specific_heat)  # Thermal diffusivity
     # Create rectangular mesh
     L = 30e-3  # m full billet length
     D = L / 2  # m half of the billet
@@ -600,7 +604,8 @@ def create_industrial_heating_problem(maxh=0.1):
         mesh=mesh,
         graph_data=temp_data,
         initial_condition=initial_condition,
-        alpha=alpha,  # Thermal diffusivity
+        rho_cp=rho_cp,
+        k=k,
         time_config=time_config,
         mesh_config=mesh_config,
         problem_id=0,
@@ -670,12 +675,11 @@ def create_em_to_thermal():
     density = 7870  # kg/m^3
     specific_heat = 461  # J/(kg·K)
     k = 86  # W/(m·K)
+    rho_cp = density * specific_heat  # [J/(m^3·K)]
     # Time configuration
     time_config = TimeConfig(dt=0.1, t_final=1.0)
-    h_conv_air = 10  # Air convective heat transfer coefficient
-    h_conv = h_conv_air / (density * specific_heat)
+    h_conv = 10  # Air convective heat transfer coefficient [W/(m^2·K)]
     T_amb = 22  # Ambient temperature
-    alpha = k / (density * specific_heat)  # Thermal diffusivity
     dirichlet_boundaries = []
     neumann_boundaries = []
     robin_boundaries = ["bc_workpiece_top", "bc_workpiece_right", "bc_workpiece_bottom"]
@@ -741,7 +745,8 @@ def create_em_to_thermal():
         mesh=mesh,
         graph_data=temp_data,
         initial_condition=initial_condition,
-        alpha=alpha,  # Thermal diffusivity
+        rho_cp=rho_cp,
+        k=k,
         time_config=time_config,
         mesh_config=mesh_config,
         problem_id=0,
@@ -763,7 +768,7 @@ def create_em_to_thermal():
     sigma = 6289308
     E_phi = -1j * omega * (A + phi * r1)
 
-    Q = 0.5 * sigma * ng.Norm(E_phi) ** 2 / (density * specific_heat)
+    Q = 0.5 * sigma * ng.Norm(E_phi) ** 2
 
     ngmesh = mesh.ngmesh
     n_nodes = temp_data.pos.shape[0]

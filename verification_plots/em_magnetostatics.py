@@ -10,29 +10,20 @@ import vtk
 import ngsolve as ng
 import netgen
 import scienceplots
+from helpers.error_metrics import compute_relative_error
 from helpers.vtk_extractor import VTKToPlotConverter
 from helpers.line_data_extractor import ExtractDataOverLine
 from helpers.plot_helpers import (
     plot_l2,
-    epoch_vs_l2,
     epoch_vs_train_loss,
     epoch_vs_training_l2,
     _get_run_label,
 )
 from new_pignn.plotter import load_log
 
-plt.style.use(["science", "grid"])
+from helpers.mpl_style import apply_mpl_style
 
-plt.rcParams.update(
-    {
-        "font.family": "serif",
-        "font.serif": ["cmr10"],
-        "font.sans-serif": ["cmss10"],
-        "font.monospace": ["cmtt10"],
-        "axes.formatter.use_mathtext": True,
-        "font.size": 14,
-    }
-)
+apply_mpl_style()
 
 # mesh_filename = "results/physics_informed/test_magnetostatics/results_data/mesh.vol"
 # ngmesh = netgen.meshing.Mesh(dim=2)
@@ -152,7 +143,7 @@ vtk_file_2_coil = Path(
 
 
 def get_line_data(vtk_file: Path, point1: tuple, point2: tuple) -> tuple:
-    extract_data = ExtractDataOverLine(vtk_file)
+    extract_data = ExtractDataOverLine(vtk_file, has_time_data=False)
     extract_data.set_points(point1, point2)
     result_data = extract_data.get_data(
         ["PredictedSolution_real", "ExactSolution_real"]
@@ -165,18 +156,14 @@ def get_line_data(vtk_file: Path, point1: tuple, point2: tuple) -> tuple:
 
 point1 = (0.0004562261719171998, 0.10469228023861457, 0)
 point2 = (0.1198514935894682, 0.10469228023861457, 0)
-extract_data = ExtractDataOverLine(vtk_file_1_coil)
-extract_data.set_points(point1, point2)
 
 coil_1_data = get_line_data(vtk_file_1_coil, point1, point2)
 x_line1, predicted_solution1, fem_solution1 = coil_1_data
 coil_2_data = get_line_data(vtk_file_2_coil, point1, point2)
 x_line2, predicted_solution2, fem_solution2 = coil_2_data
 
-abs_err_1 = np.abs(predicted_solution1 - fem_solution1)
-rel_err_1 = abs_err_1 / np.maximum(np.abs(fem_solution1), 1e-12) * 100.0
-abs_err_2 = np.abs(predicted_solution2 - fem_solution2)
-rel_err_2 = abs_err_2 / np.maximum(np.abs(fem_solution2), 1e-12) * 100.0
+rel_err_1 = compute_relative_error(fem_solution1, predicted_solution1)
+rel_err_2 = compute_relative_error(fem_solution2, predicted_solution2)
 
 
 fig, (ax, ax_err) = plt.subplots(
@@ -226,13 +213,9 @@ ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
 ax_err.grid(True)
 ax_err.legend(frameon=True, ncols=2)
 
-for a in (ax, ax_err):
-    a.spines["top"].set_visible(False)
-    a.spines["right"].set_visible(False)
-
 plt.savefig(save_dir / "line_plot_coils.pdf", dpi=300)
 
-plotter1 = VTKToPlotConverter(vtk_file_1_coil, last_time_step=0, val_range=(0, 2.5))
+plotter1 = VTKToPlotConverter(vtk_file_1_coil, last_time_step=0, val_range=(0, 2.5), has_time_data=False)
 plotter1.plot_steady_state(
     save_dir / "steady_state_1_coil.pdf",
     exact_field_name="ExactSolution_real",
@@ -242,7 +225,7 @@ plotter1.plot_steady_state(
 )
 plotter1.plot_relative_error(save_dir / "relative_error_1_coil.pdf", field_name="RelError")
 
-plotter2 = VTKToPlotConverter(vtk_file_2_coil, last_time_step=0, val_range=(0, 2.5))
+plotter2 = VTKToPlotConverter(vtk_file_2_coil, last_time_step=0, val_range=(0, 2.5), has_time_data=False)
 plotter2.plot_steady_state(
     save_dir / "steady_state_2_coil.pdf",
     exact_field_name="ExactSolution_real",

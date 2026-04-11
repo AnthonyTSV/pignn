@@ -140,19 +140,17 @@ class IHGeometryAndMesh:
         r = wp.diameter / 2.0 * S
         hh = wp.height / 2.0 * S
         yc = y_center * S
-        return (
-            Rectangle(
-                pmin=(0, yc - hh),
-                pmax=(r, yc + hh),
-                mat="mat_workpiece",
-                left="bc_workpiece_left",
-                right="bc_workpiece_right",
-                top="bc_workpiece_top",
-                bottom="bc_workpiece_bottom",
-            )
-            .Mat("mat_workpiece")
-            .Maxh(self.h_workpiece * S)
-        )
+        rect = Rectangle(
+            pmin=(0, yc - hh),
+            pmax=(r, yc + hh),
+            mat="mat_workpiece",
+            left="bc_workpiece_left",
+            right="bc_workpiece_right",
+            top="bc_workpiece_top",
+            bottom="bc_workpiece_bottom",
+        ).Mat("mat_workpiece").Maxh(self.h_workpiece * S)
+        
+        return rect
 
     def _make_tube(self, wp: TubeParams, y_center: float):
         S = self._S

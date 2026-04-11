@@ -71,14 +71,14 @@ class ExtractDataOverLine:
         save_data_in = Path("path/to/json/file.json")
         extract_data.save_data(save_data_in, ["Temperature,_[C]"])
     """
-    def __init__(self, result_file: Path):
+    def __init__(self, result_file: Path, has_time_data: bool = True):
         self.result_file = result_file
         file_extension = result_file.suffix
         self.extractor: EnsightDataExtractor | VtuDataExtractor = None
         if file_extension == ".case":
             self.extractor = EnsightDataExtractor(self.result_file)
         elif file_extension == ".vtu":
-            self.extractor = VtuDataExtractor(self.result_file)
+            self.extractor = VtuDataExtractor(self.result_file, has_time_data=has_time_data)
         else:
             raise ValueError(f"Unsupported result format {file_extension} in ExtractDataOverLine")
         self.point1: tuple[float] = None

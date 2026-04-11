@@ -1,8 +1,175 @@
+from __future__ import annotations
+
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 import torch
 import ngsolve as ng
+from pydantic import BaseModel
+
+AIR_CONV = 10.0  # Convection coefficient for air (W/m^2K)
+
+
+class Table1D(BaseModel):
+    """
+    1-D lookup table with linear interpolation.
+    """
+    args: list[float]
+    values: list[float]
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        if len(self.args) != len(self.values):
+            raise ValueError("args and values must have the same length")
+        if len(self.args) < 2:
+            raise ValueError("Table1D requires at least 2 breakpoints")
+        for i in range(len(self.args) - 1):
+            if self.args[i] >= self.args[i + 1]:
+                raise ValueError("args must be strictly increasing")
+
+    def evaluate(self, x: float) -> float:
+        """Linearly interpolate / extrapolate at *x*."""
+        return float(np.interp(x, self.args, self.values))
+
+    def evaluate_array(self, x: np.ndarray) -> np.ndarray:
+        """Vectorised linear interpolation."""
+        return np.interp(x, self.args, self.values)
+
+    def sample_at_references(self, ref_temps: Optional[list[float]] = None) -> np.ndarray:
+        """Return k values sampled at reference temperatures.
+
+        If *ref_temps* is ``None`` the table's own breakpoints are used.
+        The returned array has shape ``(len(ref_temps),)``.
+        """
+        if ref_temps is None:
+            return np.array(self.values, dtype=np.float64)
+        return np.interp(ref_temps, self.args, self.values).astype(np.float64)
+
+    def to_ngsolve_cf(self, temperature_gf: ng.GridFunction) -> ng.CoefficientFunction:
+        """Build a piecewise-linear NGSolve CoefficientFunction of *temperature_gf*.
+
+        Uses nested ng.IfPos to build a branchless CF that NGSolve can
+        evaluate at quadrature points during assembly.
+        """
+        t = temperature_gf
+        xs = self.args
+        ys = self.values
+        # Start with constant extrapolation below the first breakpoint
+        cf = ng.CoefficientFunction(ys[0])
+        for i in range(len(xs) - 1):
+            slope = (ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i])
+            segment_cf = ys[i] + slope * (t - xs[i])
+            # Replace cf for t >= xs[i]
+            cf = ng.IfPos(t - xs[i], segment_cf, cf)
+        # Clamp: for t >= xs[-1] use the last value
+        cf = ng.IfPos(t - xs[-1], ys[-1], cf)
+        return cf
+
+
+class FieldValue(BaseModel):
+    """A material property that is either a constant or temperature-dependent table.
+
+    Usage
+    -----
+    >>> FieldValue(constant=1.0)          # constant property
+    >>> FieldValue(table=Table1D(...))     # temperature-dependent property
+    """
+    constant: Optional[float] = None
+    table: Optional[Table1D] = None
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        if self.constant is None and self.table is None:
+            raise ValueError("Either constant or table must be provided")
+        if self.constant is not None and self.table is not None:
+            raise ValueError("Cannot specify both constant and table")
+
+    def is_temperature_dependent(self) -> bool:
+        return self.table is not None
+
+    def get_value(self) -> float:
+        """
+        Return a representative scalar value.
+        """
+        if self.constant is not None:
+            return self.constant
+        return self.table.values[0]
+
+    def get_table(self) -> Optional[Table1D]:
+        return self.table
+
+
+def _coerce_to_field_value(v) -> FieldValue:
+    """Accept float, int, or FieldValue and return a FieldValue."""
+    if isinstance(v, FieldValue):
+        return v
+    if isinstance(v, (int, float)):
+        return FieldValue(constant=float(v))
+    raise TypeError(f"Cannot coerce {type(v).__name__} to FieldValue")
+
+
+class BoundaryCondition(BaseModel):
+    type: str
+
+class DirichletBC(BoundaryCondition):
+    type: str = "Dirichlet"
+    value: float
+
+class NeumannBC(BoundaryCondition):
+    type: str = "Neumann"
+    value: float
+
+class RobinBC(BoundaryCondition):
+    type: str = "Robin"
+    value: tuple # (h, T_amb)
+
+class ConvectionBC(BoundaryCondition):
+    type: str = "Convection"
+    value: tuple # (h, T_amb)
+
+class RadiationBC(BoundaryCondition):
+    type: str = "Radiation"
+    value: tuple # (eps, T_amb)
+
+class CombinedBC(BoundaryCondition):
+    type: str = "Combined"
+    value: dict # {"convection": (h, T_amb), "radiation": (eps, T_amb)}
+
+class MaterialPropertiesHeat(BaseModel):
+    """Thermal material properties.  Each of *rho*, *cp*, *k* may be a scalar
+    or a :class:`FieldValue` wrapping a :class:`Table1D` for temperature
+    dependence."""
+    model_config = {"arbitrary_types_allowed": True}
+
+    rho: Union[float, FieldValue]  # mass density
+    cp: Union[float, FieldValue]   # specific heat capacity
+    k: Union[float, FieldValue]    # thermal conductivity
+    h_conv: Optional[float] = None
+    thermal_diffusivity: Optional[float] = None  # alpha = k / (rho * cp)
+
+    def __init__(self, **data):
+        # Coerce plain numbers into FieldValue before Pydantic validation
+        for key in ("rho", "cp", "k"):
+            if key in data:
+                data[key] = _coerce_to_field_value(data[key])
+        super().__init__(**data)
+        if self.thermal_diffusivity is None:
+            self.thermal_diffusivity = (
+                self.k.get_value() / (self.rho.get_value() * self.cp.get_value())
+            )
+        if self.h_conv is None:
+            self.h_conv = AIR_CONV
+
+class MaterialPropertiesEM(BaseModel):
+    model_config = {"arbitrary_types_allowed": True}
+    sigma: Union[float, FieldValue] # electrical conductivity
+    mu: Union[float, FieldValue] # magnetic permeability
+
+class SourceProperties(BaseModel):
+    frequency: float
+    current: float
+    fill_factor: float = 1.0
+    n_turns: int = 1
 
 class MeshProblem:
     """Container for a single training problem with mesh, initial condition, and physics parameters."""
@@ -12,19 +179,26 @@ class MeshProblem:
         mesh,
         graph_data,
         initial_condition,
-        alpha,
+        rho_cp,
+        k,
         time_config,
         mesh_config,
         problem_id,
+        boundary_conditions=None,
     ):
         self.mesh = mesh
         self.graph_data = graph_data
         self.initial_condition: np.ndarray = initial_condition
-        self.alpha = alpha
-        self.alpha_coefficient = None  # Optional spatially varying coefficient function
+        self.rho_cp = rho_cp  # Density times specific heat capacity [J/(m^3·K)]
+        self.k = k  # Thermal conductivity [W/(m·K)] — scalar representative value
+        self.k_table = None  # Optional Table1D for temperature-dependent k
+        self.k_table_ref_values = None  # Optional [N_ref] array: k sampled at reference temperatures
+        self.k_coefficient = None  # Optional spatially varying conductivity (NGSolve CoefficientFunction)
+        self.rho_cp_coefficient = None  # Optional spatially varying rho*cp (NGSolve CoefficientFunction)
         self.time_config: TimeConfig = time_config
         self.mesh_config: MeshConfig = mesh_config
         self.problem_id = problem_id
+        self.boundary_conditions = boundary_conditions or {}
 
         # Statistics for logging
         self.n_nodes = graph_data.num_nodes
@@ -51,6 +225,9 @@ class MeshProblem:
         self.nonlinear_source_params = (
             None  # Optional parameters for nonlinear heat sources
         )
+        self.nonlinear_bc_tol = 1e-3
+        self.nonlinear_bc_max_iters = 15
+        self.nonlinear_bc_min_iters = 1
         self.material_fraction_field = None  # Optional per-node material descriptor
         self.material_field = (
             None  # Optional per-node physical property (e.g., diffusivity)
@@ -126,6 +303,7 @@ class MeshProblemEM:
         self.dirichlet_values_array = None  # To be set
         self.material_field = None  # To be set
         self.sigma_field = None
+        self.sigma_nodal = None  # Per-node sigma for FEM assembly (nondimensionalized)
         self.current_density_field = None  # To be set (current density at each node)
 
         ###
@@ -197,9 +375,12 @@ class TimeConfig:
     num_steps: int = 0
 
     def __post_init__(self):
-        self.time_steps = np.arange(self.dt, self.t_final + self.dt, self.dt)
-        self.time_steps_export = np.arange(0.0, self.t_final + self.dt, self.dt)
-        self.num_steps = int(self.t_final / self.dt)
+        self.num_steps = int(round(self.t_final / self.dt))
+        if not np.isclose(self.num_steps * self.dt, self.t_final, rtol=0.0, atol=1e-12):
+            raise ValueError("t_final must be an integer multiple of dt")
+
+        self.time_steps = np.linspace(self.dt, self.t_final, self.num_steps)
+        self.time_steps_export = np.linspace(0.0, self.t_final, self.num_steps + 1)
 
 
 @dataclass

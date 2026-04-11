@@ -361,13 +361,13 @@ def _build_node_features(
         ).unsqueeze(1)
         features.append(sigma_tensor)
 
-    if current_density_field is not None:
-        current_density_tensor = torch.tensor(
-            current_density_field, dtype=torch.float32, device=device
-        ).unsqueeze(1)
-    else:
-        current_density_tensor = torch.zeros(n_nodes, 1, device=device)
-    features.append(current_density_tensor)
+    # if current_density_field is not None:
+    #     current_density_tensor = torch.tensor(
+    #         current_density_field, dtype=torch.float32, device=device
+    #     ).unsqueeze(1)
+    # else:
+    #     current_density_tensor = torch.zeros(n_nodes, 1, device=device)
+    # features.append(current_density_tensor)
 
     return torch.cat(features, dim=1)
 
@@ -416,11 +416,8 @@ def _build_global_features(
         omega = 0.0
     if current is None:
         current = 0.0
-    # global_features = torch.tensor(
-    #     [omega, current], dtype=torch.float32, device=device
-    # )
     global_features = torch.tensor(
-        [current], dtype=torch.float32, device=device
+        [omega], dtype=torch.float32, device=device
     )
     return global_features.unsqueeze(0)
 

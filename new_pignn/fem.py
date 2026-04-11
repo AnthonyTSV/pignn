@@ -1,9 +1,25 @@
 import numpy as np
 try:
-    from .containers import MeshConfig, MeshProblem, TimeConfig
+    from .containers import (
+        MeshConfig,
+        MeshProblem,
+        TimeConfig,
+        RobinBC,
+        ConvectionBC,
+        RadiationBC,
+        CombinedBC,
+    )
     from .mesh_utils import create_rectangular_mesh
 except ImportError:
-    from containers import MeshConfig, MeshProblem, TimeConfig
+    from containers import (
+        MeshConfig,
+        MeshProblem,
+        TimeConfig,
+        RobinBC,
+        ConvectionBC,
+        RadiationBC,
+        CombinedBC,
+    )
     from mesh_utils import create_rectangular_mesh
 import ngsolve as ng
 from typing import Optional, List, Tuple
@@ -11,6 +27,9 @@ import torch
 import scipy.sparse as sp
 import os
 from pathlib import Path
+
+STEFAN_BOLTZMANN = 5.670374419e-8
+KELVIN_OFFSET = 273.15
 
 
 class FEMSolver:
@@ -50,25 +69,45 @@ class FEMSolver:
         jac = self._jac()
 
         self.stiffness_matrix = ng.BilinearForm(self.fes, symmetric=True)
-        self.stiffness_matrix += jac * self._alpha_weight() * ng.grad(u) * ng.grad(v) * dx_r
+        self.stiffness_matrix += jac * self._k_weight() * ng.grad(u) * ng.grad(v) * dx_r
 
-        # Add Robin BC contribution to stiffness matrix: + integral(jac * h * u * v) ds
-        if hasattr(self.problem, "robin_values"):
+        # Add only linear boundary contributions to the preassembled operator.
+        # Nonlinear radiation is handled explicitly in compute_residual.
+        has_structured_bcs = bool(getattr(self.problem, "boundary_conditions", None))
+        if has_structured_bcs:
+            linear_rhs_dummy = ng.LinearForm(self.fes)
+            self._add_linear_boundary_terms(
+                self.problem,
+                self.stiffness_matrix,
+                linear_rhs_dummy,
+                u,
+                v,
+            )
+        elif hasattr(self.problem, "robin_values"):
             for name, (h, _) in self.problem.robin_values.items():
                 self.stiffness_matrix += jac * h * u * v * ng.ds(definedon=name)
 
         self.stiffness_matrix.Assemble()
 
         self.mass_matrix = ng.BilinearForm(self.fes, symmetric=True)
-        self.mass_matrix += jac * u * v * dx_r
+        self.mass_matrix += jac * self._rho_cp_weight() * u * v * dx_r
         self.mass_matrix.Assemble()
 
         self.neumann_matrix = ng.LinearForm(self.fes)
         for name, value in self.problem.neumann_values.items():
             self.neumann_matrix += jac * value * v * ng.ds(definedon=name)
 
-        # Add Robin BC contribution to RHS: + integral(jac * h * T_amb * v) ds
-        if hasattr(self.problem, "robin_values"):
+        # Add only linear boundary loads to the preassembled RHS.
+        if has_structured_bcs:
+            linear_stiffness_dummy = ng.BilinearForm(self.fes)
+            self._add_linear_boundary_terms(
+                self.problem,
+                linear_stiffness_dummy,
+                self.neumann_matrix,
+                u,
+                v,
+            )
+        elif hasattr(self.problem, "robin_values"):
             for name, (h, t_amb) in self.problem.robin_values.items():
                 self.neumann_matrix += jac * h * t_amb * v * ng.ds(definedon=name)
 
@@ -89,6 +128,7 @@ class FEMSolver:
         self.neumann_vec = torch.tensor(
             self.neumann_matrix.vec.FV().NumPy().copy(), dtype=torch.float64
         )
+        self._init_radiation_boundary_terms()
 
         # Compute lumped mass diagonal for residual normalization.
         # Row-sum of M converts weak-form residual to strong (pointwise) form,
@@ -115,13 +155,87 @@ class FEMSolver:
         sys_diag[indices[0, diag_mask]] = values[diag_mask]
         self.system_diag = sys_diag  # [N_dofs]
 
-    def _alpha_weight(self):
+    def _extract_sparse_diagonal(self, sparse_mat: torch.Tensor) -> torch.Tensor:
+        sparse_mat = sparse_mat.coalesce()
+        indices = sparse_mat.indices()
+        values = sparse_mat.values()
+        diag = torch.zeros(sparse_mat.shape[0], dtype=values.dtype, device=values.device)
+        diag_mask = indices[0] == indices[1]
+        diag[indices[0, diag_mask]] = values[diag_mask]
+        return diag
+
+    def _k_weight(self, temperature_gf=None):
+        """Return the thermal conductivity weight for FEM assembly.
+
+        Parameters
+        ----------
+        temperature_gf : ng.GridFunction, optional
+            Current temperature field.  When the problem carries a
+            ``k_table`` (temperature-dependent k) and *temperature_gf* is
+            provided, a piecewise-linear NGSolve CoefficientFunction is
+            built from the table evaluated at *temperature_gf*.
+        """
         if self.problem is None:
             return 1.0
-        alpha_cf = getattr(self.problem, "alpha_coefficient", None)
-        if alpha_cf is not None:
-            return alpha_cf
-        return getattr(self.problem, "alpha", 1.0)
+        # Temperature-dependent k via Table1D
+        k_table = getattr(self.problem, "k_table", None)
+        if k_table is not None and temperature_gf is not None:
+            return k_table.to_ngsolve_cf(temperature_gf)
+        k_cf = getattr(self.problem, "k_coefficient", None)
+        if k_cf is not None:
+            return k_cf
+        return getattr(self.problem, "k", 1.0)
+
+    def _has_nonlinear_material(self) -> bool:
+        """Return True when the problem contains temperature-dependent material properties."""
+        if self.problem is None:
+            return False
+        return getattr(self.problem, "k_table", None) is not None
+
+    def _assemble_stiffness_at_temperature(
+        self,
+        temperature_values: np.ndarray,
+    ) -> torch.Tensor:
+        """Assemble the stiffness matrix K(T) + Robin BC terms at a given temperature.
+
+        For temperature-dependent conductivity k(T), the diffusion operator
+        must be reassembled at the current temperature iterate.  The Robin
+        boundary contributions (constant) are included so that the returned
+        matrix is a drop-in replacement for ``self.stiffness_matrix_mat``.
+
+        Returns a sparse COO torch tensor (float64).
+        """
+        u = self.fes.TrialFunction()
+        v = self.fes.TestFunction()
+        dx_r = self._dx_region()
+        jac = self._jac()
+
+        # Build GridFunction from the nodal temperature values
+        gfu_temp = ng.GridFunction(self.fes)
+        gfu_temp.vec.FV().NumPy()[:] = temperature_values
+
+        K_form = ng.BilinearForm(self.fes, symmetric=True)
+        K_form += jac * self._k_weight(temperature_gf=gfu_temp) * ng.grad(u) * ng.grad(v) * dx_r
+
+        # Re-add Robin / convection boundary terms (same as init_matrices)
+        has_structured_bcs = bool(getattr(self.problem, "boundary_conditions", None))
+        if has_structured_bcs:
+            dummy_lf = ng.LinearForm(self.fes)
+            self._add_linear_boundary_terms(self.problem, K_form, dummy_lf, u, v)
+        elif hasattr(self.problem, "robin_values"):
+            for name, (h, _) in self.problem.robin_values.items():
+                K_form += jac * h * u * v * ng.ds(definedon=name)
+
+        K_form.Assemble()
+        return self._ngsolve_to_torch(K_form.mat)
+
+    def _rho_cp_weight(self):
+        if self.problem is None:
+            return 1.0
+        rho_cp_cf = getattr(self.problem, "rho_cp_coefficient", None)
+        if rho_cp_cf is not None:
+            return rho_cp_cf
+        return getattr(self.problem, "rho_cp", 1.0)
 
     def _jac(self):
         """Return the axisymmetric Jacobian factor r = ng.x if enabled, else 1."""
@@ -144,6 +258,144 @@ class FEMSolver:
         shape = (ngsolve_matrix.height, ngsolve_matrix.width)
         return torch.sparse_coo_tensor(indices, values, size=shape, dtype=torch.float64)
 
+    def _init_radiation_boundary_terms(self) -> None:
+        self.radiation_boundary_terms = []
+        if self.problem is None:
+            return
+
+        boundary_conditions = getattr(self.problem, "boundary_conditions", None) or {}
+        if not boundary_conditions:
+            return
+
+        u = self.fes.TrialFunction()
+        v = self.fes.TestFunction()
+        jac = self._jac()
+
+        for name, bc in boundary_conditions.items():
+            radiation = None
+            if isinstance(bc, RadiationBC):
+                radiation = bc.value
+            elif isinstance(bc, CombinedBC):
+                radiation = bc.value.get("radiation")
+
+            if radiation is None:
+                continue
+
+            emissivity, t_surroundings = radiation
+            boundary_mass = ng.BilinearForm(
+                self.fes, symmetric=True, check_unused=False
+            )
+            boundary_mass += jac * u * v * ng.ds(definedon=name)
+            boundary_mass.Assemble()
+
+            boundary_mass_torch = self._ngsolve_to_torch(boundary_mass.mat).coalesce()
+            boundary_diag = self._extract_sparse_diagonal(boundary_mass_torch)
+
+            self.radiation_boundary_terms.append(
+                {
+                    "matrix": boundary_mass_torch,
+                    "diag": boundary_diag,
+                    "eps_sigma": float(emissivity) * STEFAN_BOLTZMANN,
+                    "ambient_kelvin": float(t_surroundings) + KELVIN_OFFSET,
+                }
+            )
+
+    def _has_nonlinear_radiation(self, problem: MeshProblem) -> bool:
+        for bc in problem.boundary_conditions.values():
+            if isinstance(bc, RadiationBC):
+                return True
+            if isinstance(bc, CombinedBC) and bc.value.get("radiation") is not None:
+                return True
+        return False
+
+    def _add_linear_boundary_terms(
+        self,
+        problem: MeshProblem,
+        bilinear_form: ng.BilinearForm,
+        linear_form: ng.LinearForm,
+        u,
+        v,
+        scale: float = 1.0,
+    ) -> None:
+        jac = self._jac()
+
+        for name, bc in problem.boundary_conditions.items():
+            if isinstance(bc, RobinBC | ConvectionBC):
+                h_val, t_amb = bc.value
+                bilinear_form += scale * jac * float(h_val) * u * v * ng.ds(
+                    definedon=name
+                )
+                linear_form += scale * jac * float(h_val) * float(t_amb) * v * ng.ds(
+                    definedon=name
+                )
+                continue
+
+            if isinstance(bc, CombinedBC):
+                convection = bc.value.get("convection")
+                if convection is None:
+                    continue
+
+                h_conv, t_conv = convection
+                bilinear_form += scale * jac * float(h_conv) * u * v * ng.ds(
+                    definedon=name
+                )
+                linear_form += scale * jac * float(h_conv) * float(t_conv) * v * ng.ds(
+                    definedon=name
+                )
+
+    def _add_nonlinear_radiation_terms(
+        self,
+        problem: MeshProblem,
+        bilinear_form: ng.BilinearForm,
+        linear_form: ng.LinearForm,
+        u,
+        v,
+        temperature_guess,
+        scale: float = 1.0,
+    ) -> None:
+        jac = self._jac()
+        t_kelvin = temperature_guess + KELVIN_OFFSET
+
+        for name, bc in problem.boundary_conditions.items():
+            radiation = None
+            if isinstance(bc, RadiationBC):
+                radiation = bc.value
+            elif isinstance(bc, CombinedBC):
+                radiation = bc.value.get("radiation")
+
+            if radiation is None:
+                continue
+
+            emissivity, t_surroundings = radiation
+            t_surroundings_kelvin = float(t_surroundings) + KELVIN_OFFSET
+            radiation_jacobian = (
+                4.0 * float(emissivity) * STEFAN_BOLTZMANN * t_kelvin**3
+            )
+            radiation_flux = float(emissivity) * STEFAN_BOLTZMANN * (
+                t_kelvin**4 - t_surroundings_kelvin**4
+            )
+            radiation_constant = radiation_flux - radiation_jacobian * temperature_guess
+
+            bilinear_form += (
+                scale * jac * radiation_jacobian * u * v * ng.ds(definedon=name)
+            )
+            linear_form += (
+                -scale * jac * radiation_constant * v * ng.ds(definedon=name)
+            )
+
+    def _set_dirichlet_values(
+        self,
+        grid_function: ng.GridFunction,
+        boundary_cf,
+        dirichlet_pipe: Optional[str],
+    ) -> None:
+        if boundary_cf is None or not dirichlet_pipe:
+            return
+        grid_function.Set(
+            boundary_cf,
+            definedon=self.mesh.Boundaries(dirichlet_pipe),
+        )
+
     def solve_transient_problem(self, problem: MeshProblem) -> List[np.ndarray]:
 
         dt = problem.time_config.dt
@@ -153,40 +405,57 @@ class FEMSolver:
         u, v = self.fes.TnT()
         dx_r = self._dx_region()
         jac = self._jac()
-        mform = jac * u * v * dx_r
-        aform = jac * self._alpha_weight() * ng.grad(u) * ng.grad(v) * dx_r
+        mform = jac * self._rho_cp_weight() * u * v * dx_r
+        aform_linear = ng.BilinearForm(self.fes)
+        aform_linear += jac * self._k_weight() * ng.grad(u) * ng.grad(v) * dx_r
 
-        # Add Robin BC contribution to stiffness matrix
-        if hasattr(problem, "robin_values"):
-            for name, (h, _) in problem.robin_values.items():
-                aform += jac * h * u * v * ng.ds(definedon=name)
-
-        m = ng.BilinearForm(mform).Assemble()
-        a = ng.BilinearForm(aform).Assemble()
-        mstar = ng.BilinearForm(mform + dt * aform).Assemble()
-        mstarinv = mstar.mat.Inverse(freedofs=self.fes.FreeDofs())
-
-        f = ng.LinearForm(self.fes)
+        f_linear = ng.LinearForm(self.fes)
         for name, value in problem.neumann_values.items():
-            f += jac * value * v * ng.ds(definedon=name)
+            f_linear += jac * value * v * ng.ds(definedon=name)
 
-        # Add Robin BC contribution to RHS
-        if hasattr(problem, "robin_values"):
-            for name, (h, t_amb) in problem.robin_values.items():
-                f += jac * h * t_amb * v * ng.ds(definedon=name)
+        self._add_linear_boundary_terms(problem, aform_linear, f_linear, u, v)
 
         # add source term if provided
         # Prefer CoefficientFunction (exact at quadrature points) over nodal sampling
         source_cf = getattr(problem, "source_coefficient", None)
         if source_cf is not None:
-            f += jac * source_cf * v * dx_r
+            f_linear += jac * source_cf * v * dx_r
         elif problem.source_function is not None:
             gfu_source = ng.GridFunction(self.fes)
             gfu_source.vec.FV().NumPy()[:] = problem.source_function
-            f += jac * gfu_source * v * dx_r
-        f.Assemble()
-        base_force_vec = f.vec.CreateVector()
-        base_force_vec.data = f.vec
+            f_linear += jac * gfu_source * v * dx_r
+
+        m = ng.BilinearForm(mform).Assemble()
+        f_linear.Assemble()
+        base_force_vec = f_linear.vec.CreateVector()
+        base_force_vec.data = f_linear.vec
+
+        has_nonlinear_radiation = self._has_nonlinear_radiation(problem)
+        has_nonlinear_material = self._has_nonlinear_material()
+        needs_picard = has_nonlinear_radiation or has_nonlinear_material
+        max_picard_iters = int(getattr(problem, "nonlinear_bc_max_iters", 15))
+        min_picard_iters = int(getattr(problem, "nonlinear_bc_min_iters", 1))
+        picard_tol = float(getattr(problem, "nonlinear_bc_tol", 1e-8))
+
+        mstar_linear = None
+        mstarinv_linear = None
+        if not needs_picard:
+            mstar_linear = ng.BilinearForm(self.fes)
+            mstar_linear += mform
+            mstar_linear += (
+                dt * jac * self._k_weight() * ng.grad(u) * ng.grad(v) * dx_r
+            )
+            linear_boundary_dummy = ng.LinearForm(self.fes)
+            self._add_linear_boundary_terms(
+                problem,
+                mstar_linear,
+                linear_boundary_dummy,
+                u,
+                v,
+                scale=dt,
+            )
+            mstar_linear.Assemble()
+            mstarinv_linear = mstar_linear.mat.Inverse(freedofs=self.fes.FreeDofs())
 
         gfu = ng.GridFunction(self.fes)
         gfu_initial = ng.GridFunction(self.fes)
@@ -199,10 +468,7 @@ class FEMSolver:
         has_dirichlet = problem.mesh_config.dirichlet_pipe and problem.boundary_values
         if has_dirichlet:
             boundary_cf = self.mesh.BoundaryCF(problem.boundary_values, default=0)
-            gfu.Set(
-                boundary_cf,
-                definedon=self.mesh.Boundaries(problem.mesh_config.dirichlet_pipe),
-            )
+            self._set_dirichlet_values(gfu, boundary_cf, problem.mesh_config.dirichlet_pipe)
 
         # Copy initial condition values for free DOFs only
         free_dofs = self.fes.FreeDofs()
@@ -230,16 +496,93 @@ class FEMSolver:
             rhs_vec.data += dt * total_force
 
             gfu_next = ng.GridFunction(self.fes)
+            self._set_dirichlet_values(gfu_next, boundary_cf, problem.mesh_config.dirichlet_pipe)
 
-            # Only set Dirichlet BCs if we have them
-            if has_dirichlet and boundary_cf is not None:
-                gfu_next.Set(
-                    boundary_cf,
-                    definedon=self.mesh.Boundaries(problem.mesh_config.dirichlet_pipe),
+            if not needs_picard:
+                rhs_linear = total_force.CreateVector()
+                rhs_linear.data = rhs_vec
+                rhs_linear.data -= mstar_linear.mat * gfu_next.vec
+                gfu_next.vec.data += mstarinv_linear * rhs_linear
+            else:
+                gfu_iter = ng.GridFunction(self.fes)
+                gfu_iter.vec.data = gfu.vec
+                self._set_dirichlet_values(
+                    gfu_iter, boundary_cf, problem.mesh_config.dirichlet_pipe
                 )
 
-            rhs_vec.data -= mstar.mat * gfu_next.vec
-            gfu_next.vec.data += mstarinv * rhs_vec
+                converged = False
+                for picard_iter in range(max_picard_iters):
+                    system_form = ng.BilinearForm(self.fes)
+                    system_form += mform
+                    system_form += (
+                        dt * jac * self._k_weight(temperature_gf=gfu_iter) * ng.grad(u) * ng.grad(v) * dx_r
+                    )
+
+                    force_form = ng.LinearForm(self.fes)
+                    for name, value in problem.neumann_values.items():
+                        force_form += dt * jac * value * v * ng.ds(definedon=name)
+
+                    if source_cf is not None:
+                        force_form += dt * jac * source_cf * v * dx_r
+                    elif problem.source_function is not None:
+                        gfu_source = ng.GridFunction(self.fes)
+                        gfu_source.vec.FV().NumPy()[:] = problem.source_function
+                        force_form += dt * jac * gfu_source * v * dx_r
+
+                    self._add_linear_boundary_terms(
+                        problem,
+                        system_form,
+                        force_form,
+                        u,
+                        v,
+                        scale=dt,
+                    )
+                    self._add_nonlinear_radiation_terms(
+                        problem,
+                        system_form,
+                        force_form,
+                        u,
+                        v,
+                        gfu_iter,
+                        scale=dt,
+                    )
+
+                    system_form.Assemble()
+                    force_form.Assemble()
+
+                    rhs_nonlinear = force_form.vec.CreateVector()
+                    rhs_nonlinear.data = m.mat * gfu.vec
+                    rhs_nonlinear.data += force_form.vec
+
+                    gfu_candidate = ng.GridFunction(self.fes)
+                    self._set_dirichlet_values(
+                        gfu_candidate,
+                        boundary_cf,
+                        problem.mesh_config.dirichlet_pipe,
+                    )
+
+                    rhs_nonlinear.data -= system_form.mat * gfu_candidate.vec
+                    inv_system = system_form.mat.Inverse(freedofs=self.fes.FreeDofs())
+                    gfu_candidate.vec.data += inv_system * rhs_nonlinear
+
+                    iter_vals = gfu_iter.vec.FV().NumPy()
+                    cand_vals = gfu_candidate.vec.FV().NumPy()
+                    diff_norm = np.linalg.norm(cand_vals - iter_vals)
+                    cand_norm = max(np.linalg.norm(cand_vals), 1.0)
+                    rel_change = diff_norm / cand_norm
+
+                    gfu_next.vec.data = gfu_candidate.vec
+                    gfu_iter.vec.data = gfu_candidate.vec
+
+                    if picard_iter + 1 >= min_picard_iters and rel_change < picard_tol:
+                        converged = True
+                        break
+
+                if not converged:
+                    print(
+                        f"Warning: Nonlinear radiation Picard iteration did not converge "
+                        f"at time step {j + 1} (relative change > {picard_tol:.1e})."
+                    )
 
             gfu = gfu_next
             state_arr = gfu.vec.FV().NumPy().copy()
@@ -307,7 +650,14 @@ class FEMSolver:
 
         # Convert sparse tensors to match input precision
         mass_mat = self.mass_matrix_mat.to(dtype=t_pred_next.dtype)
-        stiff_mat = self.stiffness_matrix_mat.to(dtype=t_pred_next.dtype)
+
+        k_table = getattr(problem, "k_table", None)
+        if k_table is not None:
+            stiff_mat = self._assemble_stiffness_at_temperature(
+                t_pred_full.detach().cpu().numpy()
+            ).to(device=device, dtype=t_pred_next.dtype)
+        else:
+            stiff_mat = self.stiffness_matrix_mat.to(dtype=t_pred_next.dtype)
 
         dt_mass_mat = mass_mat / dt  # (1/dt)*M
         mass_plus_stiff = dt_mass_mat + stiff_mat  # (1/dt*M + K)
@@ -331,17 +681,28 @@ class FEMSolver:
         ).squeeze()  # [N_dofs]
 
         # Residual calculation for the full system:
-        # R = (1/dt*M + K)*T_pred_full - (1/dt*M)*T_prev_full - source_term - neumann_vec
+        # R = (1/dt*M + K_linear)*T_pred_full - (1/dt*M)*T_prev_full
+        #     - source_term - f_linear + g_rad(T_pred_full)
         residual = torch.add(t_pred_term, -t_prev_term)
         residual = torch.add(residual, -source_term)
         residual = torch.add(residual, -neumann_vec)
+        radiation_residual, radiation_diag = self._compute_radiation_residual(
+            t_pred_full
+        )
+        residual = torch.add(residual, radiation_residual)
         residual = residual.squeeze()  # [N_dofs]
 
         # Normalize weak-form residual by system matrix diagonal (Jacobi scaling).
         # Using diag(M/dt + K) rather than M_lumped alone ensures Robin BC
         # contributions are properly weighted — preventing O(10^3)–O(10^4)
         # amplification at boundary nodes where K_robin >> M_lumped.
-        sys_diag = self.system_diag.to(device=device, dtype=t_pred_next.dtype)
+        if k_table is not None:
+            # Recompute system diagonal with the temperature-dependent K(T)
+            sys_mat_t = (mass_mat / dt + stiff_mat).coalesce()
+            sys_diag = self._extract_sparse_diagonal(sys_mat_t)
+        else:
+            sys_diag = self.system_diag.to(device=device, dtype=t_pred_next.dtype)
+        sys_diag = sys_diag + radiation_diag
         sys_diag_safe = torch.clamp(torch.abs(sys_diag), min=1e-30)
         residual = residual / sys_diag_safe
 
@@ -408,6 +769,39 @@ class FEMSolver:
 
         return boundary_vector
 
+    def _compute_radiation_residual(
+        self,
+        temperature_field: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = temperature_field.device
+        dtype = temperature_field.dtype
+
+        radiation_residual = torch.zeros_like(
+            temperature_field, device=device, dtype=dtype
+        )
+        radiation_diag = torch.zeros_like(
+            temperature_field, device=device, dtype=dtype
+        )
+        t_kelvin = temperature_field + KELVIN_OFFSET
+
+        for term in getattr(self, "radiation_boundary_terms", []):
+            boundary_mat = term["matrix"].to(device=device, dtype=dtype)
+            boundary_diag = term["diag"].to(device=device, dtype=dtype)
+            eps_sigma = torch.tensor(term["eps_sigma"], device=device, dtype=dtype)
+            ambient_kelvin = torch.tensor(
+                term["ambient_kelvin"], device=device, dtype=dtype
+            )
+
+            flux = eps_sigma * (t_kelvin**4 - ambient_kelvin**4)
+            radiation_residual = radiation_residual + torch.sparse.mm(
+                boundary_mat, flux.unsqueeze(1)
+            ).squeeze()
+
+            flux_jacobian = 4.0 * eps_sigma * t_kelvin**3
+            radiation_diag = radiation_diag + boundary_diag * flux_jacobian
+
+        return radiation_residual, radiation_diag
+
     def _compute_source_term(
         self,
         problem: MeshProblem,
@@ -417,30 +811,12 @@ class FEMSolver:
     ) -> torch.Tensor:
         """Assemble the source term, supporting nonlinear heating.
 
-        If a source CoefficientFunction was provided, the source is already
-        baked into self.neumann_vec during init_matrices, so we return zero
-        to avoid double-counting.
+        Both source_coefficient and source_function are already integrated
+        into self.neumann_vec during init_matrices (via the LinearForm),
+        so we return zero to avoid double-counting.
         """
         device = temperature_field.device
         dtype = temperature_field.dtype
-
-        # Source already assembled via CoefficientFunction in neumann_vec
-        if getattr(problem, "source_coefficient", None) is not None:
-            return torch.zeros_like(temperature_field, device=device, dtype=dtype)
-
-        if problem.source_function is not None:
-            if isinstance(problem.source_function, torch.Tensor):
-                source_nodal = (
-                    problem.source_function.detach()
-                    .clone()
-                    .to(device=device, dtype=dtype)
-                )
-            else:
-                source_nodal = torch.tensor(
-                    problem.source_function, device=device, dtype=dtype
-                )
-            return torch.sparse.mm(mass_mat, source_nodal.unsqueeze(1)).squeeze()
-
         return torch.zeros_like(temperature_field, device=device, dtype=dtype)
 
     def _compute_nonlinear_source_vector(
@@ -483,15 +859,27 @@ class FEMSolver:
         filename="results/vtk/results.vtk",
         material_field: Optional[np.ndarray] = None,
         material_name: str = "MaterialDistribution",
+        material_fields: Optional[dict] = None,
     ):
         """
         Export solutions to VTK file for visualization in Paraview.
+
+        material_fields: optional dict {name: array} where each array is either
+            1D (static, shape [n_dofs]) or 2D (per-timestep, shape [n_timesteps, n_dofs]).
+            Takes precedence over the legacy material_field/material_name pair.
         """
         os.makedirs(os.path.dirname(filename), exist_ok=True)
+        time_steps = np.asarray(time_steps, dtype=np.float64)
+        if len(time_steps) + 1 == len(array_true) == len(array_pred):
+            time_steps = np.concatenate(([0.0], time_steps))
+        elif len(time_steps) != len(array_true) or len(time_steps) != len(array_pred):
+            raise ValueError(
+                "time_steps length must match exported state count, or be one shorter when states include the initial condition"
+            )
+
         gfu_true = ng.GridFunction(self.fes)
         gfu_pred = ng.GridFunction(self.fes)
         gfu_diff = ng.GridFunction(self.fes)
-        material_gfu = None
         gfu_true.vec.FV().NumPy()[:] = array_true[0]
         gfu_pred.vec.FV().NumPy()[:] = array_pred[0]
         # relative error
@@ -501,19 +889,39 @@ class FEMSolver:
         coefs = [gfu_true, gfu_pred, gfu_diff]
         names = ["ExactSolution", "PredictedSolution", "Difference, %"]
 
-        if material_field is not None:
-            material_array = np.array(material_field, dtype=np.float64)
-            if material_array.ndim > 1:
-                material_array = material_array.reshape(-1)
-            if material_array.size == self.fes.ndof:
-                material_gfu = ng.GridFunction(self.fes)
-                material_gfu.vec.FV().NumPy()[:] = material_array
-                coefs.append(material_gfu)
-                names.append(material_name)
-            else:
-                print(
-                    f"Warning: Material field length {material_array.size} does not match number of DOFs {self.fes.ndof}. Skipping export."
-                )
+        # Build unified material_fields dict from legacy or new API
+        if material_fields is None and material_field is not None:
+            material_fields = {material_name: material_field}
+
+        # Process all material fields
+        mat_gfus = {}          # name -> GridFunction
+        mat_per_step = {}      # name -> 2D array (only for per-timestep fields)
+        if material_fields is not None:
+            for mname, mfield in material_fields.items():
+                material_array = np.array(mfield, dtype=np.float64)
+                if material_array.ndim == 2 and material_array.shape[1] == self.fes.ndof:
+                    mat_per_step[mname] = material_array
+                    gfu = ng.GridFunction(self.fes)
+                    gfu.vec.FV().NumPy()[:] = material_array[0]
+                    mat_gfus[mname] = gfu
+                    coefs.append(gfu)
+                    names.append(mname)
+                elif material_array.ndim <= 1 or (material_array.ndim == 2 and material_array.shape[0] == self.fes.ndof):
+                    material_array = material_array.reshape(-1)
+                    if material_array.size == self.fes.ndof:
+                        gfu = ng.GridFunction(self.fes)
+                        gfu.vec.FV().NumPy()[:] = material_array
+                        mat_gfus[mname] = gfu
+                        coefs.append(gfu)
+                        names.append(mname)
+                    else:
+                        print(
+                            f"Warning: Material field '{mname}' length {material_array.size} does not match number of DOFs {self.fes.ndof}. Skipping."
+                        )
+                else:
+                    print(
+                        f"Warning: Material field '{mname}' shape {material_array.shape} not understood. Skipping."
+                    )
 
         vtk_out = ng.VTKOutput(
             self.mesh,
@@ -530,6 +938,9 @@ class FEMSolver:
                 / (np.max(np.abs(array_true[idx])) - np.min(np.abs(array_true[idx])))
                 * 100
             )
+            for mname, gfu in mat_gfus.items():
+                if mname in mat_per_step and idx < len(mat_per_step[mname]):
+                    gfu.vec.FV().NumPy()[:] = mat_per_step[mname][idx]
             vtk_out.Do(time=time)
         print(f"VTK file saved as {filename}")
 
@@ -562,8 +973,15 @@ if __name__ == "__main__":
         create_source_test_problem,
         create_em_to_thermal
     )
+    from thermal_problems import (
+        create_simple_problem,
+        create_bc_verification_problem, 
+        create_volumetric_heat_source_problem,
+        create_temp_dependent_material_problem,
+        create_ih_problem
+    )
 
-    problem, time_config = create_em_to_thermal()
+    problem = create_ih_problem(frequency=2000, current=2000)
 
     # Initialize FEM solver
     fem_solver = FEMSolver(problem.mesh, order=1, problem=problem)
@@ -586,9 +1004,20 @@ if __name__ == "__main__":
         )
     assert np.mean(residual.numpy()) < 1e-8, "Residual is too high!"
 
+    # Compute k field at each time step for VTK export
+    k_table = getattr(problem, "k_table", None)
+    if k_table is not None:
+        k_field = np.array(
+            [k_table.evaluate_array(state) for state in transient_solution]
+        )  # [n_timesteps, n_dofs]
+    else:
+        k_field = np.full_like(transient_solution[0], problem.k)
+
     fem_solver.export_to_vtk(
         np.array(transient_solution),
         np.array(transient_solution),
-        problem.time_config.time_steps,
+        problem.time_config.time_steps_export,
         filename="results/fem_tests/vtk/result",
+        material_field=k_field,
+        material_name="ThermalConductivity",
     )

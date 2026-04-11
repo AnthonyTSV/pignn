@@ -300,7 +300,6 @@ def train_pimgn_on_multiple_problems():
         predictions[0][:min_length],
         time_config.time_steps_export[:min_length],
         filename="results/physics_informed/pimgn_single_comparison.vtk",
-        material_field=getattr(trainer.problems[-1], "material_field", None),
     )
 
     print("maxh for last problem:", trainer.problems[-1].mesh_config.maxh)
@@ -339,7 +338,8 @@ def _run_single_problem_experiment(problem, time_config, config, experiment_name
 
     print("\nEvaluating trained PIMGN...")
     last_residuals = trainer.last_residuals
-    trainer.logger.log_evaluation(last_residuals.tolist(), "residuals_per_time_step")
+    if last_residuals is not None and len(last_residuals) > 0:
+        trainer.logger.log_evaluation(last_residuals.tolist(), "residuals_per_time_step")
     pos_data = trainer.problems[0].graph_data.pos.numpy()
     try:
         predictions, ground_truth, errors = trainer.evaluate_with_ground_truth(
@@ -355,12 +355,28 @@ def _run_single_problem_experiment(problem, time_config, config, experiment_name
             len(predictions[0]),
             len(time_config.time_steps_export),
         )
+            # Compute k field at each time step for VTK export
+        k_table = getattr(problem, "k_table", None)
+        if k_table is not None:
+            k_field_pred = np.array(
+                [k_table.evaluate_array(state) for state in predictions[0]]
+            )  # [n_timesteps, n_dofs]
+            k_field_true = np.array(
+                [k_table.evaluate_array(state) for state in ground_truth[0]]
+            )  # [n_timesteps, n_dofs]
+            material_fields = {
+                "k_FEM": k_field_true,
+                "k_Surrogate": k_field_pred,
+            }
+        else:
+            k_field = np.full_like(predictions[0][0], problem.k)
+            material_fields = {"ThermalConductivity": k_field}
         trainer.all_fem_solvers[0].export_to_vtk(
             ground_truth[0][:min_length],
             predictions[0][:min_length],
             time_config.time_steps_export[:min_length],
             filename=f"{save_path}/vtk/result",
-            material_field=getattr(trainer.problems[0], "material_field", None),
+            material_fields=material_fields,
         )
     except Exception as e:
         print(f"Ground truth evaluation failed: {e}")
@@ -382,7 +398,8 @@ def _run_multiple_problem_experiment(
     print("=" * 60)
 
     Path("results").mkdir(exist_ok=True)
-    Path("results/physics_informed").mkdir(exist_ok=True)
+    save_dir = Path(config.get("save_dir", "results/physics_informed/multiple_problems"))
+    save_dir.mkdir(exist_ok=True, parents=True)
 
     print("=" * 40)
     print("Training configuration:")
@@ -421,11 +438,11 @@ def _run_multiple_problem_experiment(
         trainer.val_losses,
         last_residuals,
         pos_data,
-        save_path="results/physics_informed",
+        save_path=save_dir,
     )
 
     print("Physics-Informed MeshGraphNet test completed!")
-    print("Results saved to: results/physics_informed/")
+    print(f"Results saved to: {save_dir}")
     trainer.save_logs()
 
     min_length = min(
@@ -435,11 +452,11 @@ def _run_multiple_problem_experiment(
         ground_truth[0][:min_length],
         predictions[0][:min_length],
         time_config.time_steps_export[:min_length],
-        filename="results/physics_informed/vtk/result",
+        filename=f"{save_dir}/vtk/result",
         material_field=getattr(trainer.problems[0], "material_field", None),
     )
 
-    model_path = "results/physics_informed/pimgn_trained_model.pth"
+    model_path = f"{save_dir}/pimgn_trained_model.pth"
     torch.save(trainer.model.state_dict(), model_path)
     print(f"Trained model saved to: {model_path}")
 
@@ -456,24 +473,12 @@ def train_pimgn_on_single_problem(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, time_config, config, "First order MMS")
 
-def train_pimgn_temp_dependent_material():
-    from train_problems import create_temp_dependent_material_problem
-    problem, time_config = create_temp_dependent_material_problem(maxh=0.2)
-    config = {
-        "epochs": 500,
-        "lr": 1e-3,
-        "time_window": 20,
-        "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/temp_dependent_material_maxh_0.2",
-    }
-    _run_single_problem_experiment(problem, time_config, config, "Temp dependent material")
-
 def train_multiple_problems():
     problems = []
     time_config = None
     for i in range(5):
         problem, time_config = create_test_problem(
-            maxh=0.1, alpha=np.random.uniform(0.1, 5.0)
+            maxh=0.1, k=np.random.uniform(0.1, 5.0)
         )
         problems.append(problem)
     config = {
@@ -514,16 +519,100 @@ def em_to_thermal():
         problem, time_config, config, "EM to thermal problem"
     )
 
-def main():
-    """Main function to run Physics-Informed MeshGraphNet training and evaluation."""
-    # Uncomment one of the following lines to run the desired test
-    # train_pimgn_on_single_problem("results/physics_informed/verification_test_problem_3_maxh_0.1/pimgn_trained_model.pth")
-    train_pimgn_on_single_problem()
-    # train_multiple_problems()
-    # train_pimgn_on_multiple_problems()
-    # train_pimgn_on_industrial_problem()
-    # em_to_thermal()
+# def main():
+#     """Main function to run Physics-Informed MeshGraphNet training and evaluation."""
+#     # Uncomment one of the following lines to run the desired test
+#     # train_pimgn_on_single_problem("results/physics_informed/verification_test_problem_3_maxh_0.1/pimgn_trained_model.pth")
+#     train_pimgn_on_single_problem()
+#     # train_multiple_problems()
+#     # train_pimgn_on_multiple_problems()
+#     # train_pimgn_on_industrial_problem()
+#     # em_to_thermal()
 
+def train_mms_problem():
+    from thermal_problems import create_simple_problem
+    problem = create_simple_problem()
+    config = {
+        "epochs": 2000,
+        "lr": 1e-3,
+        "time_window": 20,
+        "noise_sigma": 1e-1,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/thermal_mms",
+    }
+    _run_single_problem_experiment(problem, problem.time_config, config, "MMS thermal problem")
+
+def train_bc_verification_problem():
+    from thermal_problems import create_bc_verification_problem
+    problem = create_bc_verification_problem()
+    config = {
+        "epochs": 2000,
+        "lr": 1e-3,
+        "time_window": 20,
+        "noise_sigma": 1e-1,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/thermal_bc_verification",
+    }
+    _run_single_problem_experiment(problem, problem.time_config, config, "BC verification thermal problem")
+
+def train_volumetric_heat_source_problem():
+    from thermal_problems import create_volumetric_heat_source_problem
+    problem = create_volumetric_heat_source_problem()
+    config = {
+        "epochs": 2000,
+        "lr": 1e-3,
+        "time_window": 20,
+        "noise_sigma": 1e-1,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/thermal_volumetric_heat_source",
+    }
+    _run_single_problem_experiment(problem, problem.time_config, config, "Volumetric heat source thermal problem")
+
+def train_temp_dependent_material_problem(resume_from: str = None):
+    from thermal_problems import create_temp_dependent_material_problem
+    problem = create_temp_dependent_material_problem()
+    config = {
+        "epochs": 2000,
+        "lr": 1e-3,
+        "time_window": 20,
+        "noise_sigma": 1e-1,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/thermal_temp_dependent_material",
+        "resume_from": resume_from,
+    }
+    _run_single_problem_experiment(problem, problem.time_config, config, "Temperature-dependent material thermal problem")
+
+def train_ih_problem():
+    from thermal_problems import create_ih_problem
+    problem = create_ih_problem()
+    config = {
+        "epochs": 2000,
+        "lr": 1e-3,
+        "time_window": 20,
+        "noise_sigma": 1e-1,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/thermal_ih_problem",
+        "resume_from": "results/physics_informed/thermal_ih_problem/pimgn_trained_model.pth",
+    }
+    _run_single_problem_experiment(problem, problem.time_config, config, "Induction heating thermal problem")
+
+def train_ih_generalization_problem():
+    from thermal_problems import create_ih_problem
+    freq_range = np.arange(2000, 7000, 1000)
+    problems = [
+        create_ih_problem(frequency=freq) for freq in freq_range
+    ]
+    config = {
+        "epochs": 2000,
+        "lr": 1e-3,
+        "time_window": 20,
+        "noise_sigma": 1e-1,
+        "batch_size": 2,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/thermal_ih_generalization",
+        # "resume_from": "results/physics_informed/thermal_ih_generalization/pimgn_trained_model.pth",
+    }
+    _run_multiple_problem_experiment(problems, problems[0].time_config, config, "Induction heating generalization problem")
 
 if __name__ == "__main__":
-    main()
+    train_ih_generalization_problem()

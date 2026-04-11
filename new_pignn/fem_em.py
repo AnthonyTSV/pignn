@@ -125,14 +125,7 @@ class FEMSolverEM:
             default=1.0,
         )
 
-        sigma = self.mesh.MaterialCF(
-            {
-                "mat_workpiece": self.problem.sigma_workpiece,
-                "mat_air": self.problem.sigma_air,
-                "mat_coil": self.problem.sigma_coil,
-            },
-            default=0.0,
-        )
+        sigma = self._sigma_cf()
         fes = ng.H1(
             self.mesh,
             order=self.order,
@@ -178,6 +171,30 @@ class FEMSolverEM:
         ).to(self.device)
         self.fes = fes
 
+    def _sigma_cf(self):
+        """Return the conductivity CoefficientFunction for FEM assembly.
+
+        If the problem carries a per-node ``sigma_nodal`` array (e.g. from a
+        temperature-dependent conductivity model), it is injected into an
+        H1 GridFunction so that the bilinear-form integrand sees spatially
+        varying conductivity.  Otherwise the constant-per-region MaterialCF
+        is used.
+        """
+        sigma_nodal = getattr(self.problem, "sigma_nodal", None)
+        if sigma_nodal is not None:
+            fes_real = ng.H1(self.mesh, order=self.order, complex=False)
+            gfu_sigma = ng.GridFunction(fes_real)
+            gfu_sigma.vec.FV().NumPy()[:] = np.asarray(sigma_nodal, dtype=np.float64)
+            return gfu_sigma
+        return self.mesh.MaterialCF(
+            {
+                "mat_workpiece": self.problem.sigma_workpiece,
+                "mat_air": self.problem.sigma_air,
+                "mat_coil": self.problem.sigma_coil,
+            },
+            default=0.0,
+        )
+
     def init_complex_matrices(self):
         if self.problem is None:
             raise ValueError("Problem must be set before initializing matrices")
@@ -192,14 +209,7 @@ class FEMSolverEM:
             default=1.0,
         )
 
-        sigma = self.mesh.MaterialCF(
-            {
-                "mat_workpiece": self.problem.sigma_workpiece,
-                "mat_air": self.problem.sigma_air,
-                "mat_coil": self.problem.sigma_coil,
-            },
-            default=0.0,
-        )
+        sigma = self._sigma_cf()
         fes = ng.H1(
             self.mesh,
             order=self.order,
@@ -260,6 +270,23 @@ class FEMSolverEM:
         lumped = torch.sparse.mm(M_real, ones.unsqueeze(1)).squeeze(1)
         # Clamp to avoid division by zero on Dirichlet / axis nodes
         self.lumped_mass_diag = lumped.clamp_min(1e-30)
+
+    def reassemble_with_sigma(self, sigma_nodal: np.ndarray):
+        """Re-assemble the complex bilinear form with a new per-node sigma.
+
+        This is the EM analog of the thermal solver's
+        ``_assemble_stiffness_at_temperature``: when the conductivity changes
+        (e.g. because the temperature field was updated), the stiffness +
+        eddy-current matrix must be rebuilt.
+
+        Parameters
+        ----------
+        sigma_nodal : np.ndarray
+            Nondimensionalized conductivity at each mesh node (same ordering as
+            the graph / DOF numbering).
+        """
+        self.problem.sigma_nodal = np.asarray(sigma_nodal, dtype=np.float64)
+        self.init_complex_matrices()
 
     def init_mixed_matrices(self):
         """
@@ -437,14 +464,7 @@ class FEMSolverEM:
             default=1.0,
         )
 
-        sigma = self.mesh.MaterialCF(
-            {
-                "mat_workpiece": self.problem.sigma_workpiece,
-                "mat_air": self.problem.sigma_air,
-                "mat_coil": self.problem.sigma_coil,
-            },
-            default=0.0,
-        )
+        sigma = self._sigma_cf()
         fes = self.fes
         A, v = fes.TnT()
         gfA = ng.GridFunction(fes)
@@ -1232,7 +1252,7 @@ class FEMSolverEM:
         gfu_pred_real.vec.FV().NumPy()[:] = np.real(array_pred)
         gfu_err_abs.vec.FV().NumPy()[:] = np.abs(array_true - array_pred)
         gfu_err_rel.vec.FV().NumPy()[:] = np.abs(array_true - array_pred) / (
-            np.abs(array_true) + 1e-10
+            (np.abs(array_true).max() - np.abs(array_true).min()) + 1e-10
         )  # avoid division by zero
 
         coefs = [
@@ -1298,8 +1318,11 @@ class FEMSolverEM:
         gfu_pred.vec.FV().NumPy()[:] = array_pred
         gfu_err_abs.vec.FV().NumPy()[:] = np.abs(array_true - array_pred)
         gfu_err_rel.vec.FV().NumPy()[:] = np.abs(array_true - array_pred) / (
-            np.abs(array_true) + 1e-10
+            (np.abs(array_true).max() - np.abs(array_true).min()) + 1e-10
         )  # avoid division by zero
+
+        sigma_field = ng.GridFunction(fes_real)
+        sigma_field.vec.FV().NumPy()[:] = self.problem.sigma_field
 
         coefs = [
             gfu_true.real,
@@ -1310,6 +1333,7 @@ class FEMSolverEM:
             ng.Norm(gfu_pred),
             gfu_err_abs,
             gfu_err_rel,
+            sigma_field,
         ]
         names = [
             "ExactSolution_real",
@@ -1320,6 +1344,7 @@ class FEMSolverEM:
             "PredictedSolution_abs",
             "AbsError",
             "RelError",
+            "SigmaField",
         ]
 
         vtk_out = ng.VTKOutput(
@@ -1461,8 +1486,9 @@ def previous_em():
     from graph_creator import GraphCreator
     from train_problems import create_em_problem, create_em_problem_complex
     from em_magnetostatic_problems import magnetostatic_problem_3
+    from em_eddy_problems import eddy_current_problem_temp_dependent_conductivity, eddy_current_problem_1
 
-    problem = magnetostatic_problem_3()
+    problem = eddy_current_problem_temp_dependent_conductivity()
 
     # Initialize FEM solver
     fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
@@ -1485,11 +1511,11 @@ def previous_em():
         residuals_abs = np.absolute(residual.cpu().numpy())
         print(f"Mean residual: {np.mean(residuals_abs)}")
 
-    # fem_solver.export_to_vtk_complex(
-    #     gfA,
-    #     gfA,
-    #     filename="results/fem_tests_em/vtk/result",
-    # )
+    fem_solver.export_to_vtk_complex(
+        gfA,
+        gfA,
+        filename="results/fem_tests_em/vtk/temp_dependent_conductivity",
+    )
 
 # def mixed_em():
 #     import ngsolve as ng

@@ -106,6 +106,9 @@ def rollout(model, problem: MeshProblem, device, n_steps=None):
     model.eval()
     time_window = 20
 
+    if n_steps is None:
+        n_steps = len(problem.time_config.time_steps_export)
+
     time_steps = problem.time_config.time_steps
     time_steps_bundled = np.array_split(time_steps, len(time_steps) // time_window)
 

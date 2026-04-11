@@ -56,7 +56,7 @@ def plot_l2(paths: list[Path] = None, save_dir: Path = Path("verification_plots/
     plt.legend(fancybox=True, frameon=True)
     plt.savefig(save_dir / "train_loss_comparison.pdf", dpi=300)
 
-def epoch_vs_l2(paths: list[Path] = None, save_dir: Path = Path("verification_plots/problem2")):
+def time_vs_l2(paths: list[Path] = None, save_dir: Path = Path("verification_plots/problem2"), need_maxh_in_label: bool = False, time_range: np.ndarray = None):
     log_paths = paths
     l2_errors = {}
     for log_path in log_paths:
@@ -67,14 +67,19 @@ def epoch_vs_l2(paths: list[Path] = None, save_dir: Path = Path("verification_pl
         l2_errors[maxh_value] = l2_error
     plt.figure(figsize=(6, 4))
     for key, l2_error in l2_errors.items():
-        plt.plot(l2_error, label=f"maxh={key}", linewidth=1)
+        label = f"maxh={key}" if need_maxh_in_label else None
+        if time_range is not None:
+            plt.plot(time_range, l2_error, label=label, linewidth=1, marker="o", markersize=2)
+        else:
+            plt.plot(l2_error, label=label, linewidth=1)
     plt.yscale("log")
-    plt.xlabel("Epoch")
-    plt.ylabel("L2 Error")
-    plt.legend(fancybox=True, frameon=True)
-    plt.savefig(save_dir / "epoch_vs_l2_error.pdf", dpi=300)
+    plt.xlabel("Time $t$ [s]")
+    plt.ylabel(r"$L_2$ error")
+    if label:
+        plt.legend(fancybox=True, frameon=True)
+    plt.savefig(save_dir / "time_vs_l2_error.pdf", dpi=300)
 
-def epoch_vs_train_loss(paths: list[Path] = None, save_dir: Path = Path("verification_plots/problem2"), apply_smoothing: bool = True, is_error_negative: bool = False):
+def epoch_vs_train_loss(paths: list[Path] = None, save_dir: Path = Path("verification_plots/problem2"), apply_smoothing: bool = True, is_error_negative: bool = False, need_maxh_in_label: bool = False):
     """
     Plot training loss vs epoch for multiple runs. If apply_smoothing is True, applies a moving average filter to smooth the curves
     and keeps the original curves as well only with opacity 0.5.
@@ -90,13 +95,14 @@ def epoch_vs_train_loss(paths: list[Path] = None, save_dir: Path = Path("verific
         train_losses[maxh_value] = train_loss
     plt.figure(figsize=(6, 4))
     for key, train_loss in train_losses.items():
+        label = f"maxh={key}" if need_maxh_in_label else None
         if apply_smoothing:
             window_size = max(1, len(train_loss) // 100)  # Adjust window size based on length of train_loss
             smoothed_loss = np.convolve(train_loss, np.ones(window_size)/window_size, mode='valid')
-            plt.plot(smoothed_loss, label=f"maxh={key} (smoothed)", linewidth=2)
-            plt.plot(train_loss, label=f"maxh={key} (original)", linewidth=1, alpha=0.5)
+            plt.plot(train_loss, label=f"{label} (original)" if label else "original", linewidth=1, alpha=0.5, color='gray')
+            plt.plot(smoothed_loss, label=f"{label} (smoothed)" if label else "smoothed", linewidth=1.5)
         else:
-            plt.plot(train_loss, label=f"maxh={key}", linewidth=1)
+            plt.plot(train_loss, label=label, linewidth=1)
     plt.yscale("log")
     plt.xlabel("Epoch")
     plt.ylabel("Training Loss")
@@ -145,8 +151,8 @@ def epoch_vs_training_l2(
                 values, np.ones(window_size) / window_size, mode="valid"
             )
             smoothed_epochs = epochs[window_size - 1 :]
-            plt.plot(smoothed_epochs, smoothed_values, label=f"{label} (smoothed)", linewidth=2)
-            plt.plot(epochs, values, label=f"{label} (original)", linewidth=1, alpha=0.5)
+            plt.plot(smoothed_epochs, smoothed_values, label=f"{label} (smoothed)", linewidth=1)
+            plt.plot(epochs, values, label=f"{label} (original)", linewidth=1, alpha=0.3)
         else:
             plt.plot(epochs, values, label=label, linewidth=1)
 
