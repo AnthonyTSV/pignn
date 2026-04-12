@@ -178,8 +178,12 @@ class PIMGNTrainerEM:
         ).to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
-        self.scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=1000, gamma=0.95
+        # training to 10000 epochs, reduce lr from 1e-3 to 1e-5
+        min_lr = 1e-5
+        initial_lr = config["lr"]
+        self.scheduler = optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda epoch: max(min_lr / initial_lr, 0.99 ** epoch)
         )
 
         # Training history
@@ -1442,11 +1446,13 @@ def train_pimgn_eddy_current_different_currents(resume_from: str = None):
     problems = [
         eddy_current_problem_different_currents(current=current, frequency=freq) for current, freq in all_ranges
     ]
+    import random
+    random.shuffle(problems)
     config = {
-        "epochs": 15000,
+        "epochs": 10000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/eddy_current_problem_circ_coil_currents",
+        "save_dir": "results/physics_informed/eddy_current_problem_generalized",
         "enforce_axis_regularity": True,
         "data_weight": 0.0,
         "batch_size": 2,  # Number of problems per mini-batch (paper uses 2)

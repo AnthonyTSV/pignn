@@ -355,11 +355,11 @@ def _build_node_features(
         )  # Default: homogeneous Dirichlet
     features.append(dirichlet_tensor)
 
-    if sigma_field is not None:
-        sigma_tensor = torch.tensor(
-            sigma_field, dtype=torch.float32, device=device
-        ).unsqueeze(1)
-        features.append(sigma_tensor)
+    # if sigma_field is not None:
+    #     sigma_tensor = torch.tensor(
+    #         sigma_field, dtype=torch.float32, device=device
+    #     ).unsqueeze(1)
+    #     features.append(sigma_tensor)
 
     # if current_density_field is not None:
     #     current_density_tensor = torch.tensor(
@@ -417,7 +417,7 @@ def _build_global_features(
     if current is None:
         current = 0.0
     global_features = torch.tensor(
-        [omega], dtype=torch.float32, device=device
+        [omega, current], dtype=torch.float32, device=device
     )
     return global_features.unsqueeze(0)
 
