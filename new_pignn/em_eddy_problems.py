@@ -76,10 +76,11 @@ class GenericEddyCurrentProblem:
         dirichlet_boundaries, 
         dirichlet_boundaries_dict,
         material_properties: Optional[dict[str, MaterialPropertiesEM]] = None,
-        sigma_nodal=None
+        sigma_nodal=None,
+        A_star=4.8 * 1e-4,  # Wb
     ):
         self.r_star = 70 * 1e-3  # m
-        self.A_star = 4.8 * 1e-4  # Wb
+        self.A_star = A_star  # Wb
         self.mu_star = 4 * 3.1415926535e-7  # H/m
         self.J_star = self.A_star / (self.r_star**2 * self.mu_star)
         self.mesh = mesh
@@ -261,7 +262,7 @@ def eddy_current_problem_different_currents(mesh = None, current=1000, frequency
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
 
     problem_generator = GenericEddyCurrentProblem(
-        mesh, dirichlet_boundaries, dirichlet_boundaries_dict
+        mesh, dirichlet_boundaries, dirichlet_boundaries_dict, A_star=0.0022536
     )
 
     problem = problem_generator.get_problem(current=current, frequency=frequency)

@@ -603,7 +603,7 @@ def train_ih_generalization_problem():
         create_ih_problem(frequency=freq) for freq in freq_range
     ]
     config = {
-        "epochs": 2000,
+        "epochs": 500,
         "lr": 1e-3,
         "time_window": 20,
         "noise_sigma": 1e-1,

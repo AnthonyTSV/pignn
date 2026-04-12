@@ -155,6 +155,13 @@ class FEMSolver:
         sys_diag[indices[0, diag_mask]] = values[diag_mask]
         self.system_diag = sys_diag  # [N_dofs]
 
+        # Pre-compute free DOFs boolean mask (static for a given mesh/FE space)
+        free_dofs_bitarray = self.fes.FreeDofs()
+        self._free_dofs_mask = torch.tensor(
+            [free_dofs_bitarray[i] for i in range(len(free_dofs_bitarray))],
+            dtype=torch.bool,
+        )
+
     def _extract_sparse_diagonal(self, sparse_mat: torch.Tensor) -> torch.Tensor:
         sparse_mat = sparse_mat.coalesce()
         indices = sparse_mat.indices()
@@ -625,14 +632,8 @@ class FEMSolver:
         # Ensure tensors are on the same device and dtype
         device = t_pred_next.device
 
-        free_dofs_bitarray = self.fes.FreeDofs()
-
-        # Convert BitArray to torch boolean mask
-        free_dofs_mask = torch.tensor(
-            [free_dofs_bitarray[i] for i in range(len(free_dofs_bitarray))],
-            dtype=torch.bool,
-            device=device,
-        )
+        # Use pre-computed free DOFs mask
+        free_dofs_mask = self._free_dofs_mask.to(device)
 
         # Create full solution vector including boundary values
         t_pred_full = t_pred_next.clone()
@@ -734,7 +735,7 @@ class FEMSolver:
         Returns:
             boundary_vector: Vector [N_dofs] with boundary values at boundary nodes, zeros elsewhere
         """
-        n_total_dofs = len(self.fes.FreeDofs())
+        n_total_dofs = self._free_dofs_mask.shape[0]
         boundary_vector = torch.zeros(n_total_dofs, device=device, dtype=dtype)
 
         # Get the mesh boundary segments and their corresponding boundary names
@@ -755,12 +756,7 @@ class FEMSolver:
                 )
 
                 # Zero out the free DOFs (keep only boundary values)
-                free_dofs_bitarray = self.fes.FreeDofs()
-                free_dofs_mask = torch.tensor(
-                    [free_dofs_bitarray[i] for i in range(len(free_dofs_bitarray))],
-                    dtype=torch.bool,
-                    device=device,
-                )
+                free_dofs_mask = self._free_dofs_mask.to(device)
                 boundary_vector[free_dofs_mask] = 0.0
 
             except Exception as e:

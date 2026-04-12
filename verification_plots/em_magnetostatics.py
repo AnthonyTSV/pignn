@@ -198,7 +198,7 @@ ax.plot(
     label="PI-GNN (2 coils)"
 )
 
-ax.set_ylabel(r"$|J|$ [A/m$^2$]")
+ax.set_ylabel(r"$\tilde{A}$")
 # ax.set_yscale("log")
 ax.grid(True)
 # ax.legend(frameon=True, ncols=1)

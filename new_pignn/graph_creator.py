@@ -585,6 +585,47 @@ class GraphCreator:
         self.robin_names = robin_names or []
         self.connectivity_method = connectivity_method
 
+        # --- Pre-compute static graph structure (mesh-dependent, unchanging) ---
+        self._pos, self._pnum_to_idx = _build_point_index_map(mesh)
+        self._n_nodes = len(self._pos)
+        self._pos_tensor = torch.tensor(self._pos, dtype=torch.float32)
+
+        self._node_types = _classify_node_types(
+            mesh,
+            self.dirichlet_names,
+            self.neumann_names,
+            self.robin_names,
+            self._pnum_to_idx,
+        )
+
+        if connectivity_method.lower() == "fem":
+            self._edge_index = _build_fem_connectivity(
+                mesh, self._pnum_to_idx, add_self_loops=True
+            )
+        elif connectivity_method.lower() == "knn":
+            self._edge_index = _build_knn_connectivity(
+                self._pos_tensor, n_neighbors, add_self_loops=True
+            )
+        else:
+            raise ValueError(f"Unknown connectivity method: {connectivity_method}")
+
+        # Pre-compute static edge features (relative positions & distances – mesh-only)
+        src_pos = self._pos_tensor[self._edge_index[0]]
+        dst_pos = self._pos_tensor[self._edge_index[1]]
+        self._static_relative_pos = dst_pos - src_pos
+        self._static_euclidean_dist = torch.norm(self._static_relative_pos, dim=1, keepdim=True)
+
+        # Pre-compute static masks / aux entries
+        self._dirichlet_mask = self._node_types == 0
+        self._neumann_mask = self._node_types == 1
+        self._interior_mask = self._node_types == 2
+        self._robin_mask = self._node_types == 3
+        self._free_mask = self._node_types != 0
+
+        # Cache for subgraph mappings (populated on first call)
+        self._free_subgraph_cache = None   # (free_indices, old_to_new, edge_mask)
+        self._wp_subgraph_cache = {}       # wp_mask hashable key -> cache
+
     def create_graph(
         self,
         T_current: Optional[np.ndarray] = None,
@@ -605,36 +646,13 @@ class GraphCreator:
         if device is None:
             device = torch.device("cpu")
 
-        # 1. Build node positions and index mapping
-        pos, pnum_to_idx = _build_point_index_map(self.mesh)
-        n_nodes = len(pos)
+        # Use pre-computed static data (positions, node types, edge connectivity)
+        n_nodes = self._n_nodes
+        pos_tensor = self._pos_tensor.to(device)
+        node_types = self._node_types.to(device)
+        edge_index = self._edge_index.to(device)
 
-        # Convert to torch tensor on target device
-        pos_tensor = torch.tensor(pos, dtype=torch.float32, device=device)
-
-        # 2. Determine node types (Dirichlet/Neumann/Robin/Interior)
-        node_types = _classify_node_types(
-            self.mesh,
-            self.dirichlet_names or [],
-            self.neumann_names or [],
-            self.robin_names or [],
-            pnum_to_idx,
-        )
-        node_types = node_types.to(device)
-
-        # 3. Build connectivity based on method
-        if self.connectivity_method.lower() == "fem":
-            edge_index = _build_fem_connectivity(
-                self.mesh, pnum_to_idx, add_self_loops, device
-            )
-        elif self.connectivity_method.lower() == "knn":
-            edge_index = _build_knn_connectivity(
-                pos_tensor, self.n_neighbors, add_self_loops, device
-            )
-        else:
-            raise ValueError(f"Unknown connectivity method: {self.connectivity_method}")
-
-        # 4. Build node features
+        # Build node features (dynamic: T_current, t_scalar, material_field change)
         node_features = _build_node_features(
             node_types,
             T_current,
@@ -649,21 +667,28 @@ class GraphCreator:
             k_table_ref_values=k_table_ref_values,
         )
 
-        # 5. Build edge features
-        edge_features = _build_edge_features(edge_index, pos_tensor, T_current, device)
+        # Build edge features using cached static geometry + dynamic temp diff
+        static_rel = self._static_relative_pos.to(device)
+        static_dist = self._static_euclidean_dist.to(device)
+        if T_current is not None:
+            T_tensor = torch.tensor(T_current, dtype=torch.float32, device=device)
+            temp_diff = (T_tensor[edge_index[1]] - T_tensor[edge_index[0]]).unsqueeze(1)
+        else:
+            temp_diff = torch.zeros(edge_index.shape[1], 1, device=device)
+        edge_features = torch.cat([static_rel, static_dist, temp_diff], dim=1)
 
-        # 6. Build global features
+        # Build global features
         global_features = _build_global_features(t_scalar, n_nodes, device)
 
-        # 7. Create auxiliary data
+        # Create auxiliary data (use pre-computed masks)
         aux = {
-            "pnum_to_idx": pnum_to_idx,
+            "pnum_to_idx": self._pnum_to_idx,
             "node_types": node_types,
-            "dirichlet_mask": node_types == 0,
-            "neumann_mask": node_types == 1,
-            "interior_mask": node_types == 2,
-            "robin_mask": node_types == 3,
-            "free_mask": node_types != 0,  # Non-Dirichlet nodes
+            "dirichlet_mask": self._dirichlet_mask.to(device),
+            "neumann_mask": self._neumann_mask.to(device),
+            "interior_mask": self._interior_mask.to(device),
+            "robin_mask": self._robin_mask.to(device),
+            "free_mask": self._free_mask.to(device),
             "neumann_values": neumann_values,
             "dirichlet_values": dirichlet_values,
             "robin_values": robin_values,
@@ -675,7 +700,7 @@ class GraphCreator:
             aux["wp_mask"] = wp_node_mask
             aux["wp_node_indices"] = np.where(wp_node_mask)[0]
 
-        # 8. Create PyTorch Geometric Data object
+        # Create PyTorch Geometric Data object
         data = Data(
             x=node_features,
             edge_index=edge_index,
@@ -692,75 +717,75 @@ class GraphCreator:
     ) -> Tuple[Data, torch.Tensor, Dict]:
         """
         Create a subgraph containing only free (non-Dirichlet) nodes.
-
-        Args:
-            data: Full PyTorch Geometric Data object
-            aux: Auxiliary data dictionary from create_graph
-
-        Returns:
-            free_graph: Subgraph with only free nodes
-            node_mapping: Tensor mapping free node indices to original graph indices
-            new_aux: Updated auxiliary data for the subgraph
+        Caches structural mappings (indices, edge masks) for reuse.
         """
-        free_mask = aux["free_mask"]
-
-        # Ensure all tensors are on the same device as the data
         device = (
             data.x.device
             if hasattr(data.x, "device")
             else torch.device("gpu" if torch.cuda.is_available() else "cpu")
         )
-        free_mask = free_mask.to(device)
 
-        # Move all aux tensors to the same device
-        aux_tensors_to_move = [
-            "node_types",
-            "dirichlet_mask",
-            "neumann_mask",
-            "interior_mask",
-            "robin_mask",
-        ]
-        for key in aux_tensors_to_move:
-            if key in aux and hasattr(aux[key], "to"):
-                aux[key] = aux[key].to(device)
+        # Build/reuse cached structural mappings
+        if self._free_subgraph_cache is None:
+            free_mask = self._free_mask.to(device)
+            free_indices = torch.where(free_mask)[0]
+            n_free = len(free_indices)
+            if n_free == 0:
+                raise ValueError(
+                    "No free nodes found - all nodes are on Dirichlet boundary"
+                )
+            old_to_new = torch.full((self._n_nodes,), -1, dtype=torch.long, device=device)
+            old_to_new[free_indices] = torch.arange(n_free, device=device)
 
-        free_indices = torch.where(free_mask)[0]
-        n_free = len(free_indices)
+            edge_index = self._edge_index.to(device)
+            edge_mask = free_mask[edge_index[0]] & free_mask[edge_index[1]]
+            free_edge_index = old_to_new[edge_index[:, edge_mask]]
 
-        if n_free == 0:
-            raise ValueError(
-                "No free nodes found - all nodes are on Dirichlet boundary"
-            )
+            # Cache static subgraph aux fields
+            free_indices_cpu = free_indices.cpu().numpy()
+            static_free_aux = {
+                "pnum_to_idx": {
+                    k: v for k, v in self._pnum_to_idx.items()
+                    if v in set(free_indices_cpu)
+                },
+                "node_types": self._node_types[free_indices],
+                "dirichlet_mask": self._dirichlet_mask[free_indices],
+                "neumann_mask": self._neumann_mask[free_indices],
+                "interior_mask": self._interior_mask[free_indices],
+                "robin_mask": self._robin_mask[free_indices],
+                "free_mask": torch.ones(n_free, dtype=torch.bool),
+                "mesh": self.mesh,
+                "connectivity_method": self.connectivity_method,
+            }
 
-        # Create mapping from original indices to subgraph indices
-        old_to_new = torch.full((data.num_nodes,), -1, dtype=torch.long, device=device)
-        old_to_new[free_indices] = torch.arange(n_free, device=device)
+            self._free_subgraph_cache = {
+                "free_indices": free_indices,
+                "free_indices_cpu": free_indices_cpu,
+                "old_to_new": old_to_new,
+                "edge_mask": edge_mask,
+                "free_edge_index": free_edge_index,
+                "n_free": n_free,
+                "static_free_aux": static_free_aux,
+            }
 
-        # Extract free node features and positions
+        cache = self._free_subgraph_cache
+        free_indices = cache["free_indices"].to(device)
+        free_indices_cpu = cache["free_indices_cpu"]
+        n_free = cache["n_free"]
+        edge_mask = cache["edge_mask"].to(device)
+        free_edge_index = cache["free_edge_index"].to(device)
+
+        # Extract dynamic features using cached indices
         free_x = data.x[free_indices]
         free_pos = data.pos[free_indices]
-
-        # Ensure edge_index is on the same device
-        edge_index = data.edge_index.to(device)
-
-        # Filter edges to only include connections between free nodes
-        edge_mask = free_mask[edge_index[0]] & free_mask[edge_index[1]]
-        free_edges = edge_index[:, edge_mask]
         free_edge_attr = data.edge_attr[edge_mask]
-
-        # Remap edge indices to subgraph
-        free_edge_index = old_to_new[free_edges]
 
         # Handle Robin values for subgraph
         robin_values_sub = None
         if aux.get("robin_values") is not None:
             h_vals, amb_vals = aux["robin_values"]
-            robin_values_sub = (
-                h_vals[free_indices.cpu().numpy()],
-                amb_vals[free_indices.cpu().numpy()],
-            )
+            robin_values_sub = (h_vals[free_indices_cpu], amb_vals[free_indices_cpu])
 
-        # Create subgraph data
         free_data = Data(
             x=free_x,
             edge_index=free_edge_index,
@@ -770,46 +795,36 @@ class GraphCreator:
             num_nodes=n_free,
         )
 
+        # Build free_aux from cached static parts + dynamic values
+        saux = cache["static_free_aux"]
         free_aux = {
-            "pnum_to_idx": {
-                k: v
-                for k, v in aux["pnum_to_idx"].items()
-                if v in free_indices.tolist()
-            },
-            "node_types": aux["node_types"][free_indices],
-            "dirichlet_mask": aux["dirichlet_mask"][free_indices],
-            "neumann_mask": aux["neumann_mask"][free_indices],
-            "interior_mask": aux["interior_mask"][free_indices],
-            "robin_mask": (
-                aux["robin_mask"][free_indices] if "robin_mask" in aux else None
-            ),
-            "free_mask": torch.ones(
-                n_free, dtype=torch.bool, device=device
-            ),  # All nodes in subgraph are free
+            "pnum_to_idx": saux["pnum_to_idx"],
+            "node_types": saux["node_types"].to(device),
+            "dirichlet_mask": saux["dirichlet_mask"].to(device),
+            "neumann_mask": saux["neumann_mask"].to(device),
+            "interior_mask": saux["interior_mask"].to(device),
+            "robin_mask": saux["robin_mask"].to(device),
+            "free_mask": saux["free_mask"].to(device),
             "neumann_values": (
-                aux["neumann_values"][free_indices.cpu().numpy()]
-                if aux["neumann_values"] is not None
-                else None
+                aux["neumann_values"][free_indices_cpu]
+                if aux["neumann_values"] is not None else None
             ),
             "dirichlet_values": (
-                aux["dirichlet_values"][free_indices.cpu().numpy()]
-                if aux["dirichlet_values"] is not None
-                else None
+                aux["dirichlet_values"][free_indices_cpu]
+                if aux["dirichlet_values"] is not None else None
             ),
             "robin_values": robin_values_sub,
             "source_values": (
-                aux["source_values"][free_indices.cpu().numpy()]
-                if aux.get("source_values") is not None
-                else None
+                aux["source_values"][free_indices_cpu]
+                if aux.get("source_values") is not None else None
             ),
-            "mesh": aux["mesh"],
-            "connectivity_method": aux["connectivity_method"],
+            "mesh": saux["mesh"],
+            "connectivity_method": saux["connectivity_method"],
         }
 
-        # Node mapping for reconstruction
         node_mapping = {
             "free_to_original": free_indices,
-            "original_to_free": old_to_new,
+            "original_to_free": cache["old_to_new"].to(device),
             "n_original": data.num_nodes,
             "n_free": n_free,
         }
@@ -821,20 +836,7 @@ class GraphCreator:
     ) -> Tuple[Data, Dict, Dict]:
         """
         Create a subgraph containing only workpiece nodes.
-
-        This restricts the graph to nodes in the thermal domain (workpiece),
-        excluding air and coil nodes that don't participate in the heat equation.
-        Boundary nodes (Robin/Neumann on workpiece surfaces) are kept.
-
-        Args:
-            data: Full PyTorch Geometric Data object
-            aux: Auxiliary data dictionary from create_graph
-            wp_node_mask: Boolean array [N_nodes] — True for workpiece nodes
-
-        Returns:
-            wp_data: Subgraph with only workpiece nodes
-            node_mapping: Dict with mapping between workpiece and original indices
-            wp_aux: Updated auxiliary data for the subgraph
+        Caches structural mappings for reuse.
         """
         device = (
             data.x.device
@@ -842,40 +844,67 @@ class GraphCreator:
             else torch.device("cpu")
         )
 
-        wp_mask_tensor = torch.tensor(wp_node_mask, dtype=torch.bool, device=device)
-        wp_indices = torch.where(wp_mask_tensor)[0]
-        n_wp = len(wp_indices)
+        # Use a hashable cache key from the mask
+        cache_key = wp_node_mask.data.tobytes()
 
-        if n_wp == 0:
-            raise ValueError("No workpiece nodes found in wp_node_mask")
+        if cache_key not in self._wp_subgraph_cache:
+            wp_mask_tensor = torch.tensor(wp_node_mask, dtype=torch.bool, device=device)
+            wp_indices = torch.where(wp_mask_tensor)[0]
+            n_wp = len(wp_indices)
+            if n_wp == 0:
+                raise ValueError("No workpiece nodes found in wp_node_mask")
 
-        # Create mapping from original indices to workpiece subgraph indices
-        old_to_new = torch.full((data.num_nodes,), -1, dtype=torch.long, device=device)
-        old_to_new[wp_indices] = torch.arange(n_wp, device=device)
+            old_to_new = torch.full((self._n_nodes,), -1, dtype=torch.long, device=device)
+            old_to_new[wp_indices] = torch.arange(n_wp, device=device)
 
-        # Extract workpiece node features and positions
+            edge_index = self._edge_index.to(device)
+            edge_mask = wp_mask_tensor[edge_index[0]] & wp_mask_tensor[edge_index[1]]
+            wp_edge_index = old_to_new[edge_index[:, edge_mask]]
+            wp_cpu = wp_indices.cpu().numpy()
+
+            static_wp_aux = {
+                "pnum_to_idx": {
+                    k: v for k, v in self._pnum_to_idx.items()
+                    if v in set(wp_cpu)
+                },
+                "node_types": self._node_types[wp_indices],
+                "dirichlet_mask": self._dirichlet_mask[wp_indices],
+                "neumann_mask": self._neumann_mask[wp_indices],
+                "interior_mask": self._interior_mask[wp_indices],
+                "robin_mask": self._robin_mask[wp_indices],
+                "free_mask": torch.ones(n_wp, dtype=torch.bool),
+                "mesh": self.mesh,
+                "connectivity_method": self.connectivity_method,
+            }
+
+            self._wp_subgraph_cache[cache_key] = {
+                "wp_indices": wp_indices,
+                "wp_cpu": wp_cpu,
+                "old_to_new": old_to_new,
+                "edge_mask": edge_mask,
+                "wp_edge_index": wp_edge_index,
+                "n_wp": n_wp,
+                "static_wp_aux": static_wp_aux,
+            }
+
+        cache = self._wp_subgraph_cache[cache_key]
+        wp_indices = cache["wp_indices"].to(device)
+        wp_cpu = cache["wp_cpu"]
+        n_wp = cache["n_wp"]
+        edge_mask = cache["edge_mask"].to(device)
+        wp_edge_index = cache["wp_edge_index"].to(device)
+
+        # Extract dynamic features using cached indices
         wp_x = data.x[wp_indices]
         wp_pos = data.pos[wp_indices]
-
-        # Ensure edge_index is on the same device
-        edge_index = data.edge_index.to(device)
-
-        # Filter edges: only keep connections between workpiece nodes
-        edge_mask = wp_mask_tensor[edge_index[0]] & wp_mask_tensor[edge_index[1]]
-        wp_edges = edge_index[:, edge_mask]
         wp_edge_attr = data.edge_attr[edge_mask]
-
-        # Remap edge indices to subgraph
-        wp_edge_index = old_to_new[wp_edges]
 
         # Handle Robin values for subgraph
         robin_values_sub = None
         if aux.get("robin_values") is not None:
             h_vals, amb_vals = aux["robin_values"]
-            wp_cpu = wp_indices.cpu().numpy()
             robin_values_sub = (h_vals[wp_cpu], amb_vals[wp_cpu])
 
-        # Create subgraph data
         wp_data = Data(
             x=wp_x,
             edge_index=wp_edge_index,
@@ -885,47 +914,37 @@ class GraphCreator:
             num_nodes=n_wp,
         )
 
-        wp_cpu = wp_indices.cpu().numpy()
+        saux = cache["static_wp_aux"]
         wp_aux = {
-            "pnum_to_idx": {
-                k: v
-                for k, v in aux["pnum_to_idx"].items()
-                if v in wp_indices.tolist()
-            },
-            "node_types": aux["node_types"][wp_indices],
-            "dirichlet_mask": aux["dirichlet_mask"][wp_indices],
-            "neumann_mask": aux["neumann_mask"][wp_indices],
-            "interior_mask": aux["interior_mask"][wp_indices],
-            "robin_mask": (
-                aux["robin_mask"][wp_indices] if "robin_mask" in aux else None
-            ),
-            "free_mask": torch.ones(n_wp, dtype=torch.bool, device=device),
+            "pnum_to_idx": saux["pnum_to_idx"],
+            "node_types": saux["node_types"].to(device),
+            "dirichlet_mask": saux["dirichlet_mask"].to(device),
+            "neumann_mask": saux["neumann_mask"].to(device),
+            "interior_mask": saux["interior_mask"].to(device),
+            "robin_mask": saux["robin_mask"].to(device),
+            "free_mask": saux["free_mask"].to(device),
             "neumann_values": (
                 aux["neumann_values"][wp_cpu]
-                if aux["neumann_values"] is not None
-                else None
+                if aux["neumann_values"] is not None else None
             ),
             "dirichlet_values": (
                 aux["dirichlet_values"][wp_cpu]
-                if aux["dirichlet_values"] is not None
-                else None
+                if aux["dirichlet_values"] is not None else None
             ),
             "robin_values": robin_values_sub,
             "source_values": (
                 aux["source_values"][wp_cpu]
-                if aux.get("source_values") is not None
-                else None
+                if aux.get("source_values") is not None else None
             ),
-            "mesh": aux["mesh"],
-            "connectivity_method": aux["connectivity_method"],
+            "mesh": saux["mesh"],
+            "connectivity_method": saux["connectivity_method"],
         }
         if "wp_mask" in aux:
             wp_aux["wp_mask"] = aux["wp_mask"][wp_cpu]
 
-        # Node mapping for reconstruction
         node_mapping = {
             "wp_to_original": wp_indices,
-            "original_to_wp": old_to_new,
+            "original_to_wp": cache["old_to_new"].to(device),
             "n_original": data.num_nodes,
             "n_wp": n_wp,
         }

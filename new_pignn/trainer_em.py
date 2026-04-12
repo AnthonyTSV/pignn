@@ -1436,12 +1436,14 @@ def train_pimgn_eddy_current(resume_from: str = None):
 
 
 def train_pimgn_eddy_current_different_currents(resume_from: str = None):
-    freq_range = np.arange(2000, 7000, 500)
+    freq_range = np.arange(2000, 5000, 500)
+    current_range = np.arange(2000, 5000, 500)
+    all_ranges = np.array(np.meshgrid(current_range, freq_range)).T.reshape(-1, 2)
     problems = [
-        eddy_current_problem_different_currents(frequency=freq) for freq in freq_range
+        eddy_current_problem_different_currents(current=current, frequency=freq) for current, freq in all_ranges
     ]
     config = {
-        "epochs": 10000,
+        "epochs": 15000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/eddy_current_problem_circ_coil_currents",
@@ -1516,4 +1518,4 @@ if __name__ == "__main__":
     # train_pimgn_em_multi()
     # train_pimgn_magnetostatics()
     # train_pimgn_eddy_current(resume_from="results/physics_informed/eddy_current_problem_1_rect_coil/pimgn_trained_model.pth")
-    train_pimgn_eddy_current_different_currents(resume_from="results/physics_informed/eddy_current_problem_circ_coil_currents/pimgn_trained_model.pth")
+    train_pimgn_eddy_current_different_currents()

@@ -1486,7 +1486,7 @@ def previous_em():
     from graph_creator import GraphCreator
     from train_problems import create_em_problem, create_em_problem_complex
     from em_magnetostatic_problems import magnetostatic_problem_3
-    from em_eddy_problems import eddy_current_problem_temp_dependent_conductivity, eddy_current_problem_1
+    from em_eddy_problems import eddy_current_problem_temp_dependent_conductivity, eddy_current_problem_1, eddy_current_problem_different_currents
 
     problem = eddy_current_problem_temp_dependent_conductivity()
 
@@ -1516,6 +1516,32 @@ def previous_em():
         gfA,
         filename="results/fem_tests_em/vtk/temp_dependent_conductivity",
     )
+
+def check_max_A():
+    import ngsolve as ng
+    from containers import MeshProblemEM
+    from graph_creator import GraphCreator
+    from train_problems import create_em_problem, create_em_problem_complex
+    from em_magnetostatic_problems import magnetostatic_problem_3
+    from em_eddy_problems import eddy_current_problem_different_currents
+
+    curr_freq = [[2000, 2000], [2000, 4500], [4500, 2000], [4500, 4500], [6000, 6000]]
+    max_as = []
+    for curr, freq in curr_freq:
+        problem = eddy_current_problem_different_currents(current=curr, frequency=freq)
+
+        # Initialize FEM solver
+        fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
+
+        gfA = fem_solver.solve(problem)
+
+        max_A = np.max(np.abs(gfA) * problem.A_star)
+        max_as.append(max_A)
+
+    print("Max A values for different currents/frequencies:")
+    for (curr, freq), max_A in zip(curr_freq, max_as):
+        print(f"Current: {curr} A, Frequency: {freq} Hz -> Max |A|: {max_A}")
+    print(f"Median: {np.median(max_as)}")
 
 # def mixed_em():
 #     import ngsolve as ng
@@ -1550,5 +1576,6 @@ def previous_em():
 
 if __name__ == "__main__":
 
-    previous_em()
+    # previous_em()
     # mixed_em()
+    check_max_A()

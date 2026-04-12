@@ -343,7 +343,7 @@ class IHGeometryAndMesh:
         for s in clipped:
             geo.Add(s)
 
-        ngmesh = geo.GenerateMesh()
+        ngmesh = geo.GenerateMesh(maxh=self.h_air * S)
         mesh = Mesh(ngmesh)
 
         # Scale mesh coordinates back from mm to metres
