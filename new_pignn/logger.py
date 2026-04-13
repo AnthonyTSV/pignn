@@ -43,6 +43,30 @@ class TrainingLogger:
         self.save_interval = save_interval
         self.save_epoch_interval = save_epoch_interval
         self.last_save_time = time.time()
+
+        # Try loading existing log file (resume scenario)
+        filepath = self.save_dir / self.filename
+        if filepath.exists():
+            try:
+                with open(filepath, "r") as f:
+                    self.log_data = json.load(f)
+                self.log_data.setdefault("training_history", {})
+                self.log_data["training_history"].setdefault("train_loss", [])
+                self.log_data["training_history"].setdefault("val_loss", [])
+                self.log_data["training_history"].setdefault("epoch_times", [])
+                self.log_data["training_history"].setdefault("l2_error", [])
+                self.log_data.setdefault("evaluation", {})
+                self.log_data.setdefault("metadata", {})
+                self.log_data.setdefault("config", {})
+                self.log_data.setdefault("problems", [])
+            except (json.JSONDecodeError, Exception):
+                self._init_fresh_log_data()
+        else:
+            self._init_fresh_log_data()
+
+        self.start_time = time.time()
+
+    def _init_fresh_log_data(self):
         self.log_data = {
             "config": {},
             "training_history": {
@@ -58,7 +82,6 @@ class TrainingLogger:
             },
             "problems": [],
         }
-        self.start_time = time.time()
 
     def log_config(self, config: Dict[str, Any]):
         """Log configuration dictionary."""

@@ -1440,8 +1440,8 @@ def train_pimgn_eddy_current(resume_from: str = None):
 
 
 def train_pimgn_eddy_current_different_currents(resume_from: str = None):
-    freq_range = np.arange(2000, 5000, 500)
-    current_range = np.arange(2000, 5000, 500)
+    freq_range = np.arange(2000, 6000, 1000)
+    current_range = np.arange(2000, 6000, 1000)
     all_ranges = np.array(np.meshgrid(current_range, freq_range)).T.reshape(-1, 2)
     problems = [
         eddy_current_problem_different_currents(current=current, frequency=freq) for current, freq in all_ranges

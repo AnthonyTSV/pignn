@@ -355,19 +355,21 @@ def _build_node_features(
         )  # Default: homogeneous Dirichlet
     features.append(dirichlet_tensor)
 
-    # if sigma_field is not None:
-    #     sigma_tensor = torch.tensor(
-    #         sigma_field, dtype=torch.float32, device=device
-    #     ).unsqueeze(1)
-    #     features.append(sigma_tensor)
+    if sigma_field is not None:
+        sigma_tensor = torch.tensor(
+            sigma_field, dtype=torch.float32, device=device
+        ).unsqueeze(1)
+    else:
+        sigma_tensor = torch.zeros(n_nodes, 1, device=device)
+    features.append(sigma_tensor)
 
-    # if current_density_field is not None:
-    #     current_density_tensor = torch.tensor(
-    #         current_density_field, dtype=torch.float32, device=device
-    #     ).unsqueeze(1)
-    # else:
-    #     current_density_tensor = torch.zeros(n_nodes, 1, device=device)
-    # features.append(current_density_tensor)
+    if current_density_field is not None:
+        current_density_tensor = torch.tensor(
+            current_density_field, dtype=torch.float32, device=device
+        ).unsqueeze(1)
+    else:
+        current_density_tensor = torch.zeros(n_nodes, 1, device=device)
+    features.append(current_density_tensor)
 
     return torch.cat(features, dim=1)
 
@@ -409,6 +411,10 @@ def _build_global_features(
 ) -> torch.Tensor:
     """
     Build global feature vector.
+
+    Values are log-scaled so that the typical O(1e-4) kappa and O(1e-2)
+    current magnitudes are mapped to an O(1) range that the global
+    encoder MLP can easily discriminate.
     """
     if device is None:
         device = torch.device("cpu")
@@ -416,8 +422,13 @@ def _build_global_features(
         omega = 0.0
     if current is None:
         current = 0.0
+
+    import math
+    omega_scaled = math.log1p(omega * 1e4)    # log1p(~0.77..1.93) → O(1)
+    current_scaled = math.log1p(current * 1e2)  # log1p(~0.55..1.37) → O(1)
+
     global_features = torch.tensor(
-        [omega, current], dtype=torch.float32, device=device
+        [omega_scaled, current_scaled], dtype=torch.float32, device=device
     )
     return global_features.unsqueeze(0)
 
