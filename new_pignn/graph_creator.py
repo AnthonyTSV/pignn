@@ -353,13 +353,15 @@ def _build_node_features(
 
     Features (constant-k):
         [one_hot_node_type(4), T_current(1), t_scalar(1), material(1),
-         neumann_value(1), dirichlet_value(1), robin_h(1), robin_amb(1), source(1)]
-        → 12 features
+         neumann_value(1), dirichlet_value(1), robin_h(1), robin_amb(1),
+         source_normalized(1), log10(source_scale + 1)(1)]
+        → 13 features
 
     Features (temperature-dependent k):
         [one_hot_node_type(4), T_current(1), t_scalar(1), k_at_T(1), k_ref_1..k_ref_N(N_ref),
-         neumann_value(1), dirichlet_value(1), robin_h(1), robin_amb(1), source(1)]
-        → 12 + N_ref features
+         neumann_value(1), dirichlet_value(1), robin_h(1), robin_amb(1),
+         source_normalized(1), log10(source_scale + 1)(1)]
+        → 13 + N_ref features
 
     Parameters
     ----------
@@ -443,22 +445,36 @@ def _build_node_features(
     features.append(h_tensor)
     features.append(amb_tensor)
 
-    # Source term values (volumetric heat source)
+    # Source term values (volumetric heat source).
+    # Normalize the nodal source pattern so it no longer dwarfs the other
+    # input channels, and append a log-scale magnitude feature so the model
+    # still sees the absolute heating level for this problem.
     if source_values is not None:
         if isinstance(source_values, torch.Tensor):
-            source_tensor = (
+            source_tensor_raw = (
                 source_values.detach()
                 .clone()
                 .to(dtype=torch.float32, device=device)
-                .unsqueeze(1)
             )
         else:
-            source_tensor = torch.tensor(
+            source_tensor_raw = torch.tensor(
                 source_values, dtype=torch.float32, device=device
-            ).unsqueeze(1)
+            )
+        source_tensor_raw = source_tensor_raw.reshape(n_nodes)
+        source_scale = torch.max(torch.abs(source_tensor_raw))
+        source_scale_safe = torch.clamp(source_scale, min=1.0)
+        source_tensor = (source_tensor_raw / source_scale_safe).unsqueeze(1)
+        source_scale_feature = torch.full(
+            (n_nodes, 1),
+            torch.log10(source_scale + 1.0).item(),
+            dtype=torch.float32,
+            device=device,
+        )
     else:
         source_tensor = torch.zeros(n_nodes, 1, device=device)  # Default: no source
+        source_scale_feature = torch.zeros(n_nodes, 1, device=device)
     features.append(source_tensor)
+    features.append(source_scale_feature)
 
     return torch.cat(features, dim=1)
 

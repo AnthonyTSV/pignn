@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import tempfile
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,6 +23,54 @@ except ImportError:
     from graph_creator import GraphCreator
     from containers import TimeConfig, MeshConfig, MeshProblem
 from torch_geometric.data import Data, Batch
+
+
+def _load_checkpoint(path: str | Path, device: torch.device):
+    """Load trusted training checkpoint and raise actionable error if file is corrupt."""
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        try:
+            return torch.load(path, map_location=device)
+        except RuntimeError as exc:
+            if "failed finding central directory" in str(exc):
+                raise RuntimeError(
+                    f"Checkpoint at {path} is corrupted or incomplete. "
+                    "PyTorch could not read zip central directory. "
+                    "Replace file with valid checkpoint or retrain model to regenerate it."
+                ) from exc
+            raise
+    except RuntimeError as exc:
+        if "failed finding central directory" in str(exc):
+            raise RuntimeError(
+                f"Checkpoint at {path} is corrupted or incomplete. "
+                "PyTorch could not read zip central directory. "
+                "Replace file with valid checkpoint or retrain model to regenerate it."
+            ) from exc
+        raise
+
+
+def _atomic_torch_save(obj, path: str | Path) -> None:
+    """Write checkpoint atomically so interrupted saves do not leave partial zip files."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+
+        torch.save(obj, temp_path)
+        os.replace(temp_path, path)
+    except Exception:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+        raise
 
 
 class PIMGNTrainer:
@@ -147,16 +196,7 @@ class PIMGNTrainer:
         resume_from = config.get("resume_from", None)
         if resume_from and os.path.exists(resume_from):
             print(f"Resuming training from checkpoint: {resume_from}")
-            # PyTorch 2.6 changed the default `weights_only` of torch.load from False -> True.
-            # We store a full training checkpoint (optimizer/scheduler/etc.), so we must load
-            # with `weights_only=False`. Only do this for trusted checkpoint files.
-            try:
-                checkpoint = torch.load(
-                    resume_from, map_location=self.device, weights_only=False
-                )
-            except TypeError:
-                # Backward compatibility with older PyTorch versions.
-                checkpoint = torch.load(resume_from, map_location=self.device)
+            checkpoint = _load_checkpoint(resume_from, self.device)
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 # Full checkpoint with optimizer state
                 self.model.load_state_dict(checkpoint["model_state_dict"])
@@ -965,5 +1005,5 @@ class PIMGNTrainer:
             "val_losses": self.val_losses,
             "time_window": self.time_window,
         }
-        torch.save(checkpoint, path)
+        _atomic_torch_save(checkpoint, path)
         print(f"Checkpoint saved to: {path}")
