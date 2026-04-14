@@ -610,7 +610,7 @@ def get_source_function(mesh, heat_source, n_nodes):
                     source_function[node_idx] = q_val
     return source_function
 
-def create_ih_problem(frequency=2000, current=1000):
+def create_ih_problem(frequency=2000, current=1000, combined_bc=True):
     wp = BilletParams(diameter=0.030, height=0.070)
     ind = RectangularInductorParams(
         coil_inner_diameter=0.050,
@@ -627,20 +627,27 @@ def create_ih_problem(frequency=2000, current=1000):
         cp=461,
         k=86,
     )
-    boundary_conditions = {
-        "bc_workpiece_top": CombinedBC(value={
-            "convection": (10, 20),
-            "radiation": (0.8, 20),
-        }),
-        "bc_workpiece_right": CombinedBC(value={
-            "convection": (10, 20),
-            "radiation": (0.8, 20),
-        }),
-        "bc_workpiece_bottom": CombinedBC(value={
-            "convection": (10, 20),
-            "radiation": (0.8, 20),
-        }),
-    }
+    if combined_bc:
+        boundary_conditions = {
+            "bc_workpiece_top": CombinedBC(value={
+                "convection": (10, 20),
+                "radiation": (0.8, 20),
+            }),
+            "bc_workpiece_right": CombinedBC(value={
+                "convection": (10, 20),
+                "radiation": (0.8, 20),
+            }),
+            "bc_workpiece_bottom": CombinedBC(value={
+                "convection": (10, 20),
+                "radiation": (0.8, 20),
+            }),
+        }
+    else:
+        boundary_conditions = {
+            "bc_workpiece_top": ConvectionBC(value=(10, 20)),
+            "bc_workpiece_right": ConvectionBC(value=(10, 20)),
+            "bc_workpiece_bottom": ConvectionBC(value=(10, 20)),
+        }
 
     em_problem = eddy_current_problem_different_currents(mesh, frequency=frequency, current=current)
     fem_solver = FEMSolverEM(em_problem.mesh, order=1, problem=em_problem)

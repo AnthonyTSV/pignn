@@ -598,10 +598,14 @@ def train_ih_problem():
 
 def train_ih_generalization_problem():
     from thermal_problems import create_ih_problem
-    freq_range = np.arange(2000, 7000, 1000)
+    freq_range = np.arange(2000, 6000, 1000)
+    current_range = np.arange(2000, 5000, 1000)
+    all_ranges = np.array(np.meshgrid(current_range, freq_range)).T.reshape(-1, 2)
     problems = [
-        create_ih_problem(frequency=freq) for freq in freq_range
+        create_ih_problem(current=current, frequency=freq, combined_bc=False) for current, freq in all_ranges
     ]
+    # add one more problem with different geometry
+    problems.append(create_ih_problem(current=1500, frequency=1500, combined_bc=False))
     config = {
         "epochs": 500,
         "lr": 1e-3,
@@ -609,7 +613,7 @@ def train_ih_generalization_problem():
         "noise_sigma": 1e-1,
         "batch_size": 2,
         "generate_ground_truth_for_validation": True,
-        "save_dir": "results/physics_informed/thermal_ih_generalization",
+        "save_dir": "results/physics_informed/thermal_ih_generalization_convection_only",
         # "resume_from": "results/physics_informed/thermal_ih_generalization/pimgn_trained_model.pth",
     }
     _run_multiple_problem_experiment(problems, problems[0].time_config, config, "Induction heating generalization problem")
