@@ -33,7 +33,7 @@ class MeshGraphNetLayer(MessagePassing):
     Simplified version that works with standard graph structures from GraphCreator.
     """
 
-    def __init__(self, hidden_dim: int, aggr: str = "mean"):
+    def __init__(self, hidden_dim: int, aggr: str = "sum"):
         super(MeshGraphNetLayer, self).__init__()
         self.aggr = aggr  # sum, mean, max
 
@@ -74,6 +74,7 @@ class MeshGraphNetLayer(MessagePassing):
         x_e = x_e + delta_e  # residual
 
         # ---- Node aggregation (messages = updated edges) ----
+        # Keep local aggregation as a sum so message strength is not diluted.
         msgs = x_e  # [E, 128]
         aggr_msgs = scatter(
             msgs, receivers, dim=0, dim_size=x_v.size(0), reduce=self.aggr

@@ -30,6 +30,7 @@ try:
         eddy_current_problem_1,
         eddy_current_problem_2,
         eddy_current_problem_different_currents,
+        eddy_current_problem_different_meshes
     )
 except ImportError:
     from logger import TrainingLogger
@@ -52,6 +53,7 @@ except ImportError:
         eddy_current_problem_1,
         eddy_current_problem_2,
         eddy_current_problem_different_currents,
+        eddy_current_problem_different_meshes
     )
 from torch_geometric.data import Data, Batch
 
@@ -178,12 +180,14 @@ class PIMGNTrainerEM:
         ).to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
-        # training to 10000 epochs, reduce lr from 1e-3 to 1e-5
-        min_lr = 1e-5
-        initial_lr = config["lr"]
+        # Use a slow exponential decay so training does not hit the LR floor
+        # within the first few hundred epochs on harder multi-mesh runs.
+        initial_lr = float(config["lr"])
+        min_lr = float(config.get("min_lr", 1e-5))
+        lr_decay = float(config.get("lr_decay", 0.9995))
         self.scheduler = optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda epoch: max(min_lr / initial_lr, 0.99 ** epoch)
+            lr_lambda=lambda epoch: max(min_lr / initial_lr, lr_decay ** epoch)
         )
 
         # Training history
@@ -851,8 +855,8 @@ class PIMGNTrainerEM:
             epoch_loss_data = 0.0
             n_batches = 0
 
-            # Split training problems into mini-batches
-            shuffled_indices = list(train_problems_indices)
+            # Shuffle problems each epoch so the same mini-batches do not repeat forever.
+            shuffled_indices = np.random.permutation(train_problems_indices).tolist()
             for batch_start in range(0, len(shuffled_indices), batch_size):
                 batch_indices = shuffled_indices[batch_start : batch_start + batch_size]
 
@@ -1466,6 +1470,30 @@ def train_pimgn_eddy_current_different_currents(resume_from: str = None):
         train_indices=list(range(len(problems))),
     )
 
+def train_on_different_meshes(resume_from: str = None):
+    problems = [
+        eddy_current_problem_different_meshes(setting="coarse"),
+        eddy_current_problem_different_meshes(setting="default"),
+        eddy_current_problem_different_meshes(setting="fine"),
+        eddy_current_problem_different_meshes(setting="very_fine"),
+    ]
+    config = {
+        "epochs": 20000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/em_different_meshes",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "batch_size": 2,  # Number of problems per mini-batch
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_experiment(
+        problems,
+        config,
+        "EM Problem with Different Meshes",
+        train_indices=list(range(len(problems))),
+    )
+
 
 # def train_pimgn_em_mixed(resume_from: str = None):
 #     problem = create_em_mixed()
@@ -1524,4 +1552,5 @@ if __name__ == "__main__":
     # train_pimgn_em_multi()
     # train_pimgn_magnetostatics()
     # train_pimgn_eddy_current(resume_from="results/physics_informed/eddy_current_problem_1_rect_coil/pimgn_trained_model.pth")
-    train_pimgn_eddy_current_different_currents()
+    # train_pimgn_eddy_current_different_currents()
+    train_on_different_meshes(resume_from="results/physics_informed/em_different_meshes/pimgn_trained_model.pth")
