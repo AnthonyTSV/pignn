@@ -101,6 +101,7 @@ class GenericEddyCurrentProblem:
             mesh=self.mesh,
             n_neighbors=2,
             dirichlet_names=self.dirichlet_boundaries,
+            r_star=self.r_star,
         )
         # First create a temporary graph to get positions and aux data
         temp_data, temp_aux = graph_creator.create_graph()
@@ -125,6 +126,10 @@ class GenericEddyCurrentProblem:
         problem.set_dirichlet_values(self.dirichlet_boundaries_dict)
         problem.complex = True
         problem.mixed = False
+        problem.r_star = self.r_star
+        problem.A_star = self.A_star
+        problem.mu_star = self.mu_star
+        problem.J_star = problem.A_star / (problem.r_star**2 * problem.mu_star)
         problem.frequency = frequency
         problem.I_coil = current
         problem.refresh_derived_quantities()
@@ -143,7 +148,7 @@ class GenericEddyCurrentProblem:
         # Calculate current density in the coil: J = N * I / A_coil
         Acoil = problem.profile_width_phys * problem.profile_height_phys
         Js_phi = problem.N_turns * problem.I_coil / Acoil
-        Js_phi = Js_phi / self.J_star  # Normalize current density
+        Js_phi = Js_phi / problem.J_star  # Keep graph features consistent with FEM RHS
 
         # Material property mapping (mu_r values)
         n_nodes = temp_data.pos.shape[0]
@@ -244,13 +249,13 @@ def eddy_current_problem_2():
     return problem
 
 
-def eddy_current_problem_different_currents(mesh = None, current=1000, frequency=8000):
+def eddy_current_problem_different_currents(mesh = None, current=1000, frequency=8000, winding_count=1):
     if mesh is None:
         wp = BilletParams(diameter=0.030, height=0.070)
         ind = RectangularInductorParams(
             coil_inner_diameter=0.050,
             coil_height=0.040,
-            winding_count=1,
+            winding_count=winding_count,
             profile_width=0.007,
             profile_height=0.007,
         )
@@ -269,58 +274,53 @@ def eddy_current_problem_different_currents(mesh = None, current=1000, frequency
 
     return problem
 
-def temperature_field(Xn, Yn, T0=600.0, A=600.0, sigma_y=0.18, delta_x=0.08, lambda_x=0.55):
+def eddy_current_problem_different_meshes(setting="default"):
 
-    xn = np.clip(Xn / 0.03, 0.0, 1.0)
-    yn = np.clip(Yn / 0.07, 0.0, 1.0)
+    h_workpiece = 1e-3
+    h_air = 60e-3
+    h_coil = 2e-3
+    # baseline_h_max = {
+    #     "h_workpiece": 1e-3,
+    #     "h_air": 60e-3,
+    #     "h_coil": 1e-3,
+    # }
 
-    return T0 + A * np.exp(-((yn - 0.5) ** 2) / (2 * sigma_y**2)) * (
-        1.0 - np.exp(-(1.0 - xn) / delta_x)
-    ) * np.exp(-(1.0 - xn) / lambda_x)
+    match setting:
+        case "coarse":
+            h_workpiece *= 2
+            h_coil *= 2
+        case "fine":
+            h_workpiece /= 2
+            h_coil /= 2
+        case "very_fine":
+            h_workpiece /= 4
+            h_coil /= 4
+        case _:
+            pass  # Use default values
 
-def approx_temperature(
-    x,
-    y,
-    width=0.03,
-    height=0.07,
-    T0=60.0,
-    A=600.0,
-    sigma_y=0.18,
-    delta_x=0.08,
-    lambda_x=0.55,
-    cmap="coolwarm",
-    plot=False,
-):
 
-    import matplotlib.pyplot as plt
+    wp = BilletParams(diameter=0.030, height=0.070)
+    ind = RectangularInductorParams(
+        coil_inner_diameter=0.050,
+        coil_height=0.040,
+        winding_count=1,
+        profile_width=0.007,
+        profile_height=0.007,
+    )
+    kw = dict(h_workpiece=h_workpiece, h_air=h_air, h_coil=h_coil)
+    builder = IHGeometryAndMesh(wp, ind, **kw)
+    mesh = builder.generate()
 
-    x = np.asarray(x)
-    y = np.asarray(y)
+    dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
+    dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
 
-    X, Y = x, y
+    problem_generator = GenericEddyCurrentProblem(
+        mesh, dirichlet_boundaries, dirichlet_boundaries_dict, A_star=0.0022536
+    )
 
-    Xn = np.clip(X / width, 0.0, 1.0)
-    Yn = np.clip(Y / height, 0.0, 1.0)
+    problem = problem_generator.get_problem(current=3000, frequency=3000)
 
-    # Approximate analytical temperature field
-    T = temperature_field(X, Y)
-
-    if plot:
-        Xplot, Yplot = np.meshgrid(np.sort(Xn), np.sort(Yn))
-        Tplot = temperature_field(Xplot, Yplot)
-
-        fig, ax = plt.subplots(figsize=(6, 5))
-        contour = ax.contourf(Xplot, Yplot, Tplot, levels=50, cmap=cmap)
-        plt.colorbar(contour, ax=ax, label="Temperature (°C)")
-        ax.set_xlabel("x (m)")
-        ax.set_ylabel("y (m)")
-        ax.set_title("Approximate Temperature Field")
-
-        plt.tight_layout()
-        plt.show()
-
-    return T
-
+    return problem
 
 def eddy_current_problem_temp_dependent_conductivity():
     """

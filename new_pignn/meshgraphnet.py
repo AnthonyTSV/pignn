@@ -33,7 +33,7 @@ class MeshGraphNetLayer(MessagePassing):
     Simplified version that works with standard graph structures from GraphCreator.
     """
 
-    def __init__(self, hidden_dim: int, aggr: str = "sum"):
+    def __init__(self, hidden_dim: int, aggr: str = "mean"):
         super(MeshGraphNetLayer, self).__init__()
         self.aggr = aggr  # sum, mean, max
 
@@ -43,7 +43,7 @@ class MeshGraphNetLayer(MessagePassing):
         # Node MLP: [x_node, aggr_msgs, g] -> delta_node (128)
         self.node_mlp = mlp_2layer(in_dim=hidden_dim * 3, out_dim=hidden_dim)
 
-        # Global MLP: [sum_nodes, sum_edges, g] -> delta_global (128)
+        # Global MLP: [mean_nodes, mean_edges, g] -> delta_global (128)
         self.global_mlp = mlp_2layer(in_dim=hidden_dim * 3, out_dim=hidden_dim)
 
     def forward(
@@ -84,12 +84,13 @@ class MeshGraphNetLayer(MessagePassing):
         delta_v = self.node_mlp(node_input)  # [N, 128]
         x_v = x_v + delta_v  # residual
 
-        # ---- Global update (sum over nodes/edges per graph) ----
+        # ---- Global update ----
+        # Use means instead of sums so latent scale does not drift with mesh size.
         B = g.size(0)
-        sum_nodes = scatter(x_v, node_batch, dim=0, dim_size=B, reduce="sum")  # [B,128]
-        sum_edges = scatter(x_e, edge_batch, dim=0, dim_size=B, reduce="sum")  # [B,128]
+        mean_nodes = scatter(x_v, node_batch, dim=0, dim_size=B, reduce="mean")  # [B,128]
+        mean_edges = scatter(x_e, edge_batch, dim=0, dim_size=B, reduce="mean")  # [B,128]
 
-        g_input = torch.cat([sum_nodes, sum_edges, g], dim=-1)  # [B, 384]
+        g_input = torch.cat([mean_nodes, mean_edges, g], dim=-1)  # [B, 384]
         delta_g = self.global_mlp(g_input)  # [B, 128]
         g = g + delta_g  # residual
 
