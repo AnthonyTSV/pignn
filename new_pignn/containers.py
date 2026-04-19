@@ -326,6 +326,8 @@ class MeshProblemEM:
         self.profile_width = 7 * 1e-3  # m
         self.profile_height = 7 * 1e-3  # m
 
+        self.area_coil = self.profile_width_phys * self.profile_height_phys
+
         # In the nondimensionalized system, mu0 = 1 (dimensionless)
         # because we scaled by mu_star = mu0
         self.mu0 = 1.0  # Normalized permeability of free space
@@ -362,6 +364,16 @@ class MeshProblemEM:
     def set_dirichlet_values_array(self, dirichlet_values_array: np.ndarray):
         """Set Dirichlet values array for all nodes."""
         self.dirichlet_values_array = dirichlet_values_array
+    
+    def calculate_skin_depth(self) -> Optional[float]:
+        """Calculate skin depth in the workpiece based on current parameters."""
+        if self.sigma_workpiece == 0.0 or self.frequency == 0.0:
+            return None  # Infinite skin depth for non-conductive or DC case
+        mu = self.mu_r_workpiece * self.mu0
+        sigma = self.sigma_workpiece
+        omega = self.omega
+        delta = np.sqrt(2 / (omega * mu * sigma))
+        return delta
 
 
 @dataclass

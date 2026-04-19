@@ -947,7 +947,7 @@ class FEMSolver:
         self.mesh.ngmesh.Save(str(mesh_filename))
 
         # save exact, predicted, difference as npz
-        npz_filename = file_path / "results.npz"
+        npz_filename = file_path / "results_thermal.npz"
         np.savez_compressed(
             npz_filename,
             exact=array_true,

@@ -1,4 +1,5 @@
 import numpy as np
+
 try:
     from .containers import MeshConfig, MeshProblem, MeshProblemEM
 except ImportError:
@@ -151,7 +152,7 @@ class FEMSolverEM:
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r_hat * dzA * dzv + r1_nd * dr_rA * dr_rv) * ng.dx
         # a += 1j * sigma * (r_hat * jac) * A * v * ng.dx
-        Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
+        Acoil = self.problem.area_coil
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
         Js_phi = Js_phi / self.problem.J_star  # Normalize current density
         print("Normalized current density Js_phi:", Js_phi)
@@ -235,7 +236,7 @@ class FEMSolverEM:
         a = ng.BilinearForm(fes, symmetric=False)
         a += nu * (r_hat * dzA * dzv + r1_nd * dr_rA * dr_rv) * ng.dx
         a += 1j * sigma * (r_hat * jac) * A * v * ng.dx
-        Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
+        Acoil = self.problem.area_coil
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
         Js_phi = Js_phi / self.problem.J_star  # Normalize current density
         print("Normalized current density Js_phi:", Js_phi)
@@ -249,9 +250,9 @@ class FEMSolverEM:
 
         self.bilinear_form = (k_real, k_imag)
         f_np = f.vec.FV().NumPy().copy()
-        self.linear_form = torch.tensor(
-            np.real(f_np), dtype=torch.float64
-        ).to(self.device)
+        self.linear_form = torch.tensor(np.real(f_np), dtype=torch.float64).to(
+            self.device
+        )
         self.fes = fes
 
         # Assemble axisymmetric L2 mass matrix M: m_ij = \int \hat{r} \phi_i \phi_j d \Omega
@@ -293,6 +294,7 @@ class FEMSolverEM:
         Initialize matrices for A-φ mixed formulation.
         NOTE: NOT SCALED CORRECTLY
         """
+        raise NotImplementedError("Mixed formulation not fully working yet")
         # FE spaces
         fes_a = ng.H1(
             self.mesh,
@@ -349,7 +351,7 @@ class FEMSolverEM:
         a += 1j * sigma * r * A_eff * v_eff * ng.dx
 
         I_spec = self.problem.N_turns * self.problem.I_coil
-        area_coil = self.problem.profile_width_phys * self.problem.profile_height_phys
+        area_coil = self.problem.area_coil
         Js_phi = I_spec / area_coil
         Js_phi = Js_phi / self.problem.J_star  # Normalize current density
         print("Normalized current density Js_phi:", Js_phi)
@@ -388,15 +390,15 @@ class FEMSolverEM:
         which vertices are in the coil region and their corresponding DOF indices.
         """
         import ngsolve as ng
-        
+
         # Get the number of mesh vertices (graph nodes)
         n_vertices = len(list(self.mesh.ngmesh.Points()))
-        
+
         # Build mapping using NGSolve's DOF structure
         # For each vertex, check if it has a DOF in fes_phi
         node_to_phi_dof = np.full(n_vertices, -1, dtype=np.int64)
         coil_node_indices = []
-        
+
         for v_idx in range(n_vertices):
             # Get DOF numbers for this vertex in the phi space
             # NodeId(VERTEX, v_idx) gives the vertex node
@@ -409,19 +411,23 @@ class FEMSolverEM:
             except:
                 # Vertex not in phi domain
                 pass
-        
+
         # Sort by DOF index to get correct ordering
         coil_node_indices.sort(key=lambda x: x[0])
-        
+
         # coil_node_indices[i] = node_idx for phi DOF i
-        self.coil_node_indices = np.array([node_idx for _, node_idx in coil_node_indices], dtype=np.int64)
+        self.coil_node_indices = np.array(
+            [node_idx for _, node_idx in coil_node_indices], dtype=np.int64
+        )
         self.node_to_phi_dof = node_to_phi_dof
         self.coil_vertex_mask = node_to_phi_dof >= 0
         self.n_coil_nodes = len(self.coil_node_indices)
-        
+
         # Verify the mapping matches fes_phi.ndof
         if self.n_coil_nodes != self.n_dofs_phi:
-            print(f"Warning: n_coil_nodes ({self.n_coil_nodes}) != n_dofs_phi ({self.n_dofs_phi})")
+            print(
+                f"Warning: n_coil_nodes ({self.n_coil_nodes}) != n_dofs_phi ({self.n_dofs_phi})"
+            )
             print(f"This may cause dimension mismatches in loss computation.")
 
     def _ngsolve_to_torch(self, ngsolve_matrix):
@@ -488,8 +494,9 @@ class FEMSolverEM:
         a += nu * (r_hat * dzA * dzv + r1_nd * dr_rA * dr_rv) * ng.dx
         # Eddy current term: applied to all conductive regions (including workpiece)
         a += 1j * sigma * (r_hat * jac) * A * v * ng.dx
-        Acoil = self.problem.profile_width_phys * self.problem.profile_height_phys
+        Acoil = self.problem.area_coil
         Js_phi = self.problem.N_turns * self.problem.I_coil / Acoil
+        print(f"Unnormalized current density Js_phi: {Js_phi:.2e}")
         Js_phi = Js_phi / self.problem.J_star  # Normalize current density
         print("Normalized current density Js_phi:", Js_phi)
         f = ng.LinearForm(fes)
@@ -574,7 +581,7 @@ class FEMSolverEM:
         a += 1j * sigma * r * A_eff * v_eff * ng.dx
 
         I_spec = problem.N_turns * problem.I_coil
-        area_coil = problem.profile_width_phys * problem.profile_height_phys
+        area_coil = problem.area_coil
         Js_phi = I_spec / area_coil
         Js_phi = Js_phi / self.problem.J_star  # Normalize current density
 
@@ -768,10 +775,9 @@ class FEMSolverEM:
                     "Call init_complex_matrices() first."
                 )
             m_inv_free = 1.0 / self.lumped_mass_diag[free_mask].clamp_min(eps)
-            loss = (
-                (r_real_free.square() * m_inv_free).sum()
-                + (r_imag_free.square() * m_inv_free).sum()
-            )
+            loss = (r_real_free.square() * m_inv_free).sum() + (
+                r_imag_free.square() * m_inv_free
+            ).sum()
         else:
             loss = r_real_free.square().mean() + r_imag_free.square().mean()
 
@@ -992,7 +998,9 @@ class FEMSolverEM:
         # Get free DOFs mask for the product space
         free_mask = self._free_dofs_mask()
 
-        Kr, Ki = self.bilinear_form  # (real stiffness, imag/mass-like) as sparse tensors
+        Kr, Ki = (
+            self.bilinear_form
+        )  # (real stiffness, imag/mass-like) as sparse tensors
 
         # Residual blocks (full): r = K*u - f
         # For complex: (Kr + i*Ki)(ar + i*ai) = Kr*ar - Ki*ai + i*(Kr*ai + Ki*ar)
@@ -1025,7 +1033,7 @@ class FEMSolverEM:
         # phi-DOFs. Using only diag(Kr) would make the Jacobi inverse blow up.
         diag_kr = _sparse_diag(Kr).to(dtype=torch.float64, device=rr.device)
         diag_ki = _sparse_diag(Ki).to(dtype=torch.float64, device=rr.device)
-        diag_abs = torch.sqrt(diag_kr ** 2 + diag_ki ** 2)
+        diag_abs = torch.sqrt(diag_kr**2 + diag_ki**2)
         diag_free = diag_abs[free_mask].clamp_min(eps)
 
         def Minv(v_free: torch.Tensor) -> torch.Tensor:
@@ -1084,12 +1092,12 @@ class FEMSolverEM:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute SEPARATE residual losses for A and phi components.
-        
+
         This helps with the scale imbalance between A and phi by:
         1. Computing residuals for A and phi DOFs separately
         2. Normalizing each by their own DOF count
         3. Returning both so they can be weighted in the trainer
-        
+
         Args:
             pred_sol_a_real: Real part of A prediction [n_dofs_A]
             pred_sol_a_imag: Imaginary part of A prediction [n_dofs_A]
@@ -1097,7 +1105,7 @@ class FEMSolverEM:
             pred_sol_phi_imag: Imaginary part of phi prediction [n_dofs_phi]
             phi_weight: Weight for phi loss relative to A loss
             eps: Small value to avoid division by zero
-            
+
         Returns:
             (loss_A, loss_phi, total_loss): Losses for A, phi, and weighted total
         """
@@ -1137,7 +1145,7 @@ class FEMSolverEM:
         # Build diagonal preconditioner
         diag_kr = _sparse_diag(Kr).to(dtype=torch.float64, device=self.device)
         diag_ki = _sparse_diag(Ki).to(dtype=torch.float64, device=self.device)
-        diag_abs = torch.sqrt(diag_kr ** 2 + diag_ki ** 2).clamp_min(eps)
+        diag_abs = torch.sqrt(diag_kr**2 + diag_ki**2).clamp_min(eps)
 
         # Separate masks for A and phi free DOFs
         free_mask_A = free_mask[:n_A]
@@ -1147,12 +1155,14 @@ class FEMSolverEM:
         rr_A = r_real[:n_A][free_mask_A]
         ri_A = r_imag[:n_A][free_mask_A]
         diag_A = diag_abs[:n_A][free_mask_A]
-        
+
         n_free_A = rr_A.numel()
         if n_free_A > 0:
             wr_A = rr_A / diag_A
             wi_A = ri_A / diag_A
-            loss_A = 0.5 * (torch.dot(rr_A, wr_A) + torch.dot(ri_A, wi_A)) / float(n_free_A)
+            loss_A = (
+                0.5 * (torch.dot(rr_A, wr_A) + torch.dot(ri_A, wi_A)) / float(n_free_A)
+            )
         else:
             loss_A = torch.zeros((), dtype=torch.float64, device=self.device)
 
@@ -1160,12 +1170,16 @@ class FEMSolverEM:
         rr_phi = r_real[n_A:][free_mask_phi]
         ri_phi = r_imag[n_A:][free_mask_phi]
         diag_phi = diag_abs[n_A:][free_mask_phi]
-        
+
         n_free_phi = rr_phi.numel()
         if n_free_phi > 0:
             wr_phi = rr_phi / diag_phi
             wi_phi = ri_phi / diag_phi
-            loss_phi = 0.5 * (torch.dot(rr_phi, wr_phi) + torch.dot(ri_phi, wi_phi)) / float(n_free_phi)
+            loss_phi = (
+                0.5
+                * (torch.dot(rr_phi, wr_phi) + torch.dot(ri_phi, wi_phi))
+                / float(n_free_phi)
+            )
         else:
             loss_phi = torch.zeros((), dtype=torch.float64, device=self.device)
 
@@ -1364,7 +1378,7 @@ class FEMSolverEM:
         self.mesh.ngmesh.Save(str(mesh_filename))
 
         # save exact, predicted, difference as npz
-        npz_filename = file_path / f"results{suffix}.npz"
+        npz_filename = file_path / f"results_em{suffix}.npz"
         np.savez_compressed(
             npz_filename,
             exact=array_true,
@@ -1388,35 +1402,39 @@ class FEMSolverEM:
         # Split into A and phi components
         A_true = array_true[:n_A]
         A_pred = array_pred[:n_A]
-        phi_true = array_true[n_A:n_A + n_phi]
-        phi_pred = array_pred[n_A:n_A + n_phi]
+        phi_true = array_true[n_A : n_A + n_phi]
+        phi_pred = array_pred[n_A : n_A + n_phi]
 
         # Create GridFunctions for A (full mesh)
         fes_A = ng.H1(self.mesh, order=self.order, complex=True)
         fes_A_real = ng.H1(self.mesh, order=self.order, complex=False)
-        
+
         gfA_true = ng.GridFunction(fes_A)
         gfA_pred = ng.GridFunction(fes_A)
         gfA_err_abs = ng.GridFunction(fes_A_real)
-        
+
         gfA_true.vec.FV().NumPy()[:] = A_true
         gfA_pred.vec.FV().NumPy()[:] = A_pred
         gfA_err_abs.vec.FV().NumPy()[:] = np.abs(A_true - A_pred)
 
         # Create GridFunctions for phi (coil region only)
         fes_phi = ng.H1(
-            self.mesh, order=self.order, complex=True,
-            definedon=self.mesh.Materials("mat_coil")
+            self.mesh,
+            order=self.order,
+            complex=True,
+            definedon=self.mesh.Materials("mat_coil"),
         )
         fes_phi_real = ng.H1(
-            self.mesh, order=self.order, complex=False,
-            definedon=self.mesh.Materials("mat_coil")
+            self.mesh,
+            order=self.order,
+            complex=False,
+            definedon=self.mesh.Materials("mat_coil"),
         )
-        
+
         gfPhi_true = ng.GridFunction(fes_phi)
         gfPhi_pred = ng.GridFunction(fes_phi)
         gfPhi_err_abs = ng.GridFunction(fes_phi_real)
-        
+
         gfPhi_true.vec.FV().NumPy()[:] = phi_true
         gfPhi_pred.vec.FV().NumPy()[:] = phi_pred
         gfPhi_err_abs.vec.FV().NumPy()[:] = np.abs(phi_true - phi_pred)
@@ -1480,20 +1498,29 @@ class FEMSolverEM:
         )
         print(f"Mixed results saved as {npz_filename}")
 
+
 def previous_em():
     import ngsolve as ng
     from containers import MeshProblemEM
     from graph_creator import GraphCreator
     from train_problems import create_em_problem, create_em_problem_complex
     from em_magnetostatic_problems import magnetostatic_problem_3
-    from em_eddy_problems import eddy_current_problem_temp_dependent_conductivity, eddy_current_problem_1, eddy_current_problem_different_currents
+    from em_eddy_problems import (
+        eddy_current_problem_temp_dependent_conductivity,
+        eddy_current_problem_1,
+        eddy_current_problem_different_currents,
+        eddy_current_problem_different_meshes,
+        team_36_problem
+    )
 
-    problem = eddy_current_problem_temp_dependent_conductivity()
+    # problem = eddy_current_problem_different_meshes(setting="very_fine")
+    problem = team_36_problem()
 
     # Initialize FEM solver
     fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
 
     gfA = fem_solver.solve(problem)
+    gfA = gfA * problem.A_star  # scale by A_star for better visualization and error metrics
 
     if np.iscomplexobj(gfA):
         gfA_real = np.real(gfA)
@@ -1514,8 +1541,9 @@ def previous_em():
     fem_solver.export_to_vtk_complex(
         gfA,
         gfA,
-        filename="results/fem_tests_em/vtk/temp_dependent_conductivity",
+        filename="results/fem_tests_em/vtk/team_36_problem",
     )
+
 
 def check_max_A():
     import ngsolve as ng
@@ -1542,6 +1570,7 @@ def check_max_A():
     for (curr, freq), max_A in zip(curr_freq, max_as):
         print(f"Current: {curr} A, Frequency: {freq} Hz -> Max |A|: {max_A}")
     print(f"Median: {np.median(max_as)}")
+
 
 # def mixed_em():
 #     import ngsolve as ng
@@ -1576,6 +1605,6 @@ def check_max_A():
 
 if __name__ == "__main__":
 
-    # previous_em()
+    previous_em()
     # mixed_em()
-    check_max_A()
+    # check_max_A()

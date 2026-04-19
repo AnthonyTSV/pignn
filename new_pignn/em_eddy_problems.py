@@ -71,13 +71,14 @@ except ImportError:
 
 class GenericEddyCurrentProblem:
     def __init__(
-        self, 
-        mesh, 
-        dirichlet_boundaries, 
+        self,
+        mesh,
+        dirichlet_boundaries,
         dirichlet_boundaries_dict,
         material_properties: Optional[dict[str, MaterialPropertiesEM]] = None,
         sigma_nodal=None,
         A_star=4.8 * 1e-4,  # Wb
+        coil_area: Optional[float] = None,
     ):
         self.r_star = 70 * 1e-3  # m
         self.A_star = A_star  # Wb
@@ -88,8 +89,9 @@ class GenericEddyCurrentProblem:
         self.dirichlet_boundaries_dict = dirichlet_boundaries_dict
         self.material_properties = material_properties
         self.sigma_nodal = sigma_nodal  # Optional per-node sigma [S/m] (physical units)
+        self.coil_area = coil_area
 
-    def get_problem(self, current=1000, frequency=8000):
+    def get_problem(self, current=1000, frequency=8000) -> MeshProblemEM:
         mesh_config = MeshConfig(
             maxh=1,
             order=1,
@@ -132,11 +134,19 @@ class GenericEddyCurrentProblem:
         problem.J_star = problem.A_star / (problem.r_star**2 * problem.mu_star)
         problem.frequency = frequency
         problem.I_coil = current
+        if self.coil_area:
+            problem.area_coil = self.coil_area
+        else:
+            problem.area_coil = problem.profile_width_phys * problem.profile_height_phys
         problem.refresh_derived_quantities()
         if self.material_properties is not None:
-            problem.sigma_workpiece = self.material_properties["mat_workpiece"].sigma / problem.sigma_star
+            problem.sigma_workpiece = (
+                self.material_properties["mat_workpiece"].sigma / problem.sigma_star
+            )
         else:
-            problem.sigma_workpiece = 6289308 / problem.sigma_star  # Default value (nondimensionalized)
+            problem.sigma_workpiece = (
+                6289308 / problem.sigma_star
+            )  # Default value (nondimensionalized)
         problem.sigma_air = 0
         problem.sigma_coil = 0
 
@@ -146,8 +156,7 @@ class GenericEddyCurrentProblem:
         current_density = np.zeros(n_nodes, dtype=np.float64)
 
         # Calculate current density in the coil: J = N * I / A_coil
-        Acoil = problem.profile_width_phys * problem.profile_height_phys
-        Js_phi = problem.N_turns * problem.I_coil / Acoil
+        Js_phi = problem.N_turns * problem.I_coil / problem.area_coil
         Js_phi = Js_phi / problem.J_star  # Keep graph features consistent with FEM RHS
 
         # Material property mapping (mu_r values)
@@ -195,7 +204,6 @@ class GenericEddyCurrentProblem:
         problem.current_density_field = current_density
 
         return problem
-
 
 def eddy_current_problem_1(mesh=None):
     if mesh is None:
@@ -249,7 +257,9 @@ def eddy_current_problem_2():
     return problem
 
 
-def eddy_current_problem_different_currents(mesh = None, current=1000, frequency=8000, winding_count=1):
+def eddy_current_problem_different_currents(
+    mesh=None, current=1000, frequency=8000, winding_count=1
+):
     if mesh is None:
         wp = BilletParams(diameter=0.030, height=0.070)
         ind = RectangularInductorParams(
@@ -273,6 +283,7 @@ def eddy_current_problem_different_currents(mesh = None, current=1000, frequency
     problem = problem_generator.get_problem(current=current, frequency=frequency)
 
     return problem
+
 
 def eddy_current_problem_different_meshes(setting="default"):
 
@@ -298,7 +309,6 @@ def eddy_current_problem_different_meshes(setting="default"):
         case _:
             pass  # Use default values
 
-
     wp = BilletParams(diameter=0.030, height=0.070)
     ind = RectangularInductorParams(
         coil_inner_diameter=0.050,
@@ -321,6 +331,63 @@ def eddy_current_problem_different_meshes(setting="default"):
     problem = problem_generator.get_problem(current=3000, frequency=3000)
 
     return problem
+
+
+def team_36_problem():
+
+    mm = 1e-3
+
+    builder = IHGeometryAndMesh(
+        BilletParams(diameter=60 * mm, height=500 * mm),
+        RectangularInductorParams(
+            coil_inner_diameter=48 * 2 * mm,
+            coil_height=500 * mm,
+            winding_count=10,
+            profile_width=20 * mm,
+            profile_height=40 * mm,
+            is_hollow=True,
+            wall_thickness=3 * mm,
+        ),
+        h_workpiece=1 * mm,
+        h_coil=4 * mm,
+        h_air=100 * mm,
+        air_width=300 * mm,
+        air_height_factor=2.0,
+    )
+    mesh = builder.generate()
+
+    dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
+    dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
+
+    full_coil_area = 20 * mm * 40 * mm
+    hollow_coil_area = (20 - 2 * 3) * mm * (40 - 2 * 3) * mm
+    area_coil = full_coil_area - hollow_coil_area
+    print(f"Coil area used for current density calculation: {area_coil:.6e} m^2")
+
+    material_properties = {
+        "mat_workpiece": MaterialPropertiesEM(
+            mu=100.0,
+            sigma=4761904,
+        ),
+        "mat_air": MaterialPropertiesEM(mu=1.0, sigma=0),
+        "mat_coil": MaterialPropertiesEM(mu=1.0, sigma=0),
+    }
+
+    problem_generator = GenericEddyCurrentProblem(
+        mesh,
+        dirichlet_boundaries,
+        dirichlet_boundaries_dict,
+        material_properties=material_properties,
+        A_star=3.9e-3,
+        coil_area=area_coil,
+    )
+
+    problem = problem_generator.get_problem(current=4950, frequency=2000)
+
+    print("Skin depth in workpiece (m):", problem.calculate_skin_depth())
+
+    return problem
+
 
 def eddy_current_problem_temp_dependent_conductivity():
     """
@@ -355,7 +422,7 @@ def eddy_current_problem_temp_dependent_conductivity():
         "700": 9.5e-6,
         "800": 1.11e-6,
         "900": 1.16e-6,
-        "1000": 1.19e-6
+        "1000": 1.19e-6,
     }
     electrical_conductivity = {T: 1 / rho for T, rho in electrical_resistivity.items()}
 
@@ -388,16 +455,26 @@ def eddy_current_problem_temp_dependent_conductivity():
                     pos_x, pos_y = temp_data.pos[node_idx]
                     temperature_at_node = temperature_field(pos_x, pos_y)
                     temperature_field_nodes[node_idx] = temperature_at_node
-                    sigma_from_temperature[node_idx] = sigma_from_temperature_builder(temperature_at_node)
+                    sigma_from_temperature[node_idx] = sigma_from_temperature_builder(
+                        temperature_at_node
+                    )
 
     import matplotlib.pyplot as plt
+
     # plt.figure(figsize=(6, 5))
     # scatter = plt.scatter(temp_data.pos[:, 0], temp_data.pos[:, 1], c=sigma_from_temperature, cmap="viridis", vmin=np.min(sigma_from_temperature[np.nonzero(sigma_from_temperature)]), vmax=np.max(sigma_from_temperature))
     # plt.colorbar(scatter, label="Conductivity (S/m)")
     # plt.show()
 
     plt.figure(figsize=(6, 5))
-    scatter = plt.scatter(temp_data.pos[:, 0], temp_data.pos[:, 1], c=temperature_field_nodes, cmap="inferno", vmin=np.min(temperature_field_nodes[np.nonzero(temperature_field_nodes)]), vmax=np.max(temperature_field_nodes))
+    scatter = plt.scatter(
+        temp_data.pos[:, 0],
+        temp_data.pos[:, 1],
+        c=temperature_field_nodes,
+        cmap="inferno",
+        vmin=np.min(temperature_field_nodes[np.nonzero(temperature_field_nodes)]),
+        vmax=np.max(temperature_field_nodes),
+    )
     plt.colorbar(scatter, label="Temperature (°C)")
     plt.show()
 
