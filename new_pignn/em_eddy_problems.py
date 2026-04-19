@@ -78,9 +78,10 @@ class GenericEddyCurrentProblem:
         material_properties: Optional[dict[str, MaterialPropertiesEM]] = None,
         sigma_nodal=None,
         A_star=4.8 * 1e-4,  # Wb
+        r_star=70 * 1e-3,  # m
         coil_area: Optional[float] = None,
     ):
-        self.r_star = 70 * 1e-3  # m
+        self.r_star = r_star  # m
         self.A_star = A_star  # Wb
         self.mu_star = 4 * 3.1415926535e-7  # H/m
         self.J_star = self.A_star / (self.r_star**2 * self.mu_star)
@@ -379,6 +380,7 @@ def team_36_problem():
         dirichlet_boundaries_dict,
         material_properties=material_properties,
         A_star=3.9e-3,
+        r_star=600e-3,
         coil_area=area_coil,
     )
 
