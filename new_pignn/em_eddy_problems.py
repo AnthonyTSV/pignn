@@ -334,28 +334,28 @@ def eddy_current_problem_different_meshes(setting="default"):
     return problem
 
 
-def team_36_problem():
+def em_team_36_problem(mesh=None):
 
     mm = 1e-3
-
-    builder = IHGeometryAndMesh(
-        BilletParams(diameter=60 * mm, height=500 * mm),
-        RectangularInductorParams(
-            coil_inner_diameter=48 * 2 * mm,
-            coil_height=500 * mm,
-            winding_count=10,
-            profile_width=20 * mm,
-            profile_height=40 * mm,
-            is_hollow=True,
-            wall_thickness=3 * mm,
-        ),
-        h_workpiece=1 * mm,
-        h_coil=4 * mm,
-        h_air=100 * mm,
-        air_width=300 * mm,
-        air_height_factor=2.0,
-    )
-    mesh = builder.generate()
+    if mesh is None:
+        builder = IHGeometryAndMesh(
+            BilletParams(diameter=60 * mm, height=500 * mm),
+            RectangularInductorParams(
+                coil_inner_diameter=48 * 2 * mm,
+                coil_height=500 * mm,
+                winding_count=10,
+                profile_width=20 * mm,
+                profile_height=40 * mm,
+                is_hollow=True,
+                wall_thickness=3 * mm,
+            ),
+            h_workpiece=1 * mm,
+            h_coil=8 * mm,
+            h_air=100 * mm,
+            air_width=300 * mm,
+            air_height_factor=2.0,
+        )
+        mesh = builder.generate()
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}

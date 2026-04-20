@@ -31,7 +31,7 @@ try:
         eddy_current_problem_2,
         eddy_current_problem_different_currents,
         eddy_current_problem_different_meshes,
-        team_36_problem
+        em_team_36_problem
     )
 except ImportError:
     from logger import TrainingLogger
@@ -55,7 +55,7 @@ except ImportError:
         eddy_current_problem_2,
         eddy_current_problem_different_currents,
         eddy_current_problem_different_meshes,
-        team_36_problem
+        em_team_36_problem
     )
 from torch_geometric.data import Data, Batch
 
@@ -568,23 +568,6 @@ class PIMGNTrainerEM:
 
                 d_loss = d_loss_A
 
-                if self.is_mixed and "coil_node_indices" in gt:
-                    pred_phi_real = torch.zeros(n_total, dtype=torch.float64, device=self.device)
-                    pred_phi_imag = torch.zeros(n_total, dtype=torch.float64, device=self.device)
-                    pred_phi_real[free_to_original] = prediction_free[:, 2].to(dtype=torch.float64)
-                    pred_phi_imag[free_to_original] = prediction_free[:, 3].to(dtype=torch.float64)
-
-                    coil_idx = gt["coil_node_indices"]
-                    gt_phi_norm = torch.sqrt(
-                        (gt["phi_real"]**2 + gt["phi_imag"]**2).sum()
-                    ).clamp_min(1e-10)
-                    n_phi = len(coil_idx)
-                    d_loss_phi = (
-                        (pred_phi_real[coil_idx] - gt["phi_real"]) ** 2
-                        + (pred_phi_imag[coil_idx] - gt["phi_imag"]) ** 2
-                    ).mean() / (gt_phi_norm**2 / n_phi)
-                    d_loss = d_loss + d_loss_phi
-
             total_loss = total_loss + physics_loss + data_weight * d_loss
             total_loss_A += self._last_loss_A
             total_loss_phi += self._last_loss_phi
@@ -709,38 +692,7 @@ class PIMGNTrainerEM:
                 (pred_A_real - gt_A_real) ** 2 + (pred_A_imag - gt_A_imag) ** 2
             ).mean() / (gt_A_norm**2 / n_total)
 
-            # Phi supervision: compare on coil nodes only
-            pred_phi_real = torch.zeros(
-                n_total, dtype=torch.float64, device=self.device
-            )
-            pred_phi_imag = torch.zeros(
-                n_total, dtype=torch.float64, device=self.device
-            )
-            pred_phi_real[free_to_original] = prediction_free[:, 2].to(
-                dtype=torch.float64
-            )
-            pred_phi_imag[free_to_original] = prediction_free[:, 3].to(
-                dtype=torch.float64
-            )
-
-            coil_idx = ground_truth["coil_node_indices"]
-            gt_phi_real = ground_truth["phi_real"]
-            gt_phi_imag = ground_truth["phi_imag"]
-
-            # Extract predicted phi at coil nodes
-            pred_phi_real_coil = pred_phi_real[coil_idx]
-            pred_phi_imag_coil = pred_phi_imag[coil_idx]
-
-            gt_phi_norm = torch.sqrt(
-                (gt_phi_real**2 + gt_phi_imag**2).sum()
-            ).clamp_min(1e-10)
-            n_phi = len(coil_idx)
-            data_loss_phi = (
-                (pred_phi_real_coil - gt_phi_real) ** 2
-                + (pred_phi_imag_coil - gt_phi_imag) ** 2
-            ).mean() / (gt_phi_norm**2 / n_phi)
-
-            data_loss = data_loss_A + data_loss_phi
+            data_loss = data_loss_A
             self._last_data_loss = data_loss.item()
 
         # Combined loss
@@ -1486,17 +1438,17 @@ def train_specific_eddy_current_problem(resume_from: str = None):
     _run_single_problem_experiment(problem, config, f"Eddy Current (Current: 3000, Frequency: 3000)")
 
 def train_team_36(resume_from: str = None):
-    problem = team_36_problem()
+    problem = em_team_36_problem()
     config = {
         "epochs": 20000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/team_36_problem",
+        "save_dir": "results/physics_informed/em_team_36_problem",
         "enforce_axis_regularity": True,
         "data_weight": 0.0,
         "resume_from": resume_from,  # Path to checkpoint to resume from
     }
-    _run_single_problem_experiment(problem, config, f"Team 36 Problem")
+    _run_single_problem_experiment(problem, config, f"EM Team 36 Problem")
 
 def train_on_different_meshes(resume_from: str = None):
     problems = [
