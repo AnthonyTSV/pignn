@@ -584,7 +584,7 @@ def train_temp_dependent_material_problem(resume_from: str = None):
 
 def train_ih_problem():
     from thermal_problems import create_ih_problem
-    problem = create_ih_problem()
+    problem = create_ih_problem(frequency=3000, current=3000, combined_bc=False, time_end=3.0, dt=0.05)
     config = {
         "epochs": 2000,
         "lr": 1e-3,
@@ -592,9 +592,36 @@ def train_ih_problem():
         "noise_sigma": 1e-1,
         "generate_ground_truth_for_validation": True,
         "save_dir": "results/physics_informed/thermal_ih_problem",
-        "resume_from": "results/physics_informed/thermal_ih_problem/pimgn_trained_model.pth",
+        "resume_from": None,
     }
     _run_single_problem_experiment(problem, problem.time_config, config, "Induction heating thermal problem")
+
+def train_ih_team_36_problem(resume_from: str = None):
+    from thermal_problems import ih_team_36_problem
+    problem = ih_team_36_problem()
+    config = {
+        "epochs": 5000,
+        "lr": 1e-3,
+        "time_window": 20,
+        "noise_sigma": 1,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/thermal_team_36_problem",
+        "resume_from": resume_from,
+    }
+    _run_single_problem_experiment(problem, problem.time_config, config, "Team 36 induction heating problem")
+
+def test_boundary_layer_mesh():
+    from thermal_problems import test_boundary_layer
+    problem = test_boundary_layer()
+    config = {
+        "epochs": 2000,
+        "lr": 1e-3,
+        "time_window": 20,
+        "noise_sigma": 1e-1,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/thermal_boundary_layer_test",
+    }
+    _run_single_problem_experiment(problem, problem.time_config, config, "Boundary layer mesh test problem")
 
 def train_ih_generalization_problem():
     from thermal_problems import create_ih_problem
@@ -619,4 +646,6 @@ def train_ih_generalization_problem():
     _run_multiple_problem_experiment(problems, problems[0].time_config, config, "Induction heating generalization problem")
 
 if __name__ == "__main__":
-    train_ih_generalization_problem()
+    # train_ih_problem()
+    # train_ih_team_36_problem()
+    test_boundary_layer_mesh()

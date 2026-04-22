@@ -14,7 +14,6 @@ from pathlib import Path
 TensorLike = Union[np.ndarray, torch.Tensor]
 NormalizeMode = Literal["none", "ndof", "rhs"]
 EnergyInvMode = Literal["jacobi", "cg"]
-ResidualMetric = Literal["operator_diag", "mass", "euclidean"]
 
 
 def _sparse_diag(A: torch.Tensor) -> torch.Tensor:
@@ -100,7 +99,6 @@ class FEMSolverEM:
         self.bilinear_form = None
         self.linear_form = None
         self.lumped_mass_diag = None
-        self.operator_residual_diag = None
         self.fes = None
 
         self.problem = problem
@@ -273,9 +271,6 @@ class FEMSolverEM:
         lumped = torch.sparse.mm(M_real, ones.unsqueeze(1)).squeeze(1)
         # Clamp to avoid division by zero on Dirichlet / axis nodes
         self.lumped_mass_diag = lumped.clamp_min(1e-30)
-        self.operator_residual_diag = self._build_operator_residual_diag(
-            k_real, k_imag
-        )
 
     def reassemble_with_sigma(self, sigma_nodal: np.ndarray):
         """Re-assemble the complex bilinear form with a new per-node sigma.
@@ -463,21 +458,6 @@ class FEMSolverEM:
                 indices, values, size=shape, dtype=torch.float64
             )
             return tensor.to(self.device)
-
-    def _build_operator_residual_diag(
-        self, Kr: torch.Tensor, Ki: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Diagonal of the operator-aware residual Riesz map.
-
-        The natural EM test norm is closer to a stiffness-plus-conductivity
-        operator than to a plain L2 mass operator.  For the cheap diagonal
-        metric we approximate P = K_r + K_i + eps M_L by storing
-        diag(K_r) + |diag(K_i)| here and adding eps M_L at use time.
-        """
-        diag_kr = _sparse_diag(Kr).to(dtype=torch.float64, device=self.device).abs()
-        diag_ki = _sparse_diag(Ki).to(dtype=torch.float64, device=self.device).abs()
-        return diag_kr + diag_ki
 
     def solve(self, problem):
         # Define material properties as coefficient functions
@@ -753,27 +733,15 @@ class FEMSolverEM:
         pred_sol_real,
         pred_sol_imag,
         *,
-        normalize: NormalizeMode = "rhs",
-        residual_metric: ResidualMetric = "operator_diag",
-        use_mass_weighting: Optional[bool] = None,
+        normalize: NormalizeMode = "ndof",
+        use_mass_weighting: bool = True,
         eps: float = 1e-12,
     ) -> torch.Tensor:
         r"""
         Compute the residual for complex-valued solutions.
 
-        By default the residual is measured with an operator-aware diagonal
-        approximation to the dual test norm:
-
-            R_D(u)^2 = r_r^T D^{-1} r_r + r_i^T D^{-1} r_i
-
-        with
-
-            D = diag(K_r) + |diag(K_i)| + eps diag(M_L).
-
-        This is a cheap minimum-residual metric aligned with the
-        stiffness-plus-conductivity norm of the eddy-current operator.
-
-        The legacy mass mode measures the residual in the ``M_L^{-1}`` norm:
+        If *use_mass_weighting* is True the residual is measured in the
+        ``M_L^{-1}`` norm (Riesz-map weighting):
 
             ||r||^2_{M^{-1}} = \sum_i  r_i^2 / m_i
 
@@ -781,17 +749,7 @@ class FEMSolverEM:
         ``M_L`` (row-sum of  M_ij = \int \hat{r} \phi_i \phi_j d \Omega).  This is the standard
         FE way to measure a linear-functional residual in a norm consistent
         with the L^2 inner product via the Riesz map.
-
-        If ``normalize="rhs"``, this returns the squared relative residual in
-        the selected metric.  For the default operator metric:
-
-            eta_D^2 = (r_r^T D^{-1} r_r + r_i^T D^{-1} r_i) / (b^T D^{-1} b)
-
-        Take ``torch.sqrt(loss)`` for eta itself.
         """
-        if use_mass_weighting is not None:
-            residual_metric = "mass" if use_mass_weighting else "euclidean"
-
         free_mask = self._free_dofs_mask()
 
         pred_sol_real_tensor = self._to_tensor64(pred_sol_real)
@@ -809,29 +767,8 @@ class FEMSolverEM:
 
         r_real_free = r_real[free_mask]
         r_imag_free = r_imag[free_mask]
-        rhs_free = self.linear_form[free_mask]
-        rhs_metric_denominator: torch.Tensor
 
-        if residual_metric == "operator_diag":
-            if self.lumped_mass_diag is None:
-                raise RuntimeError(
-                    "Lumped mass diagonal not available. "
-                    "Call init_complex_matrices() first."
-                )
-            if self.operator_residual_diag is None:
-                self.operator_residual_diag = self._build_operator_residual_diag(
-                    Kr, Ki
-                )
-
-            d_free = (
-                self.operator_residual_diag[free_mask]
-                + eps * self.lumped_mass_diag[free_mask]
-            ).clamp_min(torch.finfo(torch.float64).tiny)
-            loss = (r_real_free.square() / d_free).sum() + (
-                r_imag_free.square() / d_free
-            ).sum()
-            rhs_metric_denominator = (rhs_free.square() / d_free).sum()
-        elif residual_metric == "mass":
+        if use_mass_weighting:
             if self.lumped_mass_diag is None:
                 raise RuntimeError(
                     "Lumped mass diagonal not available. "
@@ -841,19 +778,16 @@ class FEMSolverEM:
             loss = (r_real_free.square() * m_inv_free).sum() + (
                 r_imag_free.square() * m_inv_free
             ).sum()
-            rhs_metric_denominator = (rhs_free.square() * m_inv_free).sum()
-        elif residual_metric == "euclidean":
-            loss = r_real_free.square().mean() + r_imag_free.square().mean()
-            rhs_metric_denominator = rhs_free.square().mean()
         else:
-            raise ValueError(f"Unknown residual metric: {residual_metric}")
+            loss = r_real_free.square().mean() + r_imag_free.square().mean()
 
         if normalize == "none":
             return loss
         if normalize == "rhs":
-            return loss / rhs_metric_denominator.clamp_min(eps)
+            rhsn = torch.linalg.norm(self.linear_form[free_mask]) + eps
+            return loss / (rhsn * rhsn)
         if normalize == "ndof":
-            if residual_metric in {"operator_diag", "mass"}:
+            if use_mass_weighting:
                 n_free = free_mask.sum().clamp_min(1).to(dtype=torch.float64)
                 return loss / n_free
             return loss  # already mean()
@@ -1581,13 +1515,13 @@ def previous_em():
     )
 
     # problem = eddy_current_problem_different_meshes(setting="very_fine")
-    problem = eddy_current_problem_1()
+    problem = em_team_36_problem()
 
     # Initialize FEM solver
     fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
 
     gfA = fem_solver.solve(problem)
-    # gfA = gfA * problem.A_star  # scale by A_star for better visualization and error metrics
+    gfA = gfA * problem.A_star  # scale by A_star for better visualization and error metrics
 
     if np.iscomplexobj(gfA):
         gfA_real = np.real(gfA)
@@ -1608,7 +1542,7 @@ def previous_em():
     fem_solver.export_to_vtk_complex(
         gfA,
         gfA,
-        filename="results/fem_tests_em/vtk/eddy_current_problem_1",
+        filename="results/fem_tests_em/vtk/team_36_problem",
     )
 
 

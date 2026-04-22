@@ -31,7 +31,8 @@ try:
         eddy_current_problem_2,
         eddy_current_problem_different_currents,
         eddy_current_problem_different_meshes,
-        em_team_36_problem
+        em_team_36_problem,
+        test_boundary_layer
     )
 except ImportError:
     from logger import TrainingLogger
@@ -55,7 +56,8 @@ except ImportError:
         eddy_current_problem_2,
         eddy_current_problem_different_currents,
         eddy_current_problem_different_meshes,
-        em_team_36_problem
+        em_team_36_problem,
+        test_boundary_layer
     )
 from torch_geometric.data import Data, Batch
 
@@ -1384,12 +1386,12 @@ def train_pimgn_magnetostatics(resume_from: str = None):
 
 
 def train_pimgn_eddy_current(resume_from: str = None):
-    problem = eddy_current_problem_1()
+    problem = eddy_current_problem_2()
     config = {
         "epochs": 20000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/eddy_current_problem_1_rect_coil",
+        "save_dir": "results/physics_informed/eddy_current_problem_2_new_loss",
         "enforce_axis_regularity": True,
         "data_weight": 0.0,
         "resume_from": resume_from,  # Path to checkpoint to resume from
@@ -1449,6 +1451,19 @@ def train_team_36(resume_from: str = None):
         "resume_from": resume_from,  # Path to checkpoint to resume from
     }
     _run_single_problem_experiment(problem, config, f"EM Team 36 Problem")
+
+def test_boundary_layers(resume_from: str = None):
+    problem = test_boundary_layer()
+    config = {
+        "epochs": 13000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/em_boundary_layer_test",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_single_problem_experiment(problem, config, f"EM Boundary Layer Test")
 
 def train_on_different_meshes(resume_from: str = None):
     problems = [
@@ -1535,4 +1550,5 @@ if __name__ == "__main__":
     # train_pimgn_eddy_current_different_currents()
     # train_on_different_meshes(resume_from="results/physics_informed/em_different_meshes/pimgn_trained_model.pth")
     # train_specific_eddy_current_problem(resume_from="results/physics_informed/eddy_current_problem_specific/pimgn_trained_model.pth")
-    train_team_36()
+    # train_team_36()
+    test_boundary_layers(resume_from="results/physics_informed/em_boundary_layer_test/pimgn_trained_model.pth")

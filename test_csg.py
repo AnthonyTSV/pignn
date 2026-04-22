@@ -24,7 +24,7 @@ def test_case(name, wp, ind, **kwargs):
     print(f"  Elements: {mesh.ne}, Vertices: {mesh.nv}")
     return mesh
 
-kw = dict(h_workpiece=5e-3, h_coil=2e-3, h_air=0.1)
+kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3, workpiece_boundary_layer_thicknesses=[1e-3, 2e-3, 4e-3])
 
 # 1) Billet + rectangular inductor
 print("Test 1...")
@@ -33,7 +33,7 @@ mesh = test_case(
     BilletParams(diameter=0.030, height=0.070),
     RectangularInductorParams(
         coil_inner_diameter=0.050, coil_height=0.040,
-        winding_count=2, profile_width=0.007, profile_height=0.007
+        winding_count=1, profile_width=0.007, profile_height=0.007
     ),
     **kw,
 )

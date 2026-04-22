@@ -224,7 +224,7 @@ def eddy_current_problem_1(mesh=None):
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
 
     problem_generator = GenericEddyCurrentProblem(
-        mesh, dirichlet_boundaries, dirichlet_boundaries_dict
+        mesh, dirichlet_boundaries, dirichlet_boundaries_dict, A_star=4.8e-3
     )
 
     problem = problem_generator.get_problem(current=10000)
@@ -250,7 +250,7 @@ def eddy_current_problem_2():
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
 
     problem_generator = GenericEddyCurrentProblem(
-        mesh, dirichlet_boundaries, dirichlet_boundaries_dict
+        mesh, dirichlet_boundaries, dirichlet_boundaries_dict, A_star=4.8e-3
     )
 
     problem = problem_generator.get_problem()
@@ -337,6 +337,19 @@ def eddy_current_problem_different_meshes(setting="default"):
 def em_team_36_problem(mesh=None):
 
     mm = 1e-3
+    total_thickness = 5 * mm
+    stretch_factor = 1.4
+    layers = 5
+    layer_factor = 1.4
+    skin_factor = 1.55
+    thicknesses = [
+        0.04899417051926398 * mm,
+        0.06859183872696957 * mm,
+        0.09602857421775739 * mm,
+        0.13444000390486033 * mm,
+        0.18821600546680448 * mm,
+        0.2635024076535262 * mm
+    ]
     if mesh is None:
         builder = IHGeometryAndMesh(
             BilletParams(diameter=60 * mm, height=500 * mm),
@@ -349,11 +362,12 @@ def em_team_36_problem(mesh=None):
                 is_hollow=True,
                 wall_thickness=3 * mm,
             ),
-            h_workpiece=1 * mm,
+            h_workpiece=3 * mm,
             h_coil=8 * mm,
             h_air=100 * mm,
             air_width=300 * mm,
             air_height_factor=2.0,
+            workpiece_boundary_layer_thicknesses=thicknesses
         )
         mesh = builder.generate()
 
@@ -390,6 +404,22 @@ def em_team_36_problem(mesh=None):
 
     return problem
 
+def test_boundary_layer():
+    wp = BilletParams(diameter=0.030, height=0.070)
+    ind = RectangularInductorParams(
+        coil_inner_diameter=0.050,
+        coil_height=0.040,
+        winding_count=1,
+        profile_width=0.007,
+        profile_height=0.007,
+    )
+    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3, workpiece_boundary_layer_thicknesses=[1e-3, 2e-3, 3e-3, 4e-3, 5e-3])
+    builder = IHGeometryAndMesh(wp, ind, **kw)
+    mesh = builder.generate()
+
+    problem = eddy_current_problem_different_currents(mesh=mesh, current=3000, frequency=3000)
+
+    return problem
 
 def eddy_current_problem_temp_dependent_conductivity():
     """

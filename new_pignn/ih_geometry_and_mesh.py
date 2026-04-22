@@ -1,9 +1,9 @@
 from __future__ import annotations
-from typing import List, Union
+from typing import List, Sequence, Union
 from pydantic import BaseModel
 
 from ngsolve import Mesh
-from netgen.geom2d import CSG2d, Rectangle, Circle
+from netgen import occ
 
 
 class BilletParams(BaseModel):
@@ -71,10 +71,6 @@ class RectangularInductorParams(BaseModel):
 WorkpieceParams = Union[BilletParams, TubeParams, SteppedShaftParams, MultiBilletParams]
 InductorParams = Union[CircularInductorParams, RectangularInductorParams]
 
-# Internal scale factor: CSG2d boolean ops with Circle hang at metre scale
-# (netgen bug). We build geometry in mm and scale the mesh back to metres.
-_SCALE = 1000.0  # m -> mm
-
 
 class IHGeometryAndMesh:
     """Creates 2D axisymmetric induction-heating meshes.
@@ -88,6 +84,12 @@ class IHGeometryAndMesh:
         )
         builder = IHGeometryAndMesh(wp, ind)
         mesh = builder.generate()
+
+        # With workpiece skin layers:
+        builder = IHGeometryAndMesh(
+            wp, ind, workpiece_boundary_layer_thicknesses=[1e-5, 2e-5, 4e-5],
+        )
+        mesh = builder.generate()
     """
 
     def __init__(
@@ -100,6 +102,7 @@ class IHGeometryAndMesh:
         h_workpiece: float = 5e-4,
         h_coil: float = 1e-3,
         h_air: float = 60e-3,
+        workpiece_boundary_layer_thicknesses: Sequence[float] | None = None,
     ):
         self.wp = workpiece
         self.ind = inductor
@@ -108,7 +111,78 @@ class IHGeometryAndMesh:
         self.h_workpiece = h_workpiece
         self.h_coil = h_coil
         self.h_air = h_air
-        self._S = _SCALE  # shortcut
+        self.workpiece_boundary_layer_thicknesses = (
+            None
+            if workpiece_boundary_layer_thicknesses is None
+            else list(workpiece_boundary_layer_thicknesses)
+        )
+
+    @staticmethod
+    def _set_face_properties(shape, material: str, maxh: float) -> None:
+        """Set OCC face material and mesh size on a face or compound."""
+        shape.name = material
+        shape.maxh = maxh
+        for face in shape.faces:
+            face.name = material
+            face.maxh = maxh
+
+    @staticmethod
+    def _make_rectangle(
+        xmin: float,
+        ymin: float,
+        xmax: float,
+        ymax: float,
+        *,
+        material: str,
+        maxh: float,
+        left: str | None = None,
+        right: str | None = None,
+        top: str | None = None,
+        bottom: str | None = None,
+        bc: str | None = None,
+    ):
+        """Create an OCC rectangular face with optional edge names."""
+        if xmax <= xmin or ymax <= ymin:
+            raise ValueError("rectangle dimensions must be positive")
+
+        rect = (
+            occ.Rectangle(xmax - xmin, ymax - ymin)
+            .Face()
+            .Move(occ.Vec(xmin, ymin, 0))
+        )
+        IHGeometryAndMesh._set_face_properties(rect, material, maxh)
+
+        if bc is not None:
+            rect.edges.name = bc
+        if left is not None:
+            rect.edges.Min(occ.X).name = left
+        if right is not None:
+            rect.edges.Max(occ.X).name = right
+        if top is not None:
+            rect.edges.Max(occ.Y).name = top
+        if bottom is not None:
+            rect.edges.Min(occ.Y).name = bottom
+        return rect
+
+    @staticmethod
+    def _make_circle(
+        cx: float,
+        cy: float,
+        radius: float,
+        *,
+        material: str,
+        maxh: float,
+        bc: str | None = None,
+    ):
+        """Create an OCC circular face with optional edge name."""
+        if radius <= 0:
+            raise ValueError("circle radius must be positive")
+
+        circle = occ.WorkPlane().Circle(cx, cy, radius).Face()
+        IHGeometryAndMesh._set_face_properties(circle, material, maxh)
+        if bc is not None:
+            circle.edges.name = bc
+        return circle
 
     def _workpiece_total_height(self) -> float:
         wp = self.wp
@@ -123,7 +197,7 @@ class IHGeometryAndMesh:
         raise TypeError(f"Unknown workpiece type: {type(wp)}")
 
     def _build_workpiece(self, y_center: float) -> list:
-        """Return a list of CSG2d Solid2d objects for the workpiece."""
+        """Return a list of OCC faces/compounds for the workpiece."""
         wp = self.wp
         if isinstance(wp, BilletParams):
             return [self._make_billet(wp, y_center)]
@@ -136,90 +210,91 @@ class IHGeometryAndMesh:
         raise TypeError(f"Unknown workpiece type: {type(wp)}")
 
     def _make_billet(self, wp: BilletParams, y_center: float):
-        S = self._S
-        r = wp.diameter / 2.0 * S
-        hh = wp.height / 2.0 * S
-        yc = y_center * S
-        rect = Rectangle(
-            pmin=(0, yc - hh),
-            pmax=(r, yc + hh),
-            mat="mat_workpiece",
+        r = wp.diameter / 2.0
+        hh = wp.height / 2.0
+        rect = self._make_rectangle(
+            0,
+            y_center - hh,
+            r,
+            y_center + hh,
+            material="mat_workpiece",
+            maxh=self.h_workpiece,
             left="bc_workpiece_left",
             right="bc_workpiece_right",
             top="bc_workpiece_top",
             bottom="bc_workpiece_bottom",
-        ).Mat("mat_workpiece").Maxh(self.h_workpiece * S)
-        
+        )
         return rect
 
     def _make_tube(self, wp: TubeParams, y_center: float):
-        S = self._S
-        r_inner = wp.inner_diameter / 2.0 * S
-        r_outer = wp.outer_diameter / 2.0 * S
-        hh = wp.height / 2.0 * S
-        yc = y_center * S
-        return (
-            Rectangle(
-                pmin=(r_inner, yc - hh),
-                pmax=(r_outer, yc + hh),
-                mat="mat_workpiece",
-                left="bc_workpiece_left",
-                right="bc_workpiece_right",
-                top="bc_workpiece_top",
-                bottom="bc_workpiece_bottom",
-            )
-            .Mat("mat_workpiece")
-            .Maxh(self.h_workpiece * S)
+        r_inner = wp.inner_diameter / 2.0
+        r_outer = wp.outer_diameter / 2.0
+        hh = wp.height / 2.0
+        return self._make_rectangle(
+            r_inner,
+            y_center - hh,
+            r_outer,
+            y_center + hh,
+            material="mat_workpiece",
+            maxh=self.h_workpiece,
+            left="bc_workpiece_left",
+            right="bc_workpiece_right",
+            top="bc_workpiece_top",
+            bottom="bc_workpiece_bottom",
         )
 
     def _make_stepped_shaft(self, wp: SteppedShaftParams, y_center: float):
-        S = self._S
-        r1 = wp.diameter1 / 2.0 * S
-        r2 = wp.diameter2 / 2.0 * S
-        yc = y_center * S
+        r1 = wp.diameter1 / 2.0
+        r2 = wp.diameter2 / 2.0
         # Upper section (diameter1 / height1) above the step
-        rect_upper = Rectangle(
-            pmin=(0, yc),
-            pmax=(r1, yc + wp.height1 * S),
-            mat="mat_workpiece",
+        rect_upper = self._make_rectangle(
+            0,
+            y_center,
+            r1,
+            y_center + wp.height1,
+            material="mat_workpiece",
+            maxh=self.h_workpiece,
             left="bc_workpiece_left",
             right="bc_workpiece_right",
             top="bc_workpiece_top",
             bottom="bc_workpiece_bottom",
         )
         # Lower section (diameter2 / height2) below the step
-        rect_lower = Rectangle(
-            pmin=(0, yc - wp.height2 * S),
-            pmax=(r2, yc),
-            mat="mat_workpiece",
+        rect_lower = self._make_rectangle(
+            0,
+            y_center - wp.height2,
+            r2,
+            y_center,
+            material="mat_workpiece",
+            maxh=self.h_workpiece,
             left="bc_workpiece_left",
             right="bc_workpiece_right",
             top="bc_workpiece_top",
             bottom="bc_workpiece_bottom",
         )
-        return (rect_upper + rect_lower).Mat("mat_workpiece").Maxh(self.h_workpiece * S)
+        stepped = rect_upper + rect_lower
+        self._set_face_properties(stepped, "mat_workpiece", self.h_workpiece)
+        return stepped
 
     def _make_multi_billet(self, wp: MultiBilletParams, y_center: float) -> list:
-        S = self._S
-        r = wp.diameter / 2.0 * S
+        r = wp.diameter / 2.0
         total_h = self._workpiece_total_height()
-        y_start = (y_center - total_h / 2) * S
+        y_start = y_center - total_h / 2
 
         solids = []
         for i in range(wp.count):
-            y_bot = y_start + i * (wp.height + wp.gap) * S
-            solid = (
-                Rectangle(
-                    pmin=(0, y_bot),
-                    pmax=(r, y_bot + wp.height * S),
-                    mat="mat_workpiece",
-                    left="bc_workpiece_left",
-                    right="bc_workpiece_right",
-                    top="bc_workpiece_top",
-                    bottom="bc_workpiece_bottom",
-                )
-                .Mat("mat_workpiece")
-                .Maxh(self.h_workpiece * S)
+            y_bot = y_start + i * (wp.height + wp.gap)
+            solid = self._make_rectangle(
+                0,
+                y_bot,
+                r,
+                y_bot + wp.height,
+                material="mat_workpiece",
+                maxh=self.h_workpiece,
+                left="bc_workpiece_left",
+                right="bc_workpiece_right",
+                top="bc_workpiece_top",
+                bottom="bc_workpiece_bottom",
             )
             solids.append(solid)
         return solids
@@ -241,7 +316,7 @@ class IHGeometryAndMesh:
         return [top_y - i * spacing for i in range(ind.winding_count)]
 
     def _build_inductor(self, y_center: float) -> list:
-        """Return a list of CSG2d Solid2d objects for the inductor windings."""
+        """Return a list of OCC faces/compounds for the inductor windings."""
         y_positions = self._winding_y_positions(y_center)
         solids = []
         for y_pos in y_positions:
@@ -252,100 +327,119 @@ class IHGeometryAndMesh:
         return solids
 
     def _make_circular_winding(self, ind: CircularInductorParams, y_pos: float):
-        S = self._S
-        cx = (ind.coil_inner_diameter / 2 + ind.profile_diameter / 2) * S
-        r = ind.profile_diameter / 2 * S
-        yp = y_pos * S
+        cx = ind.coil_inner_diameter / 2 + ind.profile_diameter / 2
+        r = ind.profile_diameter / 2
 
-        outer = (
-            Circle(center=(cx, yp), radius=r, mat="mat_coil", bc="bc_coil")
-            .Mat("mat_coil")
-            .Maxh(self.h_coil * S)
+        outer = self._make_circle(
+            cx,
+            y_pos,
+            r,
+            material="mat_coil",
+            maxh=self.h_coil,
+            bc="bc_coil",
         )
         if ind.is_hollow:
-            r_inner = (ind.profile_diameter / 2 - ind.wall_thickness) * S
-            inner = Circle(center=(cx, yp), radius=r_inner)
-            return (outer - inner).Mat("mat_coil").Maxh(self.h_coil * S)
+            r_inner = ind.profile_diameter / 2 - ind.wall_thickness
+            inner = self._make_circle(
+                cx,
+                y_pos,
+                r_inner,
+                material="mat_air",
+                maxh=self.h_air,
+                bc="bc_coil",
+            )
+            winding = outer - inner
+            self._set_face_properties(winding, "mat_coil", self.h_coil)
+            winding.edges.name = "bc_coil"
+            return winding
         return outer
 
     def _make_rectangular_winding(self, ind: RectangularInductorParams, y_pos: float):
-        S = self._S
-        cx = (ind.coil_inner_diameter / 2 + ind.profile_width / 2) * S
-        hw = ind.profile_width / 2 * S
-        hh = ind.profile_height / 2 * S
-        yp = y_pos * S
+        cx = ind.coil_inner_diameter / 2 + ind.profile_width / 2
+        hw = ind.profile_width / 2
+        hh = ind.profile_height / 2
 
-        outer = (
-            Rectangle(
-                pmin=(cx - hw, yp - hh),
-                pmax=(cx + hw, yp + hh),
-                mat="mat_coil",
-                bc="bc_coil",
-            )
-            .Mat("mat_coil")
-            .Maxh(self.h_coil * S)
+        outer = self._make_rectangle(
+            cx - hw,
+            y_pos - hh,
+            cx + hw,
+            y_pos + hh,
+            material="mat_coil",
+            maxh=self.h_coil,
+            bc="bc_coil",
         )
         if ind.is_hollow:
-            t = ind.wall_thickness * S
-            inner = Rectangle(
-                pmin=(cx - hw + t, yp - hh + t),
-                pmax=(cx + hw - t, yp + hh - t),
+            t = ind.wall_thickness
+            inner = self._make_rectangle(
+                cx - hw + t,
+                y_pos - hh + t,
+                cx + hw - t,
+                y_pos + hh - t,
+                material="mat_air",
+                maxh=self.h_air,
+                bc="bc_coil",
             )
-            return (outer - inner).Mat("mat_coil").Maxh(self.h_coil * S)
+            winding = outer - inner
+            self._set_face_properties(winding, "mat_coil", self.h_coil)
+            winding.edges.name = "bc_coil"
+            return winding
         return outer
 
     @staticmethod
-    def _scale_mesh_to_metres(mesh: Mesh) -> None:
-        """Scale mesh coordinates from mm back to metres (in-place)."""
-        factor = 1.0 / _SCALE
-        for p in mesh.ngmesh.Points():
-            p[0] = p[0] * factor
-            p[1] = p[1] * factor
-        mesh.ngmesh.Update()
+    def _workpiece_domain_indices(ngmesh) -> list[int]:
+        return sorted(
+            {
+                elem.index
+                for elem in ngmesh.Elements2D()
+                if ngmesh.GetMaterial(elem.index) == "mat_workpiece"
+            }
+        )
+
+    def _add_workpiece_boundary_layers(self, ngmesh) -> None:
+        thicknesses = self.workpiece_boundary_layer_thicknesses
+        if not thicknesses:
+            return
+        if any(thickness <= 0 for thickness in thicknesses):
+            raise ValueError("workpiece boundary layer thicknesses must be positive")
+
+        domain_indices = self._workpiece_domain_indices(ngmesh)
+        if not domain_indices:
+            raise RuntimeError("Cannot add boundary layers: no mat_workpiece domain found")
+
+        for domain_index in domain_indices:
+            ngmesh.BoundaryLayer2(domain_index, thicknesses, False)
 
     def generate(self) -> Mesh:
         """Build the full geometry and return an NGSolve Mesh (in metres)."""
-        S = self._S
         total_h = self._workpiece_total_height()
         air_height = total_h * self.air_height_factor
-        y_center = air_height / 2.0  # in metres — helpers convert to mm
+        y_center = air_height / 2.0
 
-        geo = CSG2d()
-
-        # Air bounding box (in mm)
-        air = (
-            Rectangle(
-                pmin=(0, 0),
-                pmax=(self.air_width * S, air_height * S),
-                mat="mat_air",
-                bc="bc_air",
-                left="bc_axis",
-            )
-            .Mat("mat_air")
-            .Maxh(self.h_air * S)
+        air = self._make_rectangle(
+            0,
+            0,
+            self.air_width,
+            air_height,
+            material="mat_air",
+            maxh=self.h_air,
+            bc="bc_air",
+            left="bc_axis",
         )
 
-        # Collect inner-domain solids (already in mm from helpers)
         wp_solids = self._build_workpiece(y_center)
         ind_solids = self._build_inductor(y_center)
         inner_solids = wp_solids + ind_solids
 
-        # Intersect each solid with the air box
         clipped = [s * air for s in inner_solids]
 
-        # Subtract all inner domains from air
         remaining_air = air
         for s in clipped:
             remaining_air = remaining_air - s
+        self._set_face_properties(remaining_air, "mat_air", self.h_air)
 
-        # Add all domains
-        geo.Add(remaining_air)
-        for s in clipped:
-            geo.Add(s)
+        shape = occ.Compound([remaining_air, *clipped])
+        geo = occ.OCCGeometry(shape, dim=2)
 
-        ngmesh = geo.GenerateMesh(maxh=self.h_air * S)
-        mesh = Mesh(ngmesh)
-
-        # Scale mesh coordinates back from mm to metres
-        self._scale_mesh_to_metres(mesh)
-        return mesh
+        ngmesh = geo.GenerateMesh(maxh=self.h_air, grading=0.5)
+        self._add_workpiece_boundary_layers(ngmesh)
+        return Mesh(ngmesh)

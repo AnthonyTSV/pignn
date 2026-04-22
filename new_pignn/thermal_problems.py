@@ -681,49 +681,30 @@ def create_ih_problem(frequency=2000, current=1000, combined_bc=True, time_end=1
     )
     return problem.get_problem()
 
-def ih_team_36_problem():
-    mm = 1e-3
-    builder = IHGeometryAndMesh(
-        BilletParams(diameter=60 * mm, height=500 * mm),
-        RectangularInductorParams(
-            coil_inner_diameter=48 * 2 * mm,
-            coil_height=500 * mm,
-            winding_count=10,
-            profile_width=20 * mm,
-            profile_height=40 * mm,
-            is_hollow=True,
-            wall_thickness=3 * mm,
-        ),
-        h_workpiece=4 * mm,
-        h_coil=8 * mm,
-        h_air=100 * mm,
-        air_width=300 * mm,
-        air_height_factor=2.0,
+def test_boundary_layer():
+    wp = BilletParams(diameter=0.030, height=0.070)
+    ind = RectangularInductorParams(
+        coil_inner_diameter=0.050,
+        coil_height=0.040,
+        winding_count=1,
+        profile_width=0.007,
+        profile_height=0.007,
     )
+    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3, workpiece_boundary_layer_thicknesses=[1e-3, 2e-3, 3e-3, 4e-3, 5e-3])
+    builder = IHGeometryAndMesh(wp, ind, **kw)
     mesh = builder.generate()
     material_properties = MaterialPropertiesHeat(
         rho=7870,
         cp=461,
-        k=FieldValue(table=Table1D(
-            args=[0, 100, 200, 300, 400, 500, 600, 700, 750, 800, 900, 1000, 1100, 1200], 
-            values=[48.1, 48.1, 46.5, 44.0, 41.0, 38.5, 36.0, 31.4, 28.5, 26.7, 25.9, 26.7, 28.0, 29.8])),
+        k=86,
     )
     boundary_conditions = {
-        "bc_workpiece_top": CombinedBC(value={
-            "convection": (7, 25),
-            "radiation": (0.8, 25),
-        }),
-        "bc_workpiece_right": CombinedBC(value={
-            "convection": (7, 70),
-            "radiation": (0.8, 70),
-        }),
-        "bc_workpiece_bottom": CombinedBC(value={
-            "convection": (7, 25),
-            "radiation": (0.8, 25),
-        }),
+        "bc_workpiece_top": ConvectionBC(value=(10, 20)),
+        "bc_workpiece_right": ConvectionBC(value=(10, 20)),
+        "bc_workpiece_bottom": ConvectionBC(value=(10, 20)),
     }
 
-    em_problem = em_team_36_problem()
+    em_problem = eddy_current_problem_different_currents(mesh, frequency=3000, current=3000)
     fem_solver = FEMSolverEM(em_problem.mesh, order=1, problem=em_problem)
     gfA_unscaled = fem_solver.solve(em_problem)
     gfA = gfA_unscaled * em_problem.A_star
@@ -742,7 +723,93 @@ def ih_team_36_problem():
 
     problem = GenericHeatEquationProblem(
         mesh=mesh,
-        time_config=TimeConfig(dt=0.25, t_final=25),
+        time_config=TimeConfig(dt=0.01, t_final=1),
+        boundary_conditions=boundary_conditions,
+        material_properties=material_properties,
+        initial_condition=22.0,
+        thermal_domain_materials=["mat_workpiece"],
+        source_function=source_function,
+        axisymmetric=True,
+        mesh_type="ih_mesh",
+    )
+    return problem.get_problem()
+
+def ih_team_36_problem():
+    mm = 1e-3
+    thicknesses = [
+        0.04899417051926398 * mm,
+        0.06859183872696957 * mm,
+        0.09602857421775739 * mm,
+        0.13444000390486033 * mm,
+        0.18821600546680448 * mm,
+        0.2635024076535262 * mm
+    ]
+    builder = IHGeometryAndMesh(
+        BilletParams(diameter=60 * mm, height=500 * mm),
+        RectangularInductorParams(
+            coil_inner_diameter=48 * 2 * mm,
+            coil_height=500 * mm,
+            winding_count=10,
+            profile_width=20 * mm,
+            profile_height=40 * mm,
+            is_hollow=True,
+            wall_thickness=3 * mm,
+        ),
+        h_workpiece=3 * mm,
+        h_coil=8 * mm,
+        h_air=100 * mm,
+        air_width=300 * mm,
+        air_height_factor=2.0,
+        workpiece_boundary_layer_thicknesses=thicknesses
+    )
+    mesh = builder.generate()
+    material_properties = MaterialPropertiesHeat(
+        rho=7870,
+        cp=461,
+        k=FieldValue(table=Table1D(
+            args=[0, 100, 200, 300, 400, 500, 600, 700, 750, 800, 900, 1000, 1100, 1200, 1400, 1470, 1800], 
+            values=[48.1, 48.1, 46.5, 44.0, 41.0, 38.5, 36.0, 31.4, 28.5, 26.7, 25.9, 26.7, 28.0, 29.8, 35, 39, 39])),
+    )
+    # boundary_conditions = {
+    #     "bc_workpiece_top": CombinedBC(value={
+    #         "convection": (7, 70),
+    #         "radiation": (0.8, 70),
+    #     }),
+    #     "bc_workpiece_right": CombinedBC(value={
+    #         "convection": (7, 70),
+    #         "radiation": (0.8, 70),
+    #     }),
+    #     "bc_workpiece_bottom": CombinedBC(value={
+    #         "convection": (7, 70),
+    #         "radiation": (0.8, 70),
+    #     }),
+    # }
+    boundary_conditions = {
+        "bc_workpiece_top": ConvectionBC(value=(10, 22)),
+        "bc_workpiece_right": ConvectionBC(value=(10, 22)),
+        "bc_workpiece_bottom": ConvectionBC(value=(10, 22)),
+    }
+
+    em_problem = em_team_36_problem(mesh=mesh)
+    fem_solver = FEMSolverEM(em_problem.mesh, order=1, problem=em_problem)
+    gfA_unscaled = fem_solver.solve(em_problem)
+    gfA = gfA_unscaled * em_problem.A_star
+
+    gfu = ng.GridFunction(fem_solver.fes)
+    gfu.vec.data = gfA
+    omega = 2 * np.pi * em_problem.frequency
+    E_phi = -1j * omega * gfu
+    heat_source_gf = (
+        0.5
+        * em_problem.sigma_workpiece * em_problem.sigma_star
+        * ng.Norm(E_phi) ** 2
+    )
+
+    source_function = get_source_function(mesh, heat_source_gf, mesh.nv)
+
+    problem = GenericHeatEquationProblem(
+        mesh=mesh,
+        time_config=TimeConfig(dt=0.25, t_final=5),
         boundary_conditions=boundary_conditions,
         material_properties=material_properties,
         initial_condition=22.0,
