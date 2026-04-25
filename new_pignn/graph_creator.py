@@ -391,8 +391,8 @@ def _build_node_features(
     features.append(T_tensor)
 
     # Time scalar (broadcasted to all nodes)
-    t_tensor = torch.full((n_nodes, 1), t_scalar, dtype=torch.float32, device=device)
-    features.append(t_tensor)
+    # t_tensor = torch.full((n_nodes, 1), t_scalar, dtype=torch.float32, device=device)
+    # features.append(t_tensor)
 
     # Material field: k(T_current) as the per-node instantaneous conductivity
     if material_field is not None:
@@ -405,12 +405,12 @@ def _build_node_features(
 
     # Table reference samples: static per problem, broadcast to all nodes.
     # Encodes the k(T) curve shape for material generalization.
-    if k_table_ref_values is not None:
-        ref_vals = np.asarray(k_table_ref_values, dtype=np.float32)
-        ref_tensor = torch.tensor(ref_vals, dtype=torch.float32, device=device)
-        # Broadcast [N_ref] → [N_nodes, N_ref]
-        ref_tensor = ref_tensor.unsqueeze(0).expand(n_nodes, -1)
-        features.append(ref_tensor)
+    # if k_table_ref_values is not None:
+    #     ref_vals = np.asarray(k_table_ref_values, dtype=np.float32)
+    #     ref_tensor = torch.tensor(ref_vals, dtype=torch.float32, device=device)
+    #     # Broadcast [N_ref] → [N_nodes, N_ref]
+    #     ref_tensor = ref_tensor.unsqueeze(0).expand(n_nodes, -1)
+    #     features.append(ref_tensor)
 
     # Neumann boundary values (flux values h_N from paper)
     if neumann_values is not None:

@@ -1,3 +1,4 @@
+import math
 from typing import Dict, Iterable, Optional, Tuple, List
 
 import numpy as np
@@ -221,3 +222,29 @@ def create_gaussian_initial_condition(
         T_initial[boundary_mask] = 0.0
 
     return T_initial
+
+def get_fixed_skin_layer_thicknesses(
+    frequency: float,
+    mu_r: float,
+    sigma: float,
+) -> list[float]:
+    """Returns 5 skin-layer thicknesses in meters for fixed frequency, mu_r and sigma."""
+
+    if frequency <= 0:
+        raise ValueError(f"Frequency should be positive but has been set to {frequency} Hz")
+    if mu_r <= 0:
+        raise ValueError(f"Relative permeability should be positive but has been set to {mu_r}")
+    if sigma <= 0:
+        raise ValueError(f"Conductivity should be positive but has been set to {sigma} S/m")
+
+    skin_factor = 1.55
+    layer_factor = 1.4
+    layer_count = 5
+    mu0 = 4 * 3.14 * 1e-7
+    skin_depth_meters = math.sqrt(1 / (3.14 * frequency * sigma * mu_r * mu0))
+    total_thickness = skin_depth_meters * skin_factor
+
+    coeff_sum = sum(layer_factor**i for i in range(layer_count))
+    first_layer_thickness = total_thickness / coeff_sum
+
+    return [first_layer_thickness * (layer_factor**i) for i in range(layer_count)]

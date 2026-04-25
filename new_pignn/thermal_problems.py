@@ -809,7 +809,7 @@ def ih_team_36_problem():
 
     problem = GenericHeatEquationProblem(
         mesh=mesh,
-        time_config=TimeConfig(dt=0.25, t_final=5),
+        time_config=TimeConfig(dt=0.25, t_final=25),
         boundary_conditions=boundary_conditions,
         material_properties=material_properties,
         initial_condition=22.0,

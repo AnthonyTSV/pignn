@@ -182,6 +182,7 @@ class MeshGraphNet(nn.Module):
         # fallback: simple linear projection 128 -> T
         self.use_cnn = False
         self.output_head = nn.Linear(self.hidden_dim, T)
+        self._init_thermal_output_head()
 
         if self.complex_em:
             # For complex EM, we predict only A
@@ -217,6 +218,14 @@ class MeshGraphNet(nn.Module):
             # Initialize decoder biases to small non-zero values for symmetry breaking
             # This ensures gradients flow from the start
             self._init_complex_decoders()
+
+    def _init_thermal_output_head(self):
+        if self.complex_em or self.mixed_em:
+            return
+
+        final = self.output_head[-1] if isinstance(self.output_head, nn.Sequential) else self.output_head
+        nn.init.normal_(final.weight, mean=0.0, std=1e-4)
+        nn.init.zeros_(final.bias)
 
     def _init_complex_decoders(self):
         """
@@ -282,6 +291,8 @@ class MeshGraphNet(nn.Module):
         # Temporal bundling / decoding
         if self.use_cnn:
             out = self.output_head(x.unsqueeze(1)).squeeze(1)  # [N, T]
+            T_current = data.x[:, 4:5]
+            out = T_current + out # Predicting deltas from current T to help with learning
         else:
             if self.complex_em:
                 out = self.output_head(x)  # [N, 2] -> (A_real, A_imag)

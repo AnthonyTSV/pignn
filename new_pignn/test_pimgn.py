@@ -601,9 +601,9 @@ def train_ih_team_36_problem(resume_from: str = None):
     problem = ih_team_36_problem()
     config = {
         "epochs": 5000,
-        "lr": 1e-3,
+        "lr": 1e-4,
         "time_window": 20,
-        "noise_sigma": 1,
+        "noise_sigma": 0.1,
         "generate_ground_truth_for_validation": True,
         "save_dir": "results/physics_informed/thermal_team_36_problem",
         "resume_from": resume_from,
@@ -647,5 +647,5 @@ def train_ih_generalization_problem():
 
 if __name__ == "__main__":
     # train_ih_problem()
-    # train_ih_team_36_problem()
-    test_boundary_layer_mesh()
+    train_ih_team_36_problem()
+    # test_boundary_layer_mesh()
