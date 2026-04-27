@@ -302,6 +302,7 @@ class MeshProblemEM:
         self.dirichlet_values = {}
         self.dirichlet_values_array = None  # To be set
         self.material_field = None  # To be set
+        self.mu_r_field = None  # Relative permeability at each node
         self.sigma_field = None
         self.sigma_nodal = None  # Per-node sigma for FEM assembly (nondimensionalized)
         self.current_density_field = None  # To be set (current density at each node)
@@ -345,6 +346,7 @@ class MeshProblemEM:
 
     def refresh_derived_quantities(self):
         """Refresh derived nondimensional EM quantities after parameter updates."""
+        self.J_star = self.A_star / (self.r_star**2 * self.mu_star)
         self.omega = float(2 * np.pi * self.frequency)  # rad/s
         if self.omega == 0.0:
             self.sigma_star = np.inf

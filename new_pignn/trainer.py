@@ -209,7 +209,15 @@ class PIMGNTrainer:
             else:
                 # Just model weights (backward compatibility)
                 self.model.load_state_dict(checkpoint)
-                print("Loaded model weights only (no optimizer state)")
+                print(
+                    "Loaded model weights only; epoch, optimizer, scheduler, and losses "
+                    "were not restored. Training will start from epoch 0."
+                )
+        elif resume_from:
+            print(
+                f"Resume checkpoint not found: {resume_from}. "
+                "Training will start from epoch 0."
+            )
 
         # Generate ground truth for validation
         if config.get("generate_ground_truth_for_validation", False):
@@ -689,7 +697,18 @@ class PIMGNTrainer:
                         errors.append(l2_error)
                 mean_l2_error = np.mean(errors)
                 print(f"Epoch {epoch+1:4d} | Rollout L2 Error: {mean_l2_error:.3e}")
-
+            checkpoint_epoch_interval = self.config.get(
+                "save_epoch_interval", self.config.get("save_interval", 100)
+            )
+            if (
+                checkpoint_epoch_interval
+                and (epoch + 1) % checkpoint_epoch_interval == 0
+            ):
+                path_to_checkpoint = self.config.get(
+                    "save_dir", "results/physics_informed_em"
+                )
+                model_path = f"{path_to_checkpoint}/pimgn_trained_model.pth"
+                self.save_checkpoint(model_path, epoch)
 
             self.scheduler.step()
 

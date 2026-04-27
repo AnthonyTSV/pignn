@@ -32,7 +32,8 @@ try:
         eddy_current_problem_different_currents,
         eddy_current_problem_different_meshes,
         em_team_36_problem,
-        test_boundary_layer
+        test_boundary_layer,
+        eddy_current_problem_different_mu_r
     )
 except ImportError:
     from logger import TrainingLogger
@@ -57,7 +58,8 @@ except ImportError:
         eddy_current_problem_different_currents,
         eddy_current_problem_different_meshes,
         em_team_36_problem,
-        test_boundary_layer
+        test_boundary_layer,
+        eddy_current_problem_different_mu_r
     )
 from torch_geometric.data import Data, Batch
 
@@ -128,6 +130,7 @@ class PIMGNTrainerEM:
         if hasattr(first_problem, "refresh_derived_quantities"):
             first_problem.refresh_derived_quantities()
         material_field = getattr(first_problem, "material_field", None)
+        mu_r_field = getattr(first_problem, "mu_r_field", None)
         sigma_field = getattr(first_problem, "sigma_field", None)
         current_density_field = getattr(first_problem, "current_density_field", None)
         dirichlet_vals = getattr(first_problem, "dirichlet_values_array", None)
@@ -138,6 +141,7 @@ class PIMGNTrainerEM:
         sample_data, aux = graph_creator.create_graph(
             A_current=None,
             material_node_field=material_field,
+            mu_r_node_field=mu_r_field,
             sigma_field=sigma_field,
             current_density_field=current_density_field,
             dirichlet_values=dirichlet_vals,
@@ -497,6 +501,7 @@ class PIMGNTrainerEM:
             data, aux = graph_creator.create_graph(
                 A_current=None,
                 material_node_field=getattr(problem, "material_field", None),
+                mu_r_node_field=getattr(problem, "mu_r_field", None),
                 sigma_field=getattr(problem, "sigma_field", None),
                 current_density_field=getattr(problem, "current_density_field", None),
                 dirichlet_values=getattr(problem, "dirichlet_values_array", None),
@@ -626,6 +631,7 @@ class PIMGNTrainerEM:
             problem.refresh_derived_quantities()
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
+        mu_r_field = getattr(problem, "mu_r_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
         current_density_field = getattr(problem, "current_density_field", None)
         kappa = getattr(problem, "kappa", None)
@@ -638,6 +644,7 @@ class PIMGNTrainerEM:
         data, aux = graph_creator.create_graph(
             A_current=None,
             material_node_field=material_field,
+            mu_r_node_field=mu_r_field,
             sigma_field=sigma_field,
             current_density_field=current_density_field,
             dirichlet_values=dirichlet_vals,
@@ -988,6 +995,7 @@ class PIMGNTrainerEM:
             problem.refresh_derived_quantities()
         dirichlet_vals = getattr(problem, "dirichlet_values_array", None)
         material_field = getattr(problem, "material_field", None)
+        mu_r_field = getattr(problem, "mu_r_field", None)
         sigma_field = getattr(problem, "sigma_field", None)
         current_density_field = getattr(problem, "current_density_field", None)
         kappa = getattr(problem, "kappa", None)
@@ -999,6 +1007,7 @@ class PIMGNTrainerEM:
             data, aux = graph_creator.create_graph(
                 A_current=None,
                 material_node_field=material_field,
+                mu_r_node_field=mu_r_field,
                 sigma_field=sigma_field,
                 current_density_field=current_density_field,
                 dirichlet_values=dirichlet_vals,
@@ -1372,26 +1381,41 @@ def train_pimgn_em_complex(resume_from: str = None):
     _run_single_problem_experiment(problem, config, "First order EM Complex")
 
 
-def train_pimgn_magnetostatics(resume_from: str = None):
-    problem = magnetostatic_problem_4()
+def train_pimgn_magnetostatics(resume_from: str = None, coils=1):
+    if coils == 1:
+        problem = magnetostatic_problem_4(winding_count=1)
+        save_dir = "results/physics_informed/magnetostatics_billet_1_rect_coil"
+    elif coils == 2:
+        problem = magnetostatic_problem_4(winding_count=2)
+        save_dir = "results/physics_informed/magnetostatics_billet_2_rect_coil"
+    else:
+        raise ValueError("Invalid number of coils. Must be 1 or 2.")
     config = {
-        "epochs": 5000,
+        "epochs": 20000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/magnetostatics_billet_2_rect_coil",
+        "save_dir": save_dir,
+        "enforce_axis_regularity": True,
         "data_weight": 0.0,
         "resume_from": resume_from,  # Path to checkpoint to resume from
     }
     _run_single_problem_experiment(problem, config, "Magnetostatics")
 
 
-def train_pimgn_eddy_current(resume_from: str = None):
-    problem = eddy_current_problem_2()
+def train_pimgn_eddy_current(resume_from: str = None, coils=1):
+    if coils == 1:
+        problem = eddy_current_problem_1()
+        save_dir = "results/physics_informed/eddy_current_problem_1_rect_coil"
+    elif coils == 2:
+        problem = eddy_current_problem_2()
+        save_dir = "results/physics_informed/eddy_current_problem_2_rect_coil"
+    else:
+        raise ValueError("Invalid number of coils. Must be 1 or 2.")
     config = {
-        "epochs": 20000,
+        "epochs": 5000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/eddy_current_problem_2_new_loss",
+        "save_dir": save_dir,
         "enforce_axis_regularity": True,
         "data_weight": 0.0,
         "resume_from": resume_from,  # Path to checkpoint to resume from
@@ -1489,6 +1513,133 @@ def train_on_different_meshes(resume_from: str = None):
         train_indices=list(range(len(problems))),
     )
 
+def train_different_mu_r(mu_r, resume_from: str = None):
+    problem = eddy_current_problem_different_mu_r(mu_r_workpiece=mu_r)
+    config = {
+        "epochs": 50000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": f"results/physics_informed/em_different_mu_r/mu_r_{mu_r}",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_single_problem_experiment(problem, config, f"EM Problem with mu_r={mu_r}")
+
+def train_different_mu_r_all(resume_from: str = None):
+    mu_r_values = [1, 10, 50, 100]
+    problems = [
+        eddy_current_problem_different_mu_r(mu_r_workpiece=mu_r) for mu_r in mu_r_values
+    ]
+    config = {
+        "epochs": 50000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": f"results/physics_informed/em_different_mu_r/all_mu_r",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "batch_size": 2,  # Number of problems per mini-batch
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_experiment(
+        problems,
+        config,
+        f"EM Problem with Different mu_r",
+        train_indices=list(range(len(problems))),
+    )
+
+
+def _sample_mu_r_sigma_latin_hypercube(
+    n_samples: int,
+    mu_r_bounds: tuple[float, float],
+    sigma_bounds: tuple[float, float],
+    seed: int | None = 42,
+    log_scale: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate LHS samples for physical mu_r and sigma_workpiece values."""
+    from scipy.stats import qmc
+
+    bounds = np.array([mu_r_bounds, sigma_bounds], dtype=np.float64)
+    if np.any(bounds[:, 0] <= 0.0) or np.any(bounds[:, 1] <= 0.0):
+        raise ValueError("mu_r_bounds and sigma_bounds must be positive.")
+
+    sampling_bounds = np.log10(bounds) if log_scale else bounds
+    sampler = qmc.LatinHypercube(d=2, seed=seed)
+    unit_samples = sampler.random(n=n_samples)
+    scaled_samples = qmc.scale(
+        unit_samples,
+        sampling_bounds[:, 0],
+        sampling_bounds[:, 1],
+    )
+    if log_scale:
+        scaled_samples = np.power(10.0, scaled_samples)
+
+    return scaled_samples[:, 0], scaled_samples[:, 1]
+
+
+def train_different_mu_r_and_sigma(resume_from: str = None):
+    mu_r_values = np.array([1, 10, 50, 100], dtype=np.float64)
+    sigma_values = np.array([1.3, 3, 6, 15], dtype=np.float64) * 1e6  # S/m
+    n_samples = 20
+    lhs_seed = 42
+    # mu_r_samples, sigma_samples = _sample_mu_r_sigma_latin_hypercube(
+    #     n_samples=n_samples,
+    #     mu_r_bounds=(float(mu_r_values.min()), float(mu_r_values.max())),
+    #     sigma_bounds=(float(sigma_values.min()), float(sigma_values.max())),
+    #     seed=lhs_seed,
+    #     log_scale=False,
+    # )
+    # parameter_samples = [
+    #     {
+    #         "sample_idx": idx,
+    #         "mu_r_workpiece": float(mu_r),
+    #         "sigma_workpiece": float(sigma),
+    #     }
+    #     for idx, (mu_r, sigma) in enumerate(zip(mu_r_samples, sigma_samples))
+    # ]
+    # print("Latin Hypercube training samples:")
+    # for sample in parameter_samples:
+    #     print(
+    #         f"  {sample['sample_idx']:02d}: "
+    #         f"mu_r={sample['mu_r_workpiece']:.6g}, "
+    #         f"sigma={sample['sigma_workpiece']:.6e} S/m"
+    #     )
+
+    parameter_samples_grid = np.array(np.meshgrid(mu_r_values, sigma_values)).T.reshape(-1, 2)
+    parameter_samples = [
+        {
+            "sample_idx": idx,
+            "mu_r_workpiece": float(mu_r),
+            "sigma_workpiece": float(sigma),
+        } for idx, (mu_r, sigma) in enumerate(parameter_samples_grid)
+    ]
+    problems = []
+    for sample in parameter_samples:
+        problem = eddy_current_problem_different_mu_r(
+            mu_r_workpiece=sample["mu_r_workpiece"],
+            sigma_workpiece=sample["sigma_workpiece"],
+        )
+        problem.problem_id = sample["sample_idx"]
+        problems.append(problem)
+
+    config = {
+        "epochs": 14000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/em_different_mu_r_sigma",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "batch_size": 2,  # Number of problems per mini-batch
+        # "lhs_seed": lhs_seed,
+        # "parameter_samples": parameter_samples,
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_experiment(
+        problems,
+        config,
+        "EM Problem with LHS mu_r and sigma",
+        train_indices=list(range(len(problems))),
+    )
 
 # def train_pimgn_em_mixed(resume_from: str = None):
 #     problem = create_em_mixed()
@@ -1545,10 +1696,18 @@ if __name__ == "__main__":
     # train_pimgn_em_complex()
     # train_pimgn_em_mixed()
     # train_pimgn_em_multi()
-    # train_pimgn_magnetostatics()
-    # train_pimgn_eddy_current(resume_from="results/physics_informed/eddy_current_problem_1_rect_coil/pimgn_trained_model.pth")
+    # train_pimgn_magnetostatics(coils=1, resume_from="results/physics_informed/magnetostatics_billet_1_rect_coil/pimgn_trained_model.pth")
+    # train_pimgn_magnetostatics(coils=2, resume_from="results/physics_informed/magnetostatics_billet_2_rect_coil/pimgn_trained_model.pth")
+    # train_pimgn_eddy_current(resume_from=None, coils=1)
+    # train_pimgn_eddy_current(resume_from=None, coils=2)
     # train_pimgn_eddy_current_different_currents()
     # train_on_different_meshes(resume_from="results/physics_informed/em_different_meshes/pimgn_trained_model.pth")
     # train_specific_eddy_current_problem(resume_from="results/physics_informed/eddy_current_problem_specific/pimgn_trained_model.pth")
     # train_team_36()
-    test_boundary_layers(resume_from="results/physics_informed/em_boundary_layer_test/pimgn_trained_model.pth")
+    # test_boundary_layers(resume_from="results/physics_informed/em_boundary_layer_test/pimgn_trained_model.pth")
+    # train_different_mu_r(mu_r=1, resume_from="results/physics_informed/em_different_mu_r/mu_r_1/pimgn_trained_model.pth")
+    # train_different_mu_r(mu_r=10, resume_from="results/physics_informed/em_different_mu_r/mu_r_10/pimgn_trained_model.pth")
+    # train_different_mu_r(mu_r=50, resume_from="results/physics_informed/em_different_mu_r/mu_r_50/pimgn_trained_model.pth")
+    # train_different_mu_r(mu_r=100)
+    # train_different_mu_r_all(resume_from=None)
+    train_different_mu_r_and_sigma(resume_from="results/physics_informed/em_different_mu_r_sigma/pimgn_trained_model.pth")

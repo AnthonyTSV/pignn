@@ -1505,44 +1505,46 @@ def previous_em():
     from containers import MeshProblemEM
     from graph_creator import GraphCreator
     from train_problems import create_em_problem, create_em_problem_complex
-    from em_magnetostatic_problems import magnetostatic_problem_3
+    from em_magnetostatic_problems import magnetostatic_problem_4
     from em_eddy_problems import (
         eddy_current_problem_temp_dependent_conductivity,
         eddy_current_problem_1,
+        eddy_current_problem_2,
+        eddy_current_problem_different_mu_r,
         eddy_current_problem_different_currents,
         eddy_current_problem_different_meshes,
         em_team_36_problem
     )
 
     # problem = eddy_current_problem_different_meshes(setting="very_fine")
-    problem = em_team_36_problem()
+    problem = magnetostatic_problem_4(winding_count=1)
 
     # Initialize FEM solver
     fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
 
-    gfA = fem_solver.solve(problem)
-    gfA = gfA * problem.A_star  # scale by A_star for better visualization and error metrics
+    gfA_hat = fem_solver.solve(problem)
+    gfA_phys = gfA_hat * problem.A_star
 
-    if np.iscomplexobj(gfA):
-        gfA_real = np.real(gfA)
-        gfA_imag = np.imag(gfA)
+    if np.iscomplexobj(gfA_hat):
+        gfA_real = np.real(gfA_hat)
+        gfA_imag = np.imag(gfA_hat)
         residual_int = fem_solver.compute_complex_residual(
             torch.tensor(gfA_real, dtype=torch.float64),
             torch.tensor(gfA_imag, dtype=torch.float64),
         )
         print(f"Complex energy residual: {residual_int.item()}")
     else:
-        residual_int = fem_solver.compute_energy_loss(gfA)
+        residual_int = fem_solver.compute_energy_loss(gfA_hat)
         print(f"Energy residual: {residual_int.item()}")
 
-        residual = fem_solver.compute_residual(gfA)
+        residual = fem_solver.compute_residual(gfA_hat)
         residuals_abs = np.absolute(residual.cpu().numpy())
         print(f"Mean residual: {np.mean(residuals_abs)}")
 
     fem_solver.export_to_vtk_complex(
-        gfA,
-        gfA,
-        filename="results/fem_tests_em/vtk/team_36_problem",
+        gfA_phys,
+        gfA_phys,
+        filename="results/fem_tests_em/vtk/magnetostatic_problem_4",
     )
 
 

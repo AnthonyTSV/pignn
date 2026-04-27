@@ -314,6 +314,7 @@ def _build_node_features(
     node_types: torch.Tensor,
     pos: torch.Tensor,
     material_field: Optional[np.ndarray],
+    mu_r_field: Optional[np.ndarray],
     sigma_field: Optional[np.ndarray],
     current_density_field: Optional[np.ndarray],
     dirichlet_values: Optional[np.ndarray],
@@ -335,7 +336,7 @@ def _build_node_features(
     node_type_onehot[torch.arange(n_nodes, device=device), node_types] = 1.0
     features.append(node_type_onehot)
 
-    # Material field
+    # Material/category field
     if material_field is not None:
         mat_tensor = torch.tensor(
             material_field, dtype=torch.float32, device=device
@@ -343,6 +344,15 @@ def _build_node_features(
     else:
         mat_tensor = torch.ones(n_nodes, 1, device=device)  # Default material
     features.append(mat_tensor)
+
+    # Relative permeability field
+    if mu_r_field is not None:
+        mu_r_tensor = torch.tensor(
+            mu_r_field, dtype=torch.float32, device=device
+        ).unsqueeze(1)
+    else:
+        mu_r_tensor = torch.ones(n_nodes, 1, device=device)
+    features.append(mu_r_tensor)
 
     # Dirichlet boundary values (prescribed values for Dirichlet BC)
     if dirichlet_values is not None:
@@ -424,8 +434,8 @@ def _build_global_features(
         current = 0.0
 
     import math
-    omega_scaled = math.log1p(omega * 1e4)    # log1p(~0.77..1.93) → O(1)
-    current_scaled = math.log1p(current * 1e2)  # log1p(~0.55..1.37) → O(1)
+    omega_scaled = math.log1p(omega * 1e4)    # log1p(~0.77..1.93) -> O(1)
+    current_scaled = math.log1p(current * 1e2)  # log1p(~0.55..1.37) -> O(1)
 
     global_features = torch.tensor(
         [omega_scaled, current_scaled], dtype=torch.float32, device=device
@@ -490,6 +500,7 @@ class GraphCreatorEM:
         A_current: Optional[np.ndarray] = None,
         current: Optional[float] = None,
         material_node_field: Optional[np.ndarray] = None,
+        mu_r_node_field: Optional[np.ndarray] = None,
         sigma_field: Optional[np.ndarray] = None,
         current_density_field: Optional[np.ndarray] = None,
         dirichlet_values: Optional[np.ndarray] = None,
@@ -536,6 +547,7 @@ class GraphCreatorEM:
             node_types,
             pos_tensor,
             material_node_field,
+            mu_r_node_field,
             sigma_field,
             current_density_field,
             dirichlet_values,

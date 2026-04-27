@@ -223,6 +223,9 @@ class MeshGraphNet(nn.Module):
         if self.complex_em or self.mixed_em:
             return
 
+        if not self.use_cnn: # thermal
+            return
+
         final = self.output_head[-1] if isinstance(self.output_head, nn.Sequential) else self.output_head
         nn.init.normal_(final.weight, mean=0.0, std=1e-4)
         nn.init.zeros_(final.bias)

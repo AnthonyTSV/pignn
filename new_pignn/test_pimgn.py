@@ -427,7 +427,8 @@ def _run_multiple_problem_experiment(
 
     print("\nEvaluating trained PIMGN...")
     last_residuals = trainer.last_residuals
-    pos_data = trainer.problems[0].graph_data.pos.numpy()
+    eval_problem_idx = val_indices[0]
+    pos_data = trainer.problems[eval_problem_idx].graph_data.pos.numpy()
     predictions, ground_truth, errors = trainer.evaluate_with_ground_truth(
         problem_indices=val_indices
     )
@@ -448,16 +449,17 @@ def _run_multiple_problem_experiment(
     min_length = min(
         len(ground_truth[0]), len(predictions[0]), len(time_config.time_steps_export)
     )
-    trainer.all_fem_solvers[0].export_to_vtk(
+    trainer.all_fem_solvers[eval_problem_idx].export_to_vtk(
         ground_truth[0][:min_length],
         predictions[0][:min_length],
         time_config.time_steps_export[:min_length],
         filename=f"{save_dir}/vtk/result",
-        material_field=getattr(trainer.problems[0], "material_field", None),
+        material_field=getattr(trainer.problems[eval_problem_idx], "material_field", None),
     )
 
     model_path = f"{save_dir}/pimgn_trained_model.pth"
-    torch.save(trainer.model.state_dict(), model_path)
+    final_epoch = trainer.config["epochs"] - 1
+    trainer.save_checkpoint(model_path, epoch=final_epoch)
     print(f"Trained model saved to: {model_path}")
 
 
@@ -610,16 +612,17 @@ def train_ih_team_36_problem(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, problem.time_config, config, "Team 36 induction heating problem")
 
-def test_boundary_layer_mesh():
+def test_boundary_layer_mesh(resume_from: str = None):
     from thermal_problems import test_boundary_layer
     problem = test_boundary_layer()
     config = {
-        "epochs": 2000,
+        "epochs": 500,
         "lr": 1e-3,
         "time_window": 20,
         "noise_sigma": 1e-1,
         "generate_ground_truth_for_validation": True,
         "save_dir": "results/physics_informed/thermal_boundary_layer_test",
+        "resume_from": resume_from,
     }
     _run_single_problem_experiment(problem, problem.time_config, config, "Boundary layer mesh test problem")
 
@@ -645,7 +648,31 @@ def train_ih_generalization_problem():
     }
     _run_multiple_problem_experiment(problems, problems[0].time_config, config, "Induction heating generalization problem")
 
+def train_ih_mu_r_sigma(resume_from: str = None):
+    from thermal_problems import create_ih_problem_mu_r_sigma
+    mu_r_values = np.array([1, 10, 50, 100], dtype=np.float64)
+    sigma_values = np.array([1.3, 3, 6, 15], dtype=np.float64) * 1e6  # S/m
+    problems = []
+    for mu_r in mu_r_values:
+        for sigma in sigma_values:
+            problem = create_ih_problem_mu_r_sigma(mu_r=mu_r, sigma=sigma)
+            problems.append(problem)
+    
+    # add validation problem 
+    problems.append(create_ih_problem_mu_r_sigma(mu_r=25, sigma=4e6))
+    config = {
+        "epochs": 1000,
+        "lr": 1e-3,
+        "time_window": 20,
+        "noise_sigma": 1e-1,
+        "batch_size": 2,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/thermal_ih_mu_r_sigma",
+        "resume_from": resume_from,
+    }
+    _run_multiple_problem_experiment(problems, problems[0].time_config, config, "Induction heating mu_r and sigma generalization problem")
+
 if __name__ == "__main__":
     # train_ih_problem()
-    train_ih_team_36_problem()
-    # test_boundary_layer_mesh()
+    # train_ih_team_36_problem()
+    train_ih_mu_r_sigma()

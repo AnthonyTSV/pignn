@@ -9,6 +9,7 @@ try:
         create_lshape_mesh,
         create_gaussian_initial_condition,
         create_ih_mesh,
+        get_fixed_skin_layer_thicknesses
     )
     from graph_creator_em import GraphCreatorEM
     from containers import (
@@ -41,6 +42,7 @@ except ImportError:
         create_lshape_mesh,
         create_gaussian_initial_condition,
         create_ih_mesh,
+        get_fixed_skin_layer_thicknesses
     )
     from .graph_creator_em import GraphCreatorEM
     from .containers import (
@@ -68,6 +70,7 @@ except ImportError:
         RectangularInductorParams,
     )
 
+mm = 1e-3
 
 class GenericEddyCurrentProblem:
     def __init__(
@@ -144,25 +147,23 @@ class GenericEddyCurrentProblem:
             problem.sigma_workpiece = (
                 self.material_properties["mat_workpiece"].sigma / problem.sigma_star
             )
+            problem.mu_r_workpiece = self.material_properties["mat_workpiece"].mu
         else:
             problem.sigma_workpiece = (
                 6289308 / problem.sigma_star
             )  # Default value (nondimensionalized)
+            problem.mu_r_workpiece = 100
         problem.sigma_air = 0
         problem.sigma_coil = 0
-
-        # Create material fields (mu_r at each node) based on material subdomain
-        n_nodes = temp_data.pos.shape[0]
-        mu_r_field = np.ones(n_nodes, dtype=np.float64)  # Default to air (mu_r = 1)
-        current_density = np.zeros(n_nodes, dtype=np.float64)
 
         # Calculate current density in the coil: J = N * I / A_coil
         Js_phi = problem.N_turns * problem.I_coil / problem.area_coil
         Js_phi = Js_phi / problem.J_star  # Keep graph features consistent with FEM RHS
 
-        # Material property mapping (mu_r values)
+        # Material region codes and physical fields used as graph inputs.
         n_nodes = temp_data.pos.shape[0]
-        mu_r_field = np.ones(n_nodes, dtype=np.float64)  # Default to air (mu_r = 1)
+        material_code_field = np.zeros(n_nodes, dtype=np.float64)  # Default to air
+        mu_r_field = np.ones(n_nodes, dtype=np.float64)  # Default to air/coil
         sigma_field = np.zeros(n_nodes, dtype=np.float64)  # Default to 0 conductivity
         current_density = np.zeros(n_nodes, dtype=np.float64)
 
@@ -170,6 +171,11 @@ class GenericEddyCurrentProblem:
             "mat_workpiece": 2,
             "mat_air": 0,
             "mat_coil": 1,
+        }
+        mu_r_map = {
+            "mat_workpiece": problem.mu_r_workpiece,
+            "mat_air": problem.mu_r_air,
+            "mat_coil": problem.mu_r_coil,
         }
 
         # Identify nodes in each material region and assign properties
@@ -183,9 +189,10 @@ class GenericEddyCurrentProblem:
             for v in vertices:
                 node_idx = v.nr - 1 if hasattr(v, "nr") else int(v) - 1
                 if 0 <= node_idx < n_nodes:
-                    mu_r_field[node_idx] = material_encode[mat_name]
+                    material_code_field[node_idx] = material_encode[mat_name]
+                    mu_r_field[node_idx] = np.log10(mu_r_map[mat_name])
                     if mat_name == "mat_workpiece":
-                        sigma_field[node_idx] = problem.sigma_workpiece
+                        sigma_field[node_idx] = np.log10(problem.sigma_workpiece)
                     elif mat_name == "mat_coil":
                         current_density[node_idx] = Js_phi
 
@@ -195,12 +202,13 @@ class GenericEddyCurrentProblem:
             sigma_nodal_nd = (
                 np.asarray(self.sigma_nodal, dtype=np.float64) / problem.sigma_star
             )
-            # Only overwrite workpiece nodes (material_encode == 2)
-            wp_mask = mu_r_field == material_encode["mat_workpiece"]
+            # Only overwrite workpiece nodes.
+            wp_mask = material_code_field == material_encode["mat_workpiece"]
             sigma_field[wp_mask] = sigma_nodal_nd[wp_mask]
             problem.sigma_nodal = sigma_nodal_nd  # per-node for FEM assembly
 
-        problem.material_field = mu_r_field
+        problem.material_field = material_code_field
+        problem.mu_r_field = mu_r_field
         problem.sigma_field = sigma_field
         problem.current_density_field = current_density
 
@@ -216,18 +224,24 @@ def eddy_current_problem_1(mesh=None):
             profile_width=0.007,
             profile_height=0.007,
         )
-        kw = dict(h_workpiece=1e-3, h_air=60e-3, h_coil=1e-3)
+        kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=2e-3)
         builder = IHGeometryAndMesh(wp, ind, **kw)
         mesh = builder.generate()
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
 
+    material_properties = {
+        "mat_workpiece": MaterialPropertiesEM(mu=1.0, sigma=6289308),
+        "mat_air": MaterialPropertiesEM(mu=1.0, sigma=0),
+        "mat_coil": MaterialPropertiesEM(mu=1.0, sigma=0),
+    }
+
     problem_generator = GenericEddyCurrentProblem(
-        mesh, dirichlet_boundaries, dirichlet_boundaries_dict, A_star=4.8e-3
+        mesh, dirichlet_boundaries, dirichlet_boundaries_dict, material_properties, A_star=1.3e-3
     )
 
-    problem = problem_generator.get_problem(current=10000)
+    problem = problem_generator.get_problem(current=3000, frequency=3000)
 
     return problem
 
@@ -242,18 +256,24 @@ def eddy_current_problem_2():
         profile_width=0.007,
         profile_height=0.007,
     )
-    kw = dict(h_workpiece=1e-3, h_air=60e-3, h_coil=1e-3)
+    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=2e-3)
     builder = IHGeometryAndMesh(wp, ind, **kw)
     mesh = builder.generate()
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
+    
+    material_properties = {
+        "mat_workpiece": MaterialPropertiesEM(mu=1.0, sigma=6289308),
+        "mat_air": MaterialPropertiesEM(mu=1.0, sigma=0),
+        "mat_coil": MaterialPropertiesEM(mu=1.0, sigma=0),
+    }
 
     problem_generator = GenericEddyCurrentProblem(
-        mesh, dirichlet_boundaries, dirichlet_boundaries_dict, A_star=4.8e-3
+        mesh, dirichlet_boundaries, dirichlet_boundaries_dict, material_properties, A_star=1.5e-3
     )
 
-    problem = problem_generator.get_problem()
+    problem = problem_generator.get_problem(current=3000, frequency=3000)
 
     return problem
 
@@ -285,6 +305,53 @@ def eddy_current_problem_different_currents(
 
     return problem
 
+def eddy_current_problem_different_mu_r(mu_r_workpiece=100.0, sigma_workpiece=6289308):
+
+    # skin_depth = 1 / np.sqrt(np.pi * mu_r_workpiece * 4 * 3.1415926535e-7 * sigma_workpiece * 3000)
+    # print(f"Calculated skin depth for mu_r={mu_r_workpiece}: {skin_depth:.6e} m")
+    
+    thicknesses = get_fixed_skin_layer_thicknesses(frequency=3000, mu_r=mu_r_workpiece, sigma=sigma_workpiece)
+
+    wp = BilletParams(diameter=0.030, height=0.070)
+    ind = RectangularInductorParams(
+        coil_inner_diameter=0.050,
+        coil_height=0.040,
+        winding_count=3,
+        profile_width=0.007,
+        profile_height=0.007,
+    )
+    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3, workpiece_boundary_layer_thicknesses=thicknesses)
+    builder = IHGeometryAndMesh(wp, ind, **kw)
+    mesh = builder.generate()
+
+    dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
+    dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
+
+    material_properties = {
+        "mat_workpiece": MaterialPropertiesEM(mu=mu_r_workpiece, sigma=sigma_workpiece),
+        "mat_air": MaterialPropertiesEM(mu=1.0, sigma=0),
+        "mat_coil": MaterialPropertiesEM(mu=1.0, sigma=0),
+    }
+
+    # thickness_coil = 1 * mm
+    # full_coil_area = 7 * mm * 7 * mm
+    # hollow_coil_area = (7 - 2 * thickness_coil) * (7 - 2 * thickness_coil) * mm * mm
+    # area_coil = (full_coil_area - hollow_coil_area) * 3
+    area_coil = ind.profile_width * ind.profile_height
+    print(f"Coil area used for current density calculation: {area_coil:.6e} m^2")
+
+    problem_generator = GenericEddyCurrentProblem(
+        mesh,
+        dirichlet_boundaries,
+        dirichlet_boundaries_dict,
+        material_properties=material_properties,
+        A_star=3.4e-3,
+        coil_area=area_coil,
+    )
+
+    problem = problem_generator.get_problem(current=3000, frequency=3000)
+
+    return problem
 
 def eddy_current_problem_different_meshes(setting="default"):
 
