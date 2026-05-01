@@ -40,16 +40,16 @@ except ImportError:
 
 
 class GenericMagnetostaticProblem:
-    def __init__(self, mesh, dirichlet_boundaries, dirichlet_boundaries_dict):
+    def __init__(self, mesh, dirichlet_boundaries, dirichlet_boundaries_dict, A_star=4.8e-4):
         self.r_star = 70 * 1e-3  # m
-        self.A_star = 4.8 * 1e-4  # Wb
+        self.A_star = A_star  # Wb
         self.mu_star = 4 * 3.1415926535e-7  # H/m
         self.J_star = self.A_star / (self.r_star**2 * self.mu_star)
         self.mesh = mesh
         self.dirichlet_boundaries = dirichlet_boundaries
         self.dirichlet_boundaries_dict = dirichlet_boundaries_dict
 
-    def get_problem(self):
+    def get_problem(self, current=3000):
         mesh_config = MeshConfig(
             maxh=1,
             order=1,
@@ -89,6 +89,16 @@ class GenericMagnetostaticProblem:
         problem.sigma_air = 0
         problem.sigma_coil = 0
 
+        problem.mu_r_workpiece = 100
+        problem.mu_r_air = 1
+        problem.mu_r_coil = 1
+
+        problem.I_coil = current
+        problem.r_star = self.r_star
+        problem.mu_star = self.mu_star
+        problem.A_star = self.A_star
+        problem.refresh_derived_quantities()
+
         # Create material fields (mu_r at each node) based on material subdomain
         n_nodes = temp_data.pos.shape[0]
         mu_r_field = np.ones(n_nodes, dtype=np.float64)  # Default to air (mu_r = 1)
@@ -97,7 +107,7 @@ class GenericMagnetostaticProblem:
         # Calculate current density in the coil: J = N * I / A_coil
         Acoil = problem.profile_width_phys * problem.profile_height_phys
         Js_phi = problem.N_turns * problem.I_coil / Acoil
-        Js_phi = Js_phi / self.J_star  # Normalize current density
+        Js_phi = Js_phi / problem.J_star  # Normalize current density
 
         # Material property mapping (mu_r values)
         mu_r_map = {
@@ -204,21 +214,26 @@ def magnetostatic_problem_3():
 
     return problem
 
-def magnetostatic_problem_4():
+def magnetostatic_problem_4(winding_count=1):
     wp = BilletParams(diameter=0.030, height=0.070)
     ind = RectangularInductorParams(
-        coil_inner_diameter=0.050, coil_height=0.040,
-        winding_count=2, profile_width=0.007, profile_height=0.007
+        coil_inner_diameter=0.050,
+        coil_height=0.040,
+        winding_count=winding_count,
+        profile_width=0.007,
+        profile_height=0.007,
     )
-    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3)
+    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=2e-3)
     builder = IHGeometryAndMesh(wp, ind, **kw)
     mesh = builder.generate()
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
 
+    A_star = 3.4e-3 if winding_count == 1 else 5.1e-3
+
     problem_generator = GenericMagnetostaticProblem(
-        mesh, dirichlet_boundaries, dirichlet_boundaries_dict
+        mesh, dirichlet_boundaries, dirichlet_boundaries_dict, A_star=A_star
     )
 
     problem = problem_generator.get_problem()

@@ -584,17 +584,17 @@ def train_temp_dependent_material_problem(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, problem.time_config, config, "Temperature-dependent material thermal problem")
 
-def train_ih_problem():
+def train_ih_problem(resume_from: str = None):
     from thermal_problems import create_ih_problem
-    problem = create_ih_problem(frequency=3000, current=3000, combined_bc=False, time_end=3.0, dt=0.05)
+    problem = create_ih_problem()
     config = {
-        "epochs": 2000,
+        "epochs": 5000,
         "lr": 1e-3,
         "time_window": 20,
         "noise_sigma": 1e-1,
         "generate_ground_truth_for_validation": True,
         "save_dir": "results/physics_informed/thermal_ih_problem",
-        "resume_from": None,
+        "resume_from": resume_from,
     }
     _run_single_problem_experiment(problem, problem.time_config, config, "Induction heating thermal problem")
 
@@ -673,6 +673,6 @@ def train_ih_mu_r_sigma(resume_from: str = None):
     _run_multiple_problem_experiment(problems, problems[0].time_config, config, "Induction heating mu_r and sigma generalization problem")
 
 if __name__ == "__main__":
-    # train_ih_problem()
+    train_ih_problem(resume_from="results/physics_informed/thermal_ih_problem/pimgn_trained_model.pth")
     # train_ih_team_36_problem()
-    train_ih_mu_r_sigma()
+    # train_ih_mu_r_sigma()

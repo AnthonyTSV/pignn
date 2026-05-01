@@ -305,7 +305,7 @@ def eddy_current_problem_different_currents(
 
     return problem
 
-def eddy_current_problem_different_mu_r(mu_r_workpiece=100.0, sigma_workpiece=6289308):
+def eddy_current_problem_different_mu_r(mu_r_workpiece=100.0, sigma_workpiece=6289308, a_star=3.4e-3):
 
     # skin_depth = 1 / np.sqrt(np.pi * mu_r_workpiece * 4 * 3.1415926535e-7 * sigma_workpiece * 3000)
     # print(f"Calculated skin depth for mu_r={mu_r_workpiece}: {skin_depth:.6e} m")
@@ -345,7 +345,7 @@ def eddy_current_problem_different_mu_r(mu_r_workpiece=100.0, sigma_workpiece=62
         dirichlet_boundaries,
         dirichlet_boundaries_dict,
         material_properties=material_properties,
-        A_star=3.4e-3,
+        A_star=a_star,
         coil_area=area_coil,
     )
 
@@ -488,6 +488,110 @@ def test_boundary_layer():
 
     return problem
 
+def em_different_geometries(winding_count=1, diameter=30*mm, height=70*mm, coil_inner_diameter=50*mm):
+    sigma_workpiece = 6289308
+    mu_r_workpiece = 1
+    thicknesses = get_fixed_skin_layer_thicknesses(frequency=3000, mu_r=mu_r_workpiece, sigma=sigma_workpiece)
+
+    wp = BilletParams(diameter=diameter, height=height)
+    ind = RectangularInductorParams(
+        coil_inner_diameter=coil_inner_diameter,
+        coil_height=0.040,
+        winding_count=winding_count,
+        profile_width=0.007,
+        profile_height=0.007,
+    )
+    kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3, workpiece_boundary_layer_thicknesses=thicknesses)
+    builder = IHGeometryAndMesh(wp, ind, **kw)
+    mesh = builder.generate()
+
+    dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
+    dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
+
+    material_properties = {
+        "mat_workpiece": MaterialPropertiesEM(mu=mu_r_workpiece, sigma=sigma_workpiece),
+        "mat_air": MaterialPropertiesEM(mu=1.0, sigma=0),
+        "mat_coil": MaterialPropertiesEM(mu=1.0, sigma=0),
+    }
+
+    problem_generator = GenericEddyCurrentProblem(
+        mesh,
+        dirichlet_boundaries,
+        dirichlet_boundaries_dict,
+        material_properties=material_properties,
+        A_star=3.4e-3,
+        coil_area=ind.profile_width * ind.profile_height,
+    )
+
+    problem = problem_generator.get_problem(current=3000, frequency=3000)
+
+    return problem
+
+def em_himmelwerk():
+    from gmsh_reader import ReadGmsh
+    # path_to_geom = "results/from_cad.step"
+    # geo = netgen.occ.OCCGeometry(path_to_geom)
+    # cad_to_model = 1e-3
+    # shape = geo.shape.Scale((0, 0, 0), cad_to_model)
+    coil_thickness = 1 * mm
+    inner_radius = 15 * mm
+    outer_radius = inner_radius + coil_thickness
+    coil_area = np.pi * (outer_radius**2 - inner_radius**2)
+    print(f"coil_area: {coil_area:.6e} m^2")
+    # mesh = ng.Mesh(geo.GenerateMesh(maxh=1))
+    path_to_mesh = "results/calcMesh.msh"
+    ngmesh = ReadGmsh(path_to_mesh)
+
+    face_to_material = {
+        "Face_1": "mat_air",
+        "Face_2": "mat_workpiece",
+        "Face_3": "mat_coil",
+        "Face_4": "mat_coil",
+        "Face_5": "mat_coil",
+        "Face_6": "mat_coil",
+        "Face_7": "mat_coil",
+        "Face_8": "mat_coil",
+        "Face_9": "mat_coil",
+        "Face_10": "mat_coil",
+    }
+
+    old_materials = [ngmesh.GetMaterial(i) for i in range(1, 1 + len(face_to_material))]
+    for domain_idx, old_name in enumerate(old_materials, start=1):
+        ngmesh.SetMaterial(domain_idx, face_to_material[old_name])
+
+    mesh = ng.Mesh(ngmesh)
+    print(mesh.GetMaterials())
+    print("dim   =", mesh.dim)
+    print("BND   =", mesh.GetBoundaries())
+
+    # import netgen.gui
+    # from ngsolve import Draw, VOL
+    # mesh_cf = mesh.RegionCF(VOL, {"mat_workpiece": 2, "mat_air": 0, "mat_coil": 1})
+    # Draw(mesh_cf, mesh, "region")
+    # input()
+
+    dirichlet_boundaries = ["Edge_1", "Edge_2", "Edge_3", "Edge_4", "Edge_59", "Edge_60", "Edge_61", "Edge_62", "Edge_63", "Edge_64", "Edge_65"]
+    dirichlet_boundaries_dict = {name : 0 for name in dirichlet_boundaries}
+
+    material_properties = {
+        "mat_workpiece": MaterialPropertiesEM(mu=1, sigma=58823529),
+        "mat_air": MaterialPropertiesEM(mu=1, sigma=0),
+        "mat_coil": MaterialPropertiesEM(mu=1, sigma=0),
+    }
+
+    problem_generator = GenericEddyCurrentProblem(
+        mesh,
+        dirichlet_boundaries,
+        dirichlet_boundaries_dict,
+        material_properties=material_properties,
+        A_star=3.4e-3,
+        coil_area=coil_area,
+    )
+
+    problem = problem_generator.get_problem(current=850, frequency=400000)
+
+    return problem
+
 def eddy_current_problem_temp_dependent_conductivity():
     """
     Not finished!
@@ -596,3 +700,6 @@ def eddy_current_problem_temp_dependent_conductivity():
     problem = problem_generator.get_problem(current=10000)
 
     return problem
+
+if __name__ == "__main__":
+    problem = em_himmelwerk()

@@ -978,7 +978,7 @@ if __name__ == "__main__":
         ih_team_36_problem
     )
 
-    problem = ih_team_36_problem()
+    problem = create_ih_problem()
 
     # Initialize FEM solver
     fem_solver = FEMSolver(problem.mesh, order=1, problem=problem)

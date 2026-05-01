@@ -1513,11 +1513,14 @@ def previous_em():
         eddy_current_problem_different_mu_r,
         eddy_current_problem_different_currents,
         eddy_current_problem_different_meshes,
-        em_team_36_problem
+        em_different_geometries,
+        em_team_36_problem,
+        em_himmelwerk
     )
 
     # problem = eddy_current_problem_different_meshes(setting="very_fine")
-    problem = magnetostatic_problem_4(winding_count=1)
+    # problem = em_different_geometries(diameter=60e-3, height=70e-3, coil_inner_diameter=80e-3)
+    problem = eddy_current_problem_different_mu_r(mu_r_workpiece=1, sigma_workpiece=37037037)
 
     # Initialize FEM solver
     fem_solver = FEMSolverEM(problem.mesh, order=1, problem=problem)
@@ -1544,7 +1547,7 @@ def previous_em():
     fem_solver.export_to_vtk_complex(
         gfA_phys,
         gfA_phys,
-        filename="results/fem_tests_em/vtk/magnetostatic_problem_4",
+        filename="results/fem_tests_em/vtk/eddy_current_aluminum_mu_r1_sigma37037037",
     )
 
 

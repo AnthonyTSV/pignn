@@ -231,6 +231,8 @@ class PIMGNTrainerEM:
         # Load checkpoint if resuming training
         self.start_epoch = 0
         resume_from = config.get("resume_from", None)
+        require_checkpoint = bool(config.get("require_checkpoint", False))
+        strict_checkpoint = bool(config.get("strict_checkpoint", False))
         if resume_from and os.path.exists(resume_from):
             print(f"Resuming training from checkpoint: {resume_from}")
             # PyTorch 2.6 changed the default `weights_only` of torch.load from False -> True.
@@ -254,6 +256,11 @@ class PIMGNTrainerEM:
                     self.val_losses = checkpoint.get("val_losses", [])
                     print(f"Resumed from epoch {self.start_epoch}")
                 except RuntimeError as exc:
+                    if strict_checkpoint:
+                        raise RuntimeError(
+                            "Checkpoint architecture is incompatible with the "
+                            "current EM model/graph schema."
+                        ) from exc
                     print(
                         "Checkpoint architecture differs from the current model; "
                         "loading only compatible model weights and resetting optimizer state."
@@ -272,6 +279,11 @@ class PIMGNTrainerEM:
                     self.model.load_state_dict(checkpoint)
                     print("Loaded model weights only (no optimizer state)")
                 except RuntimeError as exc:
+                    if strict_checkpoint:
+                        raise RuntimeError(
+                            "Checkpoint architecture is incompatible with the "
+                            "current EM model/graph schema."
+                        ) from exc
                     print(
                         "Checkpoint architecture differs from the current model; "
                         "loading only compatible model weights."
@@ -284,6 +296,11 @@ class PIMGNTrainerEM:
                         print(f"Skipped incompatible checkpoint keys: {skipped}")
                     if missing:
                         print(f"Model parameters left at initialization: {missing}")
+        elif resume_from:
+            message = f"Resume checkpoint not found: {resume_from}"
+            if require_checkpoint:
+                raise FileNotFoundError(message)
+            print(f"{message}. Training will start from epoch 0.")
 
         # Generate ground truth for validation
         if config.get("generate_ground_truth_for_validation", False):
@@ -1391,7 +1408,7 @@ def train_pimgn_magnetostatics(resume_from: str = None, coils=1):
     else:
         raise ValueError("Invalid number of coils. Must be 1 or 2.")
     config = {
-        "epochs": 20000,
+        "epochs": 50000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
         "save_dir": save_dir,
@@ -1449,19 +1466,6 @@ def train_pimgn_eddy_current_different_currents(resume_from: str = None):
         "Eddy Current with Different Currents",
         train_indices=list(range(len(problems))),
     )
-
-def train_specific_eddy_current_problem(resume_from: str = None):
-    problem = eddy_current_problem_different_currents(current=3000, frequency=3000)
-    config = {
-        "epochs": 20000,
-        "lr": 1e-3,
-        "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/eddy_current_problem_specific",
-        "enforce_axis_regularity": True,
-        "data_weight": 0.0,
-        "resume_from": resume_from,  # Path to checkpoint to resume from
-    }
-    _run_single_problem_experiment(problem, config, f"Eddy Current (Current: 3000, Frequency: 3000)")
 
 def train_team_36(resume_from: str = None):
     problem = em_team_36_problem()
@@ -1548,6 +1552,18 @@ def train_different_mu_r_all(resume_from: str = None):
         train_indices=list(range(len(problems))),
     )
 
+def train_em_aluminum(resume_from: str = None):
+    problem = eddy_current_problem_different_mu_r(mu_r_workpiece=1, sigma_workpiece=37037037, a_star=2e-3)
+    config = {
+        "epochs": 20000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": f"results/physics_informed/em_aluminum",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_single_problem_experiment(problem, config, f"EM Problem with Aluminum")
 
 def _sample_mu_r_sigma_latin_hypercube(
     n_samples: int,
@@ -1702,7 +1718,6 @@ if __name__ == "__main__":
     # train_pimgn_eddy_current(resume_from=None, coils=2)
     # train_pimgn_eddy_current_different_currents()
     # train_on_different_meshes(resume_from="results/physics_informed/em_different_meshes/pimgn_trained_model.pth")
-    # train_specific_eddy_current_problem(resume_from="results/physics_informed/eddy_current_problem_specific/pimgn_trained_model.pth")
     # train_team_36()
     # test_boundary_layers(resume_from="results/physics_informed/em_boundary_layer_test/pimgn_trained_model.pth")
     # train_different_mu_r(mu_r=1, resume_from="results/physics_informed/em_different_mu_r/mu_r_1/pimgn_trained_model.pth")
@@ -1710,4 +1725,5 @@ if __name__ == "__main__":
     # train_different_mu_r(mu_r=50, resume_from="results/physics_informed/em_different_mu_r/mu_r_50/pimgn_trained_model.pth")
     # train_different_mu_r(mu_r=100)
     # train_different_mu_r_all(resume_from=None)
-    train_different_mu_r_and_sigma(resume_from="results/physics_informed/em_different_mu_r_sigma/pimgn_trained_model.pth")
+    # train_different_mu_r_and_sigma(resume_from="results/physics_informed/em_different_mu_r_sigma/pimgn_trained_model.pth")
+    train_em_aluminum()

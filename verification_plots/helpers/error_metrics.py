@@ -7,6 +7,12 @@ def compute_relative_error(exact_field: np.ndarray, predicted_field: np.ndarray)
     \frac{\left\|u_{\mathrm{pred}}(\cdot, t_i) - u_{\mathrm{ref}}(\cdot, t_i)\right\|_{L^2(\Omega)}}
     {\left\|u_{\mathrm{ref}}(\cdot, t_i)\right\|_{L^2(\Omega)} + \epsilon} \times 100\%
     """
+
+    if isinstance(predicted_field, list):
+        predicted_field = np.array(predicted_field)
+    if isinstance(exact_field, list):
+        exact_field = np.array(exact_field)
+
     # Compute the absolute error
     abs_err = np.abs(predicted_field - exact_field)
 

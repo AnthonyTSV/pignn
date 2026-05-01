@@ -614,47 +614,21 @@ def get_source_function(mesh, heat_source, n_nodes):
                     source_function[node_idx] = q_val
     return source_function
 
-def create_ih_problem(frequency=2000, current=1000, combined_bc=True, time_end=1.0, dt=0.01):
-    wp = BilletParams(diameter=0.030, height=0.070)
-    ind = RectangularInductorParams(
-        coil_inner_diameter=0.050,
-        coil_height=0.040,
-        winding_count=1,
-        profile_width=0.007,
-        profile_height=0.007,
-    )
-    kw = dict(h_workpiece=1e-3, h_air=60e-3, h_coil=1e-3)
-    builder = IHGeometryAndMesh(wp, ind, **kw)
-    mesh = builder.generate()
+def create_ih_problem():
     material_properties = MaterialPropertiesHeat(
-        rho=7870,
-        cp=461,
-        k=86,
+        rho=2700,
+        cp=933.3,
+        k=211,
     )
-    if combined_bc:
-        boundary_conditions = {
-            "bc_workpiece_top": CombinedBC(value={
-                "convection": (10, 20),
-                "radiation": (0.8, 20),
-            }),
-            "bc_workpiece_right": CombinedBC(value={
-                "convection": (10, 20),
-                "radiation": (0.8, 20),
-            }),
-            "bc_workpiece_bottom": CombinedBC(value={
-                "convection": (10, 20),
-                "radiation": (0.8, 20),
-            }),
-        }
-    else:
-        boundary_conditions = {
-            "bc_workpiece_top": ConvectionBC(value=(10, 20)),
-            "bc_workpiece_right": ConvectionBC(value=(10, 20)),
-            "bc_workpiece_bottom": ConvectionBC(value=(10, 20)),
-        }
+    boundary_conditions = {
+        "bc_workpiece_top": ConvectionBC(value=(10, 20)),
+        "bc_workpiece_right": ConvectionBC(value=(10, 20)),
+        "bc_workpiece_bottom": ConvectionBC(value=(10, 20)),
+    }
 
-    em_problem = eddy_current_problem_different_currents(mesh, frequency=frequency, current=current)
-    fem_solver = FEMSolverEM(em_problem.mesh, order=1, problem=em_problem)
+    em_problem = eddy_current_problem_different_mu_r(mu_r_workpiece=1, sigma_workpiece=37037037, a_star=2e-3)
+    mesh = em_problem.mesh
+    fem_solver = FEMSolverEM(mesh, order=1, problem=em_problem)
     gfA_unscaled = fem_solver.solve(em_problem)
     gfA = gfA_unscaled * em_problem.A_star
 
@@ -672,7 +646,7 @@ def create_ih_problem(frequency=2000, current=1000, combined_bc=True, time_end=1
 
     problem = GenericHeatEquationProblem(
         mesh=mesh,
-        time_config=TimeConfig(dt=dt, t_final=time_end),
+        time_config=TimeConfig(dt=0.1, t_final=10),
         boundary_conditions=boundary_conditions,
         material_properties=material_properties,
         initial_condition=22.0,
