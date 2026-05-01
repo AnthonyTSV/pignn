@@ -588,7 +588,7 @@ def train_ih_problem(resume_from: str = None):
     from thermal_problems import create_ih_problem
     problem = create_ih_problem()
     config = {
-        "epochs": 5000,
+        "epochs": 10000,
         "lr": 1e-3,
         "time_window": 20,
         "noise_sigma": 1e-1,

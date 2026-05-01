@@ -168,7 +168,16 @@ class PIMGNTrainer:
         ).to(self.device)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=config["lr"])
-        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.9995)
+        # Use a slow exponential decay so training does not hit the LR floor
+        # within the first few hundred epochs on harder multi-mesh runs.
+        initial_lr = float(config["lr"])
+        min_lr = float(config.get("min_lr", 1e-5))
+        lr_decay = float(config.get("lr_decay", 0.9995))
+        self.scheduler = optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda epoch: max(min_lr / initial_lr, lr_decay ** epoch)
+        )
+
 
         # Training history
         self.losses = []
