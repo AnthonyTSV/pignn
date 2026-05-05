@@ -421,6 +421,9 @@ def _run_multiple_problem_experiment(
     print("\nStarting physics-informed training...")
     train_indices = list(range(len(problems) - 1))  # Last for validation
     val_indices = list(range(len(problems) - 1, len(problems)))
+    # np.random.seed(42)
+    # train_indices = np.random.choice(len(problems), size=int(0.8 * len(problems)), replace=False).tolist()
+    # val_indices = [idx for idx in range(len(problems)) if idx not in train_indices]
     trainer.train(
         train_problems_indices=train_indices, val_problems_indices=val_indices
     )
@@ -588,10 +591,10 @@ def train_ih_problem(resume_from: str = None):
     from thermal_problems import create_ih_problem
     problem = create_ih_problem()
     config = {
-        "epochs": 10000,
+        "epochs": 20000,
         "lr": 1e-3,
-        "time_window": 20,
-        "noise_sigma": 1e-1,
+        "time_window": 10,
+        "noise_sigma": 1e-2,
         "generate_ground_truth_for_validation": True,
         "save_dir": "results/physics_informed/thermal_ih_problem",
         "resume_from": resume_from,
@@ -604,8 +607,8 @@ def train_ih_team_36_problem(resume_from: str = None):
     config = {
         "epochs": 5000,
         "lr": 1e-4,
-        "time_window": 20,
-        "noise_sigma": 0.1,
+        "time_window": 10,
+        "noise_sigma": 0.01,
         "generate_ground_truth_for_validation": True,
         "save_dir": "results/physics_informed/thermal_team_36_problem",
         "resume_from": resume_from,
@@ -626,7 +629,7 @@ def test_boundary_layer_mesh(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, problem.time_config, config, "Boundary layer mesh test problem")
 
-def train_ih_generalization_problem():
+def train_ih_current_freq():
     from thermal_problems import create_ih_problem
     freq_range = np.arange(2000, 6000, 1000)
     current_range = np.arange(2000, 5000, 1000)
@@ -643,29 +646,80 @@ def train_ih_generalization_problem():
         "noise_sigma": 1e-1,
         "batch_size": 2,
         "generate_ground_truth_for_validation": True,
-        "save_dir": "results/physics_informed/thermal_ih_generalization_convection_only",
+        "save_dir": "results/physics_informed/thermal_ih_current_freq",
         # "resume_from": "results/physics_informed/thermal_ih_generalization/pimgn_trained_model.pth",
     }
     _run_multiple_problem_experiment(problems, problems[0].time_config, config, "Induction heating generalization problem")
 
+def _sample_mu_r_sigma_latin_hypercube(
+    n_samples: int,
+    mu_r_bounds: tuple[float, float],
+    sigma_bounds: tuple[float, float],
+    seed: int | None = 42,
+    log_scale: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate LHS samples for physical mu_r and sigma_workpiece values."""
+    from scipy.stats import qmc
+
+    bounds = np.array([mu_r_bounds, sigma_bounds], dtype=np.float64)
+    if np.any(bounds[:, 0] <= 0.0) or np.any(bounds[:, 1] <= 0.0):
+        raise ValueError("mu_r_bounds and sigma_bounds must be positive.")
+
+    sampling_bounds = np.log10(bounds) if log_scale else bounds
+    sampler = qmc.LatinHypercube(d=2, seed=seed)
+    unit_samples = sampler.random(n=n_samples)
+    scaled_samples = qmc.scale(
+        unit_samples,
+        sampling_bounds[:, 0],
+        sampling_bounds[:, 1],
+    )
+    if log_scale:
+        scaled_samples = np.power(10.0, scaled_samples)
+
+    return scaled_samples[:, 0], scaled_samples[:, 1]
+
 def train_ih_mu_r_sigma(resume_from: str = None):
     from thermal_problems import create_ih_problem_mu_r_sigma
+    lhs_seed = 42
     mu_r_values = np.array([1, 10, 50, 100], dtype=np.float64)
     sigma_values = np.array([1.3, 3, 6, 15], dtype=np.float64) * 1e6  # S/m
+    # n_samples = 40
+    # mu_r_samples, sigma_samples = _sample_mu_r_sigma_latin_hypercube(
+    #     n_samples=n_samples,
+    #     mu_r_bounds=(float(mu_r_values.min()), float(mu_r_values.max())),
+    #     sigma_bounds=(float(sigma_values.min()), float(sigma_values.max())),
+    #     seed=lhs_seed,
+    #     log_scale=False,
+    # )
+    # parameter_samples = [
+    #     {
+    #         "sample_idx": idx,
+    #         "mu_r_workpiece": float(mu_r),
+    #         "sigma_workpiece": float(sigma),
+    #     }
+    #     for idx, (mu_r, sigma) in enumerate(zip(mu_r_samples, sigma_samples))
+    # ]
+    # print("Latin Hypercube training samples:")
+    # for sample in parameter_samples:
+    #     print(
+    #         f"  {sample['sample_idx']:02d}: "
+    #         f"mu_r={sample['mu_r_workpiece']:.6g}, "
+    #         f"sigma={sample['sigma_workpiece']:.6e} S/m"
+    #     )
     problems = []
     for mu_r in mu_r_values:
         for sigma in sigma_values:
             problem = create_ih_problem_mu_r_sigma(mu_r=mu_r, sigma=sigma)
             problems.append(problem)
-    
-    # add validation problem 
-    problems.append(create_ih_problem_mu_r_sigma(mu_r=25, sigma=4e6))
+    problems.append(create_ih_problem_mu_r_sigma(mu_r=25, sigma=2e6))
     config = {
-        "epochs": 1000,
+        "epochs": 2000,
         "lr": 1e-3,
-        "time_window": 20,
-        "noise_sigma": 1e-1,
+        "time_window": 10,
+        "noise_sigma": 1e-2,
         "batch_size": 2,
+        # "lhs_seed": lhs_seed,
+        # "parameter_samples": parameter_samples,
         "generate_ground_truth_for_validation": True,
         "save_dir": "results/physics_informed/thermal_ih_mu_r_sigma",
         "resume_from": resume_from,
@@ -673,6 +727,6 @@ def train_ih_mu_r_sigma(resume_from: str = None):
     _run_multiple_problem_experiment(problems, problems[0].time_config, config, "Induction heating mu_r and sigma generalization problem")
 
 if __name__ == "__main__":
-    train_ih_problem(resume_from="results/physics_informed/thermal_ih_problem/pimgn_trained_model.pth")
-    # train_ih_team_36_problem()
+    # train_ih_problem(resume_from="results/physics_informed/thermal_ih_problem/pimgn_trained_model.pth")
+    train_ih_team_36_problem()
     # train_ih_mu_r_sigma()

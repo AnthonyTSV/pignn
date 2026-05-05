@@ -774,7 +774,7 @@ def ih_team_36_problem():
             is_hollow=True,
             wall_thickness=3 * mm,
         ),
-        h_workpiece=3 * mm,
+        h_workpiece=5 * mm,
         h_coil=8 * mm,
         h_air=100 * mm,
         air_width=300 * mm,
@@ -789,25 +789,25 @@ def ih_team_36_problem():
             args=[0, 100, 200, 300, 400, 500, 600, 700, 750, 800, 900, 1000, 1100, 1200, 1400, 1470, 1800], 
             values=[48.1, 48.1, 46.5, 44.0, 41.0, 38.5, 36.0, 31.4, 28.5, 26.7, 25.9, 26.7, 28.0, 29.8, 35, 39, 39])),
     )
-    # boundary_conditions = {
-    #     "bc_workpiece_top": CombinedBC(value={
-    #         "convection": (7, 70),
-    #         "radiation": (0.8, 70),
-    #     }),
-    #     "bc_workpiece_right": CombinedBC(value={
-    #         "convection": (7, 70),
-    #         "radiation": (0.8, 70),
-    #     }),
-    #     "bc_workpiece_bottom": CombinedBC(value={
-    #         "convection": (7, 70),
-    #         "radiation": (0.8, 70),
-    #     }),
-    # }
     boundary_conditions = {
-        "bc_workpiece_top": ConvectionBC(value=(10, 22)),
-        "bc_workpiece_right": ConvectionBC(value=(10, 22)),
-        "bc_workpiece_bottom": ConvectionBC(value=(10, 22)),
+        "bc_workpiece_top": CombinedBC(value={
+            "convection": (7, 70),
+            "radiation": (0.8, 70),
+        }),
+        "bc_workpiece_right": CombinedBC(value={
+            "convection": (7, 25),
+            "radiation": (0.8, 25),
+        }),
+        "bc_workpiece_bottom": CombinedBC(value={
+            "convection": (7, 70),
+            "radiation": (0.8, 70),
+        }),
     }
+    # boundary_conditions = {
+    #     "bc_workpiece_top": ConvectionBC(value=(10, 70)),
+    #     "bc_workpiece_right": ConvectionBC(value=(10, 25)),
+    #     "bc_workpiece_bottom": ConvectionBC(value=(10, 70)),
+    # }
 
     em_problem = em_team_36_problem(mesh=mesh)
     fem_solver = FEMSolverEM(em_problem.mesh, order=1, problem=em_problem)
@@ -828,7 +828,7 @@ def ih_team_36_problem():
 
     problem = GenericHeatEquationProblem(
         mesh=mesh,
-        time_config=TimeConfig(dt=0.25, t_final=25),
+        time_config=TimeConfig(dt=0.1, t_final=25),
         boundary_conditions=boundary_conditions,
         material_properties=material_properties,
         initial_condition=22.0,
@@ -840,5 +840,5 @@ def ih_team_36_problem():
     return problem.get_problem()
 
 if __name__ == "__main__":
-    problem = create_temp_dependent_material_problem()
+    problem = ih_team_36_problem()
     print("Problem created successfully")

@@ -429,7 +429,7 @@ def em_team_36_problem(mesh=None):
                 is_hollow=True,
                 wall_thickness=3 * mm,
             ),
-            h_workpiece=3 * mm,
+            h_workpiece=5 * mm,
             h_coil=8 * mm,
             h_air=100 * mm,
             air_width=300 * mm,
