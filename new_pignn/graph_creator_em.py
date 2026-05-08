@@ -377,6 +377,10 @@ def _build_node_features(
         current_density_tensor = torch.tensor(
             current_density_field, dtype=torch.float32, device=device
         ).unsqueeze(1)
+        current_density_tensor = (
+            torch.sign(current_density_tensor)
+            * torch.log1p(torch.abs(current_density_tensor))
+        )
     else:
         current_density_tensor = torch.zeros(n_nodes, 1, device=device)
     features.append(current_density_tensor)

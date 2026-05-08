@@ -700,6 +700,66 @@ def create_ih_problem_mu_r_sigma(mu_r, sigma):
     )
     return problem.get_problem()
 
+def create_ih_problem_curr_freq(current, frequency):
+    material_properties = MaterialPropertiesHeat(
+        rho=7870,
+        cp=461,
+        k=86,
+    )
+    # boundary_conditions = {
+    #     "bc_workpiece_top": CombinedBC(value={
+    #         "convection": (10, 20),
+    #         "radiation": (0.8, 20),
+    #     }),
+    #     "bc_workpiece_right": CombinedBC(value={
+    #         "convection": (10, 20),
+    #         "radiation": (0.8, 20),
+    #     }),
+    #     "bc_workpiece_bottom": CombinedBC(value={
+    #         "convection": (10, 20),
+    #         "radiation": (0.8, 20),
+    #     }),
+    # }
+    boundary_conditions = {
+        "bc_workpiece_top": ConvectionBC(value=(10, 20)),
+        "bc_workpiece_right": ConvectionBC(value=(10, 20)),
+        "bc_workpiece_bottom": ConvectionBC(value=(10, 20)),
+    }
+
+    em_problem = eddy_current_problem_different_currents(
+        frequency=frequency, current=current,
+        mu_r_workpiece=100, sigma_workpiece=6289308
+    )
+    mesh = em_problem.mesh
+    fem_solver = FEMSolverEM(mesh, order=1, problem=em_problem)
+    gfA_unscaled = fem_solver.solve(em_problem)
+    gfA = gfA_unscaled * em_problem.A_star
+
+    gfu = ng.GridFunction(fem_solver.fes)
+    gfu.vec.data = gfA
+    omega = 2 * np.pi * em_problem.frequency
+    E_phi = -1j * omega * gfu
+    heat_source_gf = (
+        0.5
+        * em_problem.sigma_workpiece * em_problem.sigma_star
+        * ng.Norm(E_phi) ** 2
+    )
+
+    source_function = get_source_function(mesh, heat_source_gf, mesh.nv)
+
+    problem = GenericHeatEquationProblem(
+        mesh=mesh,
+        time_config=TimeConfig(dt=0.05, t_final=5),
+        boundary_conditions=boundary_conditions,
+        material_properties=material_properties,
+        initial_condition=22.0,
+        thermal_domain_materials=["mat_workpiece"],
+        source_function=source_function,
+        axisymmetric=True,
+        mesh_type="ih_mesh",
+    )
+    return problem.get_problem()
+
 def test_boundary_layer():
     wp = BilletParams(diameter=0.030, height=0.070)
     ind = RectangularInductorParams(

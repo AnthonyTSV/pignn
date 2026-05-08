@@ -605,7 +605,7 @@ def train_ih_team_36_problem(resume_from: str = None):
     from thermal_problems import ih_team_36_problem
     problem = ih_team_36_problem()
     config = {
-        "epochs": 5000,
+        "epochs": 10,
         "lr": 1e-4,
         "time_window": 10,
         "noise_sigma": 0.01,
@@ -630,20 +630,20 @@ def test_boundary_layer_mesh(resume_from: str = None):
     _run_single_problem_experiment(problem, problem.time_config, config, "Boundary layer mesh test problem")
 
 def train_ih_current_freq():
-    from thermal_problems import create_ih_problem
+    from thermal_problems import create_ih_problem_curr_freq
     freq_range = np.arange(2000, 6000, 1000)
-    current_range = np.arange(2000, 5000, 1000)
+    current_range = np.arange(2000, 6000, 1000)
     all_ranges = np.array(np.meshgrid(current_range, freq_range)).T.reshape(-1, 2)
     problems = [
-        create_ih_problem(current=current, frequency=freq, combined_bc=False) for current, freq in all_ranges
+        create_ih_problem_curr_freq(current=current, frequency=freq) for current, freq in all_ranges
     ]
     # add one more problem with different geometry
-    problems.append(create_ih_problem(current=1500, frequency=1500, combined_bc=False))
+    problems.append(create_ih_problem_curr_freq(current=7000, frequency=7000))
     config = {
-        "epochs": 500,
+        "epochs": 2000,
         "lr": 1e-3,
-        "time_window": 20,
-        "noise_sigma": 1e-1,
+        "time_window": 10,
+        "noise_sigma": 1e-2,
         "batch_size": 2,
         "generate_ground_truth_for_validation": True,
         "save_dir": "results/physics_informed/thermal_ih_current_freq",
@@ -728,5 +728,6 @@ def train_ih_mu_r_sigma(resume_from: str = None):
 
 if __name__ == "__main__":
     # train_ih_problem(resume_from="results/physics_informed/thermal_ih_problem/pimgn_trained_model.pth")
-    train_ih_team_36_problem()
+    # train_ih_team_36_problem()
     # train_ih_mu_r_sigma()
+    train_ih_current_freq()

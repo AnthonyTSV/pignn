@@ -279,9 +279,13 @@ def eddy_current_problem_2():
 
 
 def eddy_current_problem_different_currents(
-    mesh=None, current=1000, frequency=8000, winding_count=1
+    mesh=None, current=1000, frequency=8000, winding_count=1, sigma_workpiece=6289308, mu_r_workpiece=1
 ):
+    sigma_workpiece = sigma_workpiece
+    mu_r_workpiece = mu_r_workpiece
     if mesh is None:
+        thicknesses = get_fixed_skin_layer_thicknesses(frequency=frequency, mu_r=mu_r_workpiece, sigma=sigma_workpiece)
+
         wp = BilletParams(diameter=0.030, height=0.070)
         ind = RectangularInductorParams(
             coil_inner_diameter=0.050,
@@ -290,15 +294,28 @@ def eddy_current_problem_different_currents(
             profile_width=0.007,
             profile_height=0.007,
         )
-        kw = dict(h_workpiece=1e-3, h_air=60e-3, h_coil=1e-3)
+        kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3, workpiece_boundary_layer_thicknesses=thicknesses)
         builder = IHGeometryAndMesh(wp, ind, **kw)
         mesh = builder.generate()
 
     dirichlet_boundaries = ["bc_air", "bc_axis", "bc_workpiece_left"]
     dirichlet_boundaries_dict = {"bc_air": 0, "bc_axis": 0, "bc_workpiece_left": 0}
 
+    material_properties = {
+        "mat_workpiece": MaterialPropertiesEM(mu=mu_r_workpiece, sigma=sigma_workpiece),
+        "mat_air": MaterialPropertiesEM(mu=1.0, sigma=0),
+        "mat_coil": MaterialPropertiesEM(mu=1.0, sigma=0),
+    }
+
+    area_coil = ind.profile_width * ind.profile_height
+
     problem_generator = GenericEddyCurrentProblem(
-        mesh, dirichlet_boundaries, dirichlet_boundaries_dict, A_star=0.0022536
+        mesh,
+        dirichlet_boundaries,
+        dirichlet_boundaries_dict,
+        material_properties=material_properties,
+        A_star=3.4e-3,
+        coil_area=area_coil,
     )
 
     problem = problem_generator.get_problem(current=current, frequency=frequency)
@@ -488,7 +505,7 @@ def test_boundary_layer():
 
     return problem
 
-def em_different_geometries(winding_count=1, diameter=30*mm, height=70*mm, coil_inner_diameter=50*mm):
+def em_different_geometries(winding_count=1, diameter=30*mm, height=70*mm, coil_inner_diameter=50*mm, y_offset=0.0):
     sigma_workpiece = 6289308
     mu_r_workpiece = 1
     thicknesses = get_fixed_skin_layer_thicknesses(frequency=3000, mu_r=mu_r_workpiece, sigma=sigma_workpiece)
@@ -500,6 +517,7 @@ def em_different_geometries(winding_count=1, diameter=30*mm, height=70*mm, coil_
         winding_count=winding_count,
         profile_width=0.007,
         profile_height=0.007,
+        y_offset=y_offset
     )
     kw = dict(h_workpiece=2e-3, h_air=60e-3, h_coil=1e-3, workpiece_boundary_layer_thicknesses=thicknesses)
     builder = IHGeometryAndMesh(wp, ind, **kw)

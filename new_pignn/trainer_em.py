@@ -33,7 +33,8 @@ try:
         eddy_current_problem_different_meshes,
         em_team_36_problem,
         test_boundary_layer,
-        eddy_current_problem_different_mu_r
+        eddy_current_problem_different_mu_r,
+        em_different_geometries
     )
 except ImportError:
     from logger import TrainingLogger
@@ -59,7 +60,8 @@ except ImportError:
         eddy_current_problem_different_meshes,
         em_team_36_problem,
         test_boundary_layer,
-        eddy_current_problem_different_mu_r
+        eddy_current_problem_different_mu_r,
+        em_different_geometries
     )
 from torch_geometric.data import Data, Batch
 
@@ -1447,13 +1449,11 @@ def train_pimgn_eddy_current_different_currents(resume_from: str = None):
     problems = [
         eddy_current_problem_different_currents(current=current, frequency=freq) for current, freq in all_ranges
     ]
-    import random
-    random.shuffle(problems)
     config = {
         "epochs": 10000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/eddy_current_problem_generalized",
+        "save_dir": "results/physics_informed/eddy_current_problem_freqs_currents",
         "enforce_axis_regularity": True,
         "data_weight": 0.0,
         "batch_size": 2,  # Number of problems per mini-batch (paper uses 2)
@@ -1470,7 +1470,7 @@ def train_pimgn_eddy_current_different_currents(resume_from: str = None):
 def train_team_36(resume_from: str = None):
     problem = em_team_36_problem()
     config = {
-        "epochs": 20000,
+        "epochs": 100000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/em_team_36_problem",
@@ -1493,18 +1493,15 @@ def test_boundary_layers(resume_from: str = None):
     }
     _run_single_problem_experiment(problem, config, f"EM Boundary Layer Test")
 
-def train_on_different_meshes(resume_from: str = None):
+def train_different_air_gap(resume_from: str = None):
     problems = [
-        eddy_current_problem_different_meshes(setting="coarse"),
-        eddy_current_problem_different_meshes(setting="default"),
-        eddy_current_problem_different_meshes(setting="fine"),
-        eddy_current_problem_different_meshes(setting="very_fine"),
+        em_different_geometries(coil_inner_diameter=a) for a in [50e-3, 45e-3, 40e-3, 60e-3]
     ]
     config = {
-        "epochs": 20000,
+        "epochs": 10000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
-        "save_dir": "results/physics_informed/em_different_meshes",
+        "save_dir": "results/physics_informed/em_different_air_gaps",
         "enforce_axis_regularity": True,
         "data_weight": 0.0,
         "batch_size": 2,  # Number of problems per mini-batch
@@ -1513,7 +1510,56 @@ def train_on_different_meshes(resume_from: str = None):
     _run_experiment(
         problems,
         config,
-        "EM Problem with Different Meshes",
+        "EM Problem with Different Air Gaps",
+        train_indices=list(range(len(problems))),
+    )
+
+def train_different_coil_offset(resume_from: str = None):
+    problems = [
+        em_different_geometries(y_offset=a) for a in [0, 25e-3, -25e-3, 10e-3, -10e-3]
+    ]
+    config = {
+        "epochs": 10000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/em_different_coil_offsets",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "batch_size": 2,  # Number of problems per mini-batch
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_experiment(
+        problems,
+        config,
+        "EM Problem with Different Coil Offsets",
+        train_indices=list(range(len(problems))),
+    )
+
+def train_different_aspect_ratios(resume_from: str = None):
+    problems = [
+        em_different_geometries(height=70e-3, diameter=30e-3, coil_inner_diameter=50e-3),  # Baseline
+        em_different_geometries(height=50e-3, diameter=30e-3, coil_inner_diameter=50e-3),  # Shorter
+        em_different_geometries(height=90e-3, diameter=30e-3, coil_inner_diameter=50e-3),  # Taller
+        em_different_geometries(height=70e-3, diameter=20e-3, coil_inner_diameter=50e-3),  # Narrower
+        em_different_geometries(height=70e-3, diameter=40e-3, coil_inner_diameter=50e-3),  # Wider
+        em_different_geometries(height=50e-3, diameter=20e-3, coil_inner_diameter=50e-3),  # Shorter + Narrower
+        em_different_geometries(height=90e-3, diameter=40e-3, coil_inner_diameter=50e-3),  # Taller + Wider
+        em_different_geometries(height=50e-3, diameter=40e-3, coil_inner_diameter=50e-3),  # Shorter + Wider
+    ]
+    config = {
+        "epochs": 10000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/em_different_aspect_ratios",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "batch_size": 2,  # Number of problems per mini-batch
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_experiment(
+        problems,
+        config,
+        "EM Problem with Different Aspect Ratios",
         train_indices=list(range(len(problems))),
     )
 
@@ -1555,7 +1601,7 @@ def train_different_mu_r_all(resume_from: str = None):
 def train_em_aluminum(resume_from: str = None):
     problem = eddy_current_problem_different_mu_r(mu_r_workpiece=1, sigma_workpiece=37037037, a_star=2e-3)
     config = {
-        "epochs": 20000,
+        "epochs": 50000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
         "save_dir": f"results/physics_informed/em_aluminum",
@@ -1717,8 +1763,7 @@ if __name__ == "__main__":
     # train_pimgn_eddy_current(resume_from=None, coils=1)
     # train_pimgn_eddy_current(resume_from=None, coils=2)
     # train_pimgn_eddy_current_different_currents()
-    # train_on_different_meshes(resume_from="results/physics_informed/em_different_meshes/pimgn_trained_model.pth")
-    # train_team_36()
+    # train_team_36(resume_from="results/physics_informed/em_team_36_problem/pimgn_trained_model.pth")
     # test_boundary_layers(resume_from="results/physics_informed/em_boundary_layer_test/pimgn_trained_model.pth")
     # train_different_mu_r(mu_r=1, resume_from="results/physics_informed/em_different_mu_r/mu_r_1/pimgn_trained_model.pth")
     # train_different_mu_r(mu_r=10, resume_from="results/physics_informed/em_different_mu_r/mu_r_10/pimgn_trained_model.pth")
@@ -1726,4 +1771,7 @@ if __name__ == "__main__":
     # train_different_mu_r(mu_r=100)
     # train_different_mu_r_all(resume_from=None)
     # train_different_mu_r_and_sigma(resume_from="results/physics_informed/em_different_mu_r_sigma/pimgn_trained_model.pth")
-    train_em_aluminum()
+    # train_em_aluminum(resume_from="results/physics_informed/em_aluminum/pimgn_trained_model.pth")
+    # train_different_air_gap()
+    # train_different_coil_offset()
+    train_different_aspect_ratios()
