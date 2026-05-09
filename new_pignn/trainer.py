@@ -83,6 +83,61 @@ class PIMGNTrainer:
         self.problems = problems
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        training_mode = config.get("training_mode", None)
+        if training_mode is not None:
+            mode = str(training_mode).lower().replace("-", "_")
+            mode_aliases = {
+                "pinn": "physics",
+                "physics_informed": "physics",
+                "data_driven": "data",
+                "supervised": "data",
+                "mixed": "hybrid",
+            }
+            mode = mode_aliases.get(mode, mode)
+            if mode not in {"physics", "data", "hybrid"}:
+                raise ValueError(
+                    "training_mode must be one of 'physics', 'data', or 'hybrid'."
+                )
+            self.use_physics_loss = mode in {"physics", "hybrid"}
+            self.use_data_loss = mode in {"data", "hybrid"}
+        else:
+            self.use_physics_loss = bool(config.get("physics_loss", True))
+            self.use_data_loss = (
+                bool(config.get("data_loss", False))
+                or float(config.get("data_weight", 0.0)) > 0.0
+                or not self.use_physics_loss
+            )
+            if self.use_physics_loss and self.use_data_loss:
+                mode = "hybrid"
+            elif self.use_physics_loss:
+                mode = "physics"
+            else:
+                mode = "data"
+
+        if not self.use_physics_loss and not self.use_data_loss:
+            raise ValueError("At least one of physics loss or data loss must be enabled.")
+
+        self.training_mode = mode
+        self.physics_weight = (
+            float(config.get("physics_weight", 1.0)) if self.use_physics_loss else 0.0
+        )
+        self.data_weight_init = float(config.get("data_weight", 0.0))
+        if self.use_data_loss and self.data_weight_init <= 0.0:
+            self.data_weight_init = 1.0
+            config["data_weight"] = self.data_weight_init
+        if not self.use_data_loss:
+            self.data_weight_init = 0.0
+        default_data_weight_decay = 1.0 if mode == "data" else 0.9995
+        self.data_weight_decay = float(
+            config.get("data_weight_decay", default_data_weight_decay)
+        )
+
+        config["training_mode"] = self.training_mode
+        config["physics_loss"] = self.use_physics_loss
+        config["data_loss"] = self.use_data_loss
+        config["physics_weight"] = self.physics_weight
+        config["data_weight"] = self.data_weight_init
+        config["data_weight_decay"] = self.data_weight_decay
 
         # Time bundling configuration
         self.time_window = config.get("time_window", 20)
@@ -183,6 +238,8 @@ class PIMGNTrainer:
         self.losses = []
         self.val_losses = []
         self.last_residuals = None
+        self._last_data_loss = 0.0
+        self._ground_truth_tensors = {}
 
         # Initialize logger
         save_dir = config.get("save_dir", "results/physics_informed")
@@ -238,6 +295,67 @@ class PIMGNTrainer:
                 self.all_ground_truth.append(ground_truth)
         else:
             self.all_ground_truth = None
+
+    def _ground_truth_to_tensor(self, ground_truth) -> torch.Tensor:
+        """Return transient thermal ground truth as [n_steps + 1, n_nodes]."""
+        if ground_truth is None:
+            raise ValueError(
+                "Data-driven thermal training requires ground truth tensors. "
+                "Use trainer.train(...), or pass ground_truth into train_step."
+            )
+
+        if isinstance(ground_truth, dict):
+            if "T" in ground_truth:
+                ground_truth = ground_truth["T"]
+            elif "temperature" in ground_truth:
+                ground_truth = ground_truth["temperature"]
+            else:
+                raise KeyError("Thermal ground truth dict must contain a 'T' tensor.")
+
+        if torch.is_tensor(ground_truth):
+            return ground_truth.to(device=self.device, dtype=torch.float64)
+
+        return torch.tensor(
+            np.asarray(ground_truth, dtype=np.float64),
+            dtype=torch.float64,
+            device=self.device,
+        )
+
+    def _compute_data_supervision_loss(
+        self,
+        predictions_bundled_free: torch.Tensor,
+        ground_truth,
+        node_mapping: dict,
+        current_time: float,
+        dt: float,
+    ) -> torch.Tensor:
+        """Compute normalized supervised loss for bundled temperature predictions."""
+        ground_truth_tensor = self._ground_truth_to_tensor(ground_truth)
+        if ground_truth_tensor.ndim != 2:
+            raise ValueError(
+                "Thermal ground truth must have shape [n_steps + 1, n_nodes]."
+            )
+
+        free_to_original = node_mapping["free_to_original"].to(
+            device=self.device, dtype=torch.long
+        )
+        current_step_idx = int(round(float(current_time) / float(dt)))
+        last_step_idx = ground_truth_tensor.shape[0] - 1
+        target_indices = [
+            min(current_step_idx + t_idx + 1, last_step_idx)
+            for t_idx in range(self.time_window)
+        ]
+        target_indices_tensor = torch.tensor(
+            target_indices, dtype=torch.long, device=self.device
+        )
+
+        target_full = ground_truth_tensor.index_select(0, target_indices_tensor)
+        target_free = target_full.index_select(1, free_to_original).transpose(0, 1)
+        prediction_free = predictions_bundled_free.to(dtype=torch.float64)
+
+        sq_error = (prediction_free - target_free) ** 2
+        target_scale = (target_free**2).mean().clamp_min(1e-10)
+        return sq_error.mean() / target_scale
 
     def _is_workpiece_problem(self, problem_idx: int) -> bool:
         """Check if this problem uses workpiece-only domain."""
@@ -350,10 +468,17 @@ class PIMGNTrainer:
 
         return fem_loss
 
-    def train_step(self, t_current, current_time, problem_idx):
+    def train_step(
+        self,
+        t_current,
+        current_time,
+        problem_idx,
+        ground_truth=None,
+        data_weight: float = 0.0,
+    ):
         """
-        Compute physics loss for temporal bundling WITHOUT backpropagation.
-        Returns the loss tensor (with gradients) and bundled predictions.
+        Compute configured temporal bundling loss and update the model.
+        Returns the scalar loss value, next full state, and bundled predictions.
         """
         problem: MeshProblem = self.problems[problem_idx]
 
@@ -410,18 +535,34 @@ class PIMGNTrainer:
             else t_current
         )
 
-        # Compute physics-informed loss for temporal bundling with free nodes
         dt = problem.time_config.dt
-        physics_loss = self.compute_physics_informed_loss(
-            predictions_bundled_free,  # FREE node predictions [N_free_nodes, time_window]
-            t_current_tensor,
-            dt,
-            problem_idx,
-            aux,
-            node_mapping,
-            start_time=float(current_time),
-        )
-        physics_loss.backward()
+        physics_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+        if self.use_physics_loss:
+            # Compute physics-informed loss for temporal bundling with free nodes
+            physics_loss = self.compute_physics_informed_loss(
+                predictions_bundled_free,  # FREE node predictions [N_free_nodes, time_window]
+                t_current_tensor,
+                dt,
+                problem_idx,
+                aux,
+                node_mapping,
+                start_time=float(current_time),
+            )
+
+        data_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+        if self.use_data_loss:
+            data_loss = self._compute_data_supervision_loss(
+                predictions_bundled_free,
+                ground_truth,
+                node_mapping,
+                current_time=float(current_time),
+                dt=dt,
+            )
+        self._last_data_loss = data_loss.item()
+
+        total_loss = self.physics_weight * physics_loss + data_weight * data_loss
+
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
 
@@ -444,18 +585,25 @@ class PIMGNTrainer:
         if wp_mask is not None:
             next_state_full[~wp_mask] = problem.initial_condition[~wp_mask]
 
-        return physics_loss.item(), next_state_full, predictions_bundled_np
+        return total_loss.item(), next_state_full, predictions_bundled_np
 
-    def train_step_batched(self, problem_data: List[dict]):
+    def train_step_batched(
+        self,
+        problem_data: List[dict],
+        ground_truths: dict = None,
+        data_weight: float = 0.0,
+    ):
         """
         Batched training step: build graphs for multiple problems, run a single
-        forward pass through the model, then compute per-problem physics losses.
+        forward pass through the model, then compute configured per-problem losses.
 
         Args:
             problem_data: List of dicts with keys:
                 - problem_idx: Index of the problem
                 - t_current: Current temperature state (np.array)
                 - current_time: Current time scalar (float)
+            ground_truths: Dict mapping problem_idx -> transient ground truth tensor.
+            data_weight: Weight for data supervision loss.
 
         Returns:
             Tuple of (avg_loss_value, dict of {prob_idx: (next_state_full, predictions_bundled_np)})
@@ -521,7 +669,8 @@ class PIMGNTrainer:
 
         # ---- Split predictions back per-problem ----
         batch_tensor = batched_data.batch
-        total_loss = torch.tensor(0.0, device=self.device)
+        total_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+        total_loss_data = 0.0
         next_states = {}
 
         for i, meta in enumerate(per_problem_meta):
@@ -536,23 +685,41 @@ class PIMGNTrainer:
             node_mask = batch_tensor == i
             predictions_bundled_free = batched_prediction[node_mask]
 
-            # Compute physics loss
             t_current_tensor = (
                 torch.tensor(t_current, dtype=torch.float32, device=self.device)
                 if not torch.is_tensor(t_current)
                 else t_current
             )
             dt = problem.time_config.dt
-            physics_loss = self.compute_physics_informed_loss(
-                predictions_bundled_free,
-                t_current_tensor,
-                dt,
-                problem_idx,
-                aux,
-                node_mapping,
-                start_time=float(current_time),
+            physics_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+            if self.use_physics_loss:
+                physics_loss = self.compute_physics_informed_loss(
+                    predictions_bundled_free,
+                    t_current_tensor,
+                    dt,
+                    problem_idx,
+                    aux,
+                    node_mapping,
+                    start_time=float(current_time),
+                )
+
+            data_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+            if self.use_data_loss:
+                gt = ground_truths.get(problem_idx) if ground_truths else None
+                data_loss = self._compute_data_supervision_loss(
+                    predictions_bundled_free,
+                    gt,
+                    node_mapping,
+                    current_time=float(current_time),
+                    dt=dt,
+                )
+
+            total_loss = (
+                total_loss
+                + self.physics_weight * physics_loss
+                + data_weight * data_loss
             )
-            total_loss = total_loss + physics_loss
+            total_loss_data += data_loss.item()
 
             # Reconstruct full state
             predictions_bundled_np = predictions_bundled_free.detach().cpu().numpy()
@@ -579,20 +746,58 @@ class PIMGNTrainer:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
 
+        self._last_data_loss = total_loss_data / n_batch
+
         return total_loss.item(), next_states
 
     def train(self, train_problems_indices, val_problems_indices=None):
         """Main training loop following paper's methodology with multiple problems."""
         print(f"Starting PIMGN training on {self.device}")
+        print(
+            f"Training mode: {self.training_mode} "
+            f"(physics={self.use_physics_loss}, data={self.use_data_loss})"
+        )
         print(f"Training on problems: {train_problems_indices}")
         if val_problems_indices:
             print(f"Validation on problems: {val_problems_indices}")
 
         batch_size = self.config.get("batch_size", 1)
+        eval_ground_truth = {}
+        self._ground_truth_tensors = {}
+        if self.use_data_loss:
+            print("Generating ground truth for evaluation and data supervision...")
+
+        if self.use_data_loss or self.all_ground_truth is not None:
+            for prob_idx in train_problems_indices:
+                if self.all_ground_truth is not None:
+                    ground_truth = self.all_ground_truth[prob_idx]
+                else:
+                    print(f"  Solving problem {prob_idx} ...")
+                    ground_truth = self.all_fem_solvers[
+                        prob_idx
+                    ].solve_transient_problem(self.problems[prob_idx])
+
+                eval_ground_truth[prob_idx] = ground_truth
+                if self.use_data_loss:
+                    self._ground_truth_tensors[prob_idx] = {
+                        "T": torch.tensor(
+                            np.asarray(ground_truth, dtype=np.float64),
+                            dtype=torch.float64,
+                            device=self.device,
+                        )
+                    }
+
+            if self.use_data_loss:
+                print(f"Ground truth generated for {len(eval_ground_truth)} problems.")
+
+        data_weight_init = self.data_weight_init
+        data_weight_decay = self.data_weight_decay
 
         for epoch in range(self.start_epoch, self.config["epochs"]):
             epoch_start = time.time()
             epoch_losses = []
+            epoch_data_losses = []
+            data_weight = data_weight_init * (data_weight_decay**epoch)
 
             # Shuffle training problems for each epoch
             shuffled_train_indices = train_problems_indices.copy()
@@ -629,17 +834,26 @@ class PIMGNTrainer:
                                 }
                                 for idx in batch_indices
                             ]
-                            loss, next_states = self.train_step_batched(pdata)
+                            loss, next_states = self.train_step_batched(
+                                pdata,
+                                ground_truths=self._ground_truth_tensors,
+                                data_weight=data_weight,
+                            )
                             for idx, (state, _) in next_states.items():
                                 problem_states[idx] = state
                         else:
                             idx = batch_indices[0]
                             loss, t_next, _ = self.train_step(
-                                problem_states[idx], current_time, idx
+                                problem_states[idx],
+                                current_time,
+                                idx,
+                                ground_truth=self._ground_truth_tensors.get(idx),
+                                data_weight=data_weight,
                             )
                             problem_states[idx] = t_next
 
                         epoch_losses.append(loss)
+                        epoch_data_losses.append(self._last_data_loss)
             else:
                 # Original sequential training (batch_size=1 or single problem)
                 for problem_idx in shuffled_train_indices:
@@ -654,10 +868,15 @@ class PIMGNTrainer:
                     problem_losses = []
                     for window_times in time_steps_windowed:
                         current_time = window_times[0] - problem.time_config.dt
-                        physics_loss, t_next, _ = self.train_step(
-                            t_current, current_time, problem_idx
+                        loss, t_next, _ = self.train_step(
+                            t_current,
+                            current_time,
+                            problem_idx,
+                            ground_truth=self._ground_truth_tensors.get(problem_idx),
+                            data_weight=data_weight,
                         )
-                        problem_losses.append(physics_loss)
+                        problem_losses.append(loss)
+                        epoch_data_losses.append(self._last_data_loss)
                         t_current = t_next
 
                     if problem_losses:
@@ -665,6 +884,9 @@ class PIMGNTrainer:
                         epoch_losses.append(avg_problem_loss)
 
             avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+            avg_epoch_data_loss = (
+                np.mean(epoch_data_losses) if epoch_data_losses else 0.0
+            )
             self.losses.append(avg_epoch_loss)
 
             # Validation (if validation problems are provided and ground truth is available)
@@ -679,8 +901,15 @@ class PIMGNTrainer:
             if epoch % 10 == 0:
                 elapsed = time.time() - epoch_start
                 val_str = f" | Val Loss: {val_loss:.3e}" if val_loss is not None else ""
+                loss_detail_str = ""
+                if self.use_data_loss:
+                    loss_detail_str = (
+                        f" | L_data: {avg_epoch_data_loss:.3e} "
+                        f"(w={data_weight:.2e})"
+                    )
                 print(
-                    f"Epoch {epoch+1:4d} | Train Loss: {avg_epoch_loss:.3e}{val_str} | Time: {elapsed:.2f}s"
+                    f"Epoch {epoch+1:4d} | Train Loss: {avg_epoch_loss:.3e}"
+                    f"{loss_detail_str}{val_str} | Time: {elapsed:.2f}s"
                 )
             if (epoch + 1) % 100 == 0:
                 self.model.eval()
@@ -688,8 +917,8 @@ class PIMGNTrainer:
                 predictions = self.rollout(problem_idx=prob_idx)
 
                 # If we have ground truth, compute errors
-                if self.all_ground_truth is not None:
-                    ground_truth = self.all_ground_truth[prob_idx]
+                ground_truth = eval_ground_truth.get(prob_idx)
+                if ground_truth is not None:
 
                     # Compute errors
                     problem = self.problems[prob_idx]
@@ -704,8 +933,9 @@ class PIMGNTrainer:
                         else:
                             l2_error = np.linalg.norm(pred - true) / np.linalg.norm(true)
                         errors.append(l2_error)
-                mean_l2_error = np.mean(errors)
-                print(f"Epoch {epoch+1:4d} | Rollout L2 Error: {mean_l2_error:.3e}")
+                    mean_l2_error = np.mean(errors)
+                    print(f"Epoch {epoch+1:4d} | Rollout L2 Error: {mean_l2_error:.3e}")
+                self.model.train()
             checkpoint_epoch_interval = self.config.get(
                 "save_epoch_interval", self.config.get("save_interval", 100)
             )
@@ -722,7 +952,7 @@ class PIMGNTrainer:
             self.scheduler.step()
 
         print(
-            "Physics-Informed MeshGraphNet training with multiple problems completed!"
+            f"MeshGraphNet {self.training_mode} training with multiple problems completed!"
         )
 
     def validate(self, val_problems_indices):

@@ -726,8 +726,66 @@ def train_ih_mu_r_sigma(resume_from: str = None):
     }
     _run_multiple_problem_experiment(problems, problems[0].time_config, config, "Induction heating mu_r and sigma generalization problem")
 
+def train_ih_mu_r_sigma_ablation(resume_from: str = None, num_training_pnts: int = 16, physics_loss: bool = True):
+    from thermal_problems import create_ih_problem_mu_r_sigma
+    if num_training_pnts == 2:
+        values = [(1, 1.3e6), (100, 15e6)]
+    elif num_training_pnts == 4:
+        values = [
+            (1, 1.3e6),
+            (1, 15e6),
+            (100, 1.3e6),
+            (100, 15e6),
+        ]
+    elif num_training_pnts == 8:
+        values = [
+            (1, 1.3e6),
+            (1, 3e6),
+            (1, 6e6),
+            (1, 15e6),
+            (100, 1.3e6),
+            (100, 15e6),
+            (10, 1.3e6),
+            (50, 1.3e6),
+        ]
+    elif num_training_pnts == 16:
+        mu_r_values = [1, 10, 50, 100]
+        sigma_values = np.array([1.3, 3, 6, 15]) * 1e6
+        values = np.array(np.meshgrid(mu_r_values, sigma_values)).T.reshape(-1, 2)
+    else:
+        raise ValueError("Invalid number of training points. Must be 2, 4, 8, or 16.")
+    problems = []
+    for mu_r, sigma in values:
+        problem = create_ih_problem_mu_r_sigma(mu_r=mu_r, sigma=sigma)
+        problems.append(problem)
+    problems.append(create_ih_problem_mu_r_sigma(mu_r=25, sigma=2e6))
+    config = {
+        "epochs": 2000,
+        "lr": 1e-3,
+        "time_window": 10,
+        "noise_sigma": 1e-2,
+        "batch_size": 2,
+        "training_mode": "physics" if physics_loss else "data",
+        "data_weight": 0.0 if physics_loss else 1.0,
+        "physics_loss": physics_loss,
+        "generate_ground_truth_for_validation": True,
+        "save_dir": "results/physics_informed/thermal_ih_mu_r_sigma",
+        "resume_from": resume_from,
+    }
+    _run_multiple_problem_experiment(problems, problems[0].time_config, config, "Induction heating mu_r and sigma generalization problem")
+
+def ablation_study_mu_r_sigma():
+    train_ih_mu_r_sigma_ablation(num_training_pnts=2, physics_loss=True)
+    train_ih_mu_r_sigma_ablation(num_training_pnts=4, physics_loss=True)
+    train_ih_mu_r_sigma_ablation(num_training_pnts=8, physics_loss=True)
+    train_ih_mu_r_sigma_ablation(num_training_pnts=2, physics_loss=False)
+    train_ih_mu_r_sigma_ablation(num_training_pnts=4, physics_loss=False)
+    train_ih_mu_r_sigma_ablation(num_training_pnts=8, physics_loss=False)
+    train_ih_mu_r_sigma_ablation(num_training_pnts=16, physics_loss=False)
+
 if __name__ == "__main__":
     # train_ih_problem(resume_from="results/physics_informed/thermal_ih_problem/pimgn_trained_model.pth")
     # train_ih_team_36_problem()
     # train_ih_mu_r_sigma()
-    train_ih_current_freq()
+    # train_ih_current_freq()
+    ablation_study_mu_r_sigma()
