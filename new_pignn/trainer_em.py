@@ -98,6 +98,61 @@ class PIMGNTrainerEM:
         self.enforce_axis_regularity = bool(
             config.get("enforce_axis_regularity", False)
         )
+        training_mode = config.get("training_mode", None)
+        if training_mode is not None:
+            mode = str(training_mode).lower().replace("-", "_")
+            mode_aliases = {
+                "pinn": "physics",
+                "physics_informed": "physics",
+                "data_driven": "data",
+                "supervised": "data",
+                "mixed": "hybrid",
+            }
+            mode = mode_aliases.get(mode, mode)
+            if mode not in {"physics", "data", "hybrid"}:
+                raise ValueError(
+                    "training_mode must be one of 'physics', 'data', or 'hybrid'."
+                )
+            self.use_physics_loss = mode in {"physics", "hybrid"}
+            self.use_data_loss = mode in {"data", "hybrid"}
+        else:
+            self.use_physics_loss = bool(config.get("physics_loss", True))
+            self.use_data_loss = (
+                bool(config.get("data_loss", False))
+                or float(config.get("data_weight", 0.0)) > 0.0
+                or not self.use_physics_loss
+            )
+            if self.use_physics_loss and self.use_data_loss:
+                mode = "hybrid"
+            elif self.use_physics_loss:
+                mode = "physics"
+            else:
+                mode = "data"
+
+        if not self.use_physics_loss and not self.use_data_loss:
+            raise ValueError("At least one of physics loss or data loss must be enabled.")
+
+        self.training_mode = mode
+        self.physics_weight = (
+            float(config.get("physics_weight", 1.0)) if self.use_physics_loss else 0.0
+        )
+        self.data_weight_init = float(config.get("data_weight", 0.0))
+        if self.use_data_loss and self.data_weight_init <= 0.0:
+            self.data_weight_init = 1.0
+            config["data_weight"] = self.data_weight_init
+        if not self.use_data_loss:
+            self.data_weight_init = 0.0
+        default_data_weight_decay = 1.0 if mode == "data" else 0.9995
+        self.data_weight_decay = float(
+            config.get("data_weight_decay", default_data_weight_decay)
+        )
+
+        config["training_mode"] = self.training_mode
+        config["physics_loss"] = self.use_physics_loss
+        config["data_loss"] = self.use_data_loss
+        config["physics_weight"] = self.physics_weight
+        config["data_weight"] = self.data_weight_init
+        config["data_weight_decay"] = self.data_weight_decay
 
         # Create FEM solvers for physics-informed loss computation for all problems
         self.all_fem_solvers: List[FEMSolverEM] = []
@@ -486,6 +541,54 @@ class PIMGNTrainerEM:
 
         return residual
 
+    def _compute_data_supervision_loss(
+        self,
+        prediction_free: torch.Tensor,
+        ground_truth: dict,
+        node_mapping: dict,
+        problem: MeshProblemEM,
+        fem_solver: FEMSolverEM,
+    ) -> torch.Tensor:
+        """Compute normalized supervised loss against FEM/data targets."""
+        if ground_truth is None:
+            raise ValueError(
+                "Data-driven EM training requires ground truth tensors. "
+                "Use trainer.train(...), or pass ground_truth into train_step."
+            )
+        
+        if problem.mixed:
+            raise NotImplementedError("Data supervision loss for mixed A-phi formulation is not yet implemented.")
+
+        free_to_original = node_mapping["free_to_original"].to(self.device)
+        n_total = int(node_mapping.get("n_original"))
+
+        pred_A_real = torch.zeros(n_total, dtype=torch.float64, device=self.device)
+        pred_A_real[free_to_original] = prediction_free[:, 0].to(dtype=torch.float64)
+
+        gt_A_real = ground_truth["A_real"].to(self.device, dtype=torch.float64)
+
+        if problem.complex:
+            if prediction_free.shape[1] < 2:
+                raise ValueError("Complex EM data loss requires two A output channels.")
+            pred_A_imag = torch.zeros(n_total, dtype=torch.float64, device=self.device)
+            pred_A_imag[free_to_original] = prediction_free[:, 1].to(
+                dtype=torch.float64
+            )
+            gt_A_imag = ground_truth["A_imag"].to(self.device, dtype=torch.float64)
+            sq_error_A = (pred_A_real - gt_A_real) ** 2 + (
+                pred_A_imag - gt_A_imag
+            ) ** 2
+            gt_A_norm_sq = (gt_A_real**2 + gt_A_imag**2).sum()
+        else:
+            sq_error_A = (pred_A_real - gt_A_real) ** 2
+            gt_A_norm_sq = (gt_A_real**2).sum()
+
+        data_loss_A = sq_error_A.mean() / (
+            gt_A_norm_sq.clamp_min(1e-10) / float(n_total)
+        )
+
+        return data_loss_A
+
     def train_step_batched(
         self,
         problem_indices: List[int],
@@ -494,7 +597,7 @@ class PIMGNTrainerEM:
     ):
         """
         Batched training step: build graphs for multiple problems, run a single
-        forward pass through the model, then compute per-problem physics losses.
+        forward pass through the model, then compute the configured losses.
 
         Args:
             problem_indices: List of problem indices to train on in this batch.
@@ -569,34 +672,37 @@ class PIMGNTrainerEM:
                 prediction_free, free_pos, problem,
             )
 
-            # Physics loss (per-problem, uses its own FEM solver)
-            physics_loss = self.compute_physics_informed_loss(
-                prediction_free, prob_idx, aux, node_mapping,
+            physics_loss = torch.tensor(
+                0.0, device=self.device, dtype=torch.float64
             )
+            loss_A_value = 0.0
+            loss_phi_value = 0.0
+            if self.use_physics_loss:
+                # Physics loss (per-problem, uses its own FEM solver)
+                physics_loss = self.compute_physics_informed_loss(
+                    prediction_free, prob_idx, aux, node_mapping,
+                )
+                loss_A_value = self._last_loss_A
+                loss_phi_value = self._last_loss_phi
 
-            # Optional data supervision loss
             d_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
-            gt = ground_truths.get(prob_idx) if ground_truths else None
-            if gt is not None and data_weight > 0:
-                free_to_original = node_mapping["free_to_original"].to(self.device)
-                n_total = int(node_mapping.get("n_original"))
+            if self.use_data_loss:
+                gt = ground_truths.get(prob_idx) if ground_truths else None
+                d_loss = self._compute_data_supervision_loss(
+                    prediction_free,
+                    gt,
+                    node_mapping,
+                    problem,
+                    self.all_fem_solvers[prob_idx],
+                )
 
-                pred_A_real = torch.zeros(n_total, dtype=torch.float64, device=self.device)
-                pred_A_imag = torch.zeros(n_total, dtype=torch.float64, device=self.device)
-                pred_A_real[free_to_original] = prediction_free[:, 0].to(dtype=torch.float64)
-                pred_A_imag[free_to_original] = prediction_free[:, 1].to(dtype=torch.float64)
-
-                gt_A_real, gt_A_imag = gt["A_real"], gt["A_imag"]
-                gt_A_norm = torch.sqrt((gt_A_real**2 + gt_A_imag**2).sum()).clamp_min(1e-10)
-                d_loss_A = (
-                    (pred_A_real - gt_A_real) ** 2 + (pred_A_imag - gt_A_imag) ** 2
-                ).mean() / (gt_A_norm**2 / n_total)
-
-                d_loss = d_loss_A
-
-            total_loss = total_loss + physics_loss + data_weight * d_loss
-            total_loss_A += self._last_loss_A
-            total_loss_phi += self._last_loss_phi
+            total_loss = (
+                total_loss
+                + self.physics_weight * physics_loss
+                + data_weight * d_loss
+            )
+            total_loss_A += loss_A_value
+            total_loss_phi += loss_phi_value
             total_loss_data += d_loss.item() if isinstance(d_loss, torch.Tensor) else d_loss
 
             # Reconstruct full prediction for logging
@@ -629,7 +735,7 @@ class PIMGNTrainerEM:
         self, problem_idx, prediction=None, ground_truth=None, data_weight=0.0
     ):
         """
-        Compute physics loss for steady-state problem with optional data supervision.
+        Compute the configured steady-state loss with optional data supervision.
 
         Args:
             problem_idx: Index of the problem to train on
@@ -686,45 +792,31 @@ class PIMGNTrainerEM:
             problem,
         )
 
-        # Compute physics-informed loss for steady-state
-        physics_loss = self.compute_physics_informed_loss(
-            prediction_free,
-            problem_idx,
-            aux,
-            node_mapping,
-        )
+        physics_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+        self._last_loss_A = 0.0
+        self._last_loss_phi = 0.0
+        if self.use_physics_loss:
+            # Compute physics-informed loss for steady-state
+            physics_loss = self.compute_physics_informed_loss(
+                prediction_free,
+                problem_idx,
+                aux,
+                node_mapping,
+            )
 
-        # Compute data supervision loss if ground truth is provided
         data_loss = torch.tensor(0.0, device=self.device, dtype=torch.float64)
-        if ground_truth is not None and data_weight > 0:
-            free_to_original = node_mapping["free_to_original"].to(self.device)
-            n_total = int(node_mapping.get("n_original"))
-
-            # Reconstruct full predictions
-            pred_A_real = torch.zeros(n_total, dtype=torch.float64, device=self.device)
-            pred_A_imag = torch.zeros(n_total, dtype=torch.float64, device=self.device)
-            pred_A_real[free_to_original] = prediction_free[:, 0].to(
-                dtype=torch.float64
+        if self.use_data_loss:
+            data_loss = self._compute_data_supervision_loss(
+                prediction_free,
+                ground_truth,
+                node_mapping,
+                problem,
+                fem_solver,
             )
-            pred_A_imag[free_to_original] = prediction_free[:, 1].to(
-                dtype=torch.float64
-            )
-
-            # A supervision: compare on all nodes
-            gt_A_real = ground_truth["A_real"]
-            gt_A_imag = ground_truth["A_imag"]
-
-            # Normalize by ground truth norm to make loss scale-invariant
-            gt_A_norm = torch.sqrt((gt_A_real**2 + gt_A_imag**2).sum()).clamp_min(1e-10)
-            data_loss_A = (
-                (pred_A_real - gt_A_real) ** 2 + (pred_A_imag - gt_A_imag) ** 2
-            ).mean() / (gt_A_norm**2 / n_total)
-
-            data_loss = data_loss_A
-            self._last_data_loss = data_loss.item()
+        self._last_data_loss = data_loss.item()
 
         # Combined loss
-        total_loss = physics_loss + data_weight * data_loss
+        total_loss = self.physics_weight * physics_loss + data_weight * data_loss
 
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -747,6 +839,10 @@ class PIMGNTrainerEM:
     def train(self, train_problems_indices, val_problems_indices=None):
         """Main training loop for steady-state EM problems with multiple problems."""
         print(f"Starting PIMGN-EM training on {self.device}")
+        print(
+            f"Training mode: {self.training_mode} "
+            f"(physics={self.use_physics_loss}, data={self.use_data_loss})"
+        )
         print(
             f"Training on {len(train_problems_indices)} problems: {train_problems_indices}"
         )
@@ -810,16 +906,23 @@ class PIMGNTrainerEM:
                     ),
                 }
             else:
-                eval_ground_truth[prob_idx] = self.all_fem_solvers[prob_idx].solve(
-                    self.problems[prob_idx]
+                A_dofs = np.array(
+                    self.all_fem_solvers[prob_idx].solve(self.problems[prob_idx])
                 )
+                if np.iscomplexobj(A_dofs):
+                    A_dofs = A_dofs.real
+                A_dofs = A_dofs.astype(np.float64)
+                eval_ground_truth[prob_idx] = A_dofs
+                self._ground_truth_tensors[prob_idx] = {
+                    "A_real": torch.tensor(
+                        A_dofs, dtype=torch.float64, device=self.device
+                    ),
+                }
         print(f"Ground truth generated for {len(eval_ground_truth)} problems.")
 
         # Data supervision weight - starts high and decays
-        data_weight_init = self.config.get("data_weight", 0.1)
-        data_weight_decay = self.config.get(
-            "data_weight_decay", 0.9995
-        )  # Decay per epoch
+        data_weight_init = self.data_weight_init
+        data_weight_decay = self.data_weight_decay
 
         n_train = len(train_problems_indices)
 
@@ -852,7 +955,7 @@ class PIMGNTrainerEM:
                     for pidx, pred in batch_predictions.items():
                         predictions[pidx] = pred
                 else:
-                    # Single problem: use original (slightly cheaper) path
+                    # Single problem: use original path
                     prob_idx = batch_indices[0]
                     loss, prediction_next = self.train_step(
                         prob_idx,
@@ -889,19 +992,18 @@ class PIMGNTrainerEM:
                 elapsed = time.time() - epoch_start
                 val_str = f" | Val Loss: {val_loss:.3e}" if val_loss is not None else ""
                 # Show component losses for mixed EM problems
+                loss_detail_str = ""
                 if self.is_mixed:
-                    loss_A_str = (
+                    loss_detail_str = (
                         f" | L_A: {epoch_loss_A:.3e} | L_φ: {epoch_loss_phi:.3e}"
                     )
-                    if data_weight > 0:
-                        loss_A_str += (
-                            f" | L_data: {epoch_loss_data:.3e} (w={data_weight:.2e})"
-                        )
-                else:
-                    loss_A_str = ""
+                if self.use_data_loss:
+                    loss_detail_str += (
+                        f" | L_data: {epoch_loss_data:.3e} (w={data_weight:.2e})"
+                    )
                 prob_str = f" ({n_train} probs)" if n_train > 1 else ""
                 print(
-                    f"Epoch {epoch+1:4d} | Train Loss: {epoch_loss:.3e}{loss_A_str}{val_str}{prob_str} | Time: {elapsed:.2f}s"
+                    f"Epoch {epoch+1:4d} | Train Loss: {epoch_loss:.3e}{loss_detail_str}{val_str}{prob_str} | Time: {elapsed:.2f}s"
                 )
 
             # Evaluate L2 error every 100 epochs
@@ -994,7 +1096,7 @@ class PIMGNTrainerEM:
 
             self.scheduler.step()
 
-        print("Physics-Informed MeshGraphNet EM training completed!")
+        print(f"MeshGraphNet EM {self.training_mode} training completed!")
 
     def validate(self, val_problems_indices):
         raise NotImplementedError("Validation not implemented")
@@ -1305,7 +1407,9 @@ def _run_experiment(
 
     trainer = PIMGNTrainerEM(problems, config)
 
-    print(f"\nStarting physics-informed training on {len(train_indices)} problem(s)...")
+    print(
+        f"\nStarting {trainer.training_mode} training on {len(train_indices)} problem(s)..."
+    )
     trainer.train(
         train_problems_indices=train_indices,
         val_problems_indices=val_indices,
@@ -1355,7 +1459,7 @@ def _run_experiment(
     except Exception as e:
         print(f"Ground truth evaluation failed: {e}")
 
-    print("Physics-Informed MeshGraphNet test completed!")
+    print("MeshGraphNet EM test completed!")
     print(f"Results saved to: {save_path}")
     trainer.save_logs()
 
@@ -1703,6 +1807,138 @@ def train_different_mu_r_and_sigma(resume_from: str = None):
         train_indices=list(range(len(problems))),
     )
 
+def train_different_geometeries(resume_from: str = None):
+    # problems = [
+    #     em_different_geometries(coil_inner_diameter=a) for a in [50e-3, 45e-3, 40e-3, 60e-3]
+    # ] + [
+    #     em_different_geometries(y_offset=a) for a in [0, 25e-3, -25e-3, 10e-3, -10e-3]
+    # ] + [
+    #     em_different_geometries(height=70e-3, diameter=30e-3, coil_inner_diameter=50e-3),  # Baseline
+    #     em_different_geometries(height=50e-3, diameter=30e-3, coil_inner_diameter=50e-3),  # Shorter
+    #     em_different_geometries(height=90e-3, diameter=30e-3, coil_inner_diameter=50e-3),  # Taller
+    #     em_different_geometries(height=70e-3, diameter=20e-3, coil_inner_diameter=50e-3),  # Narrower
+    #     em_different_geometries(height=70e-3, diameter=40e-3, coil_inner_diameter=50e-3),  # Wider
+    #     em_different_geometries(height=50e-3, diameter=20e-3, coil_inner_diameter=50e-3),  # Shorter + Narrower
+    #     em_different_geometries(height=90e-3, diameter=40e-3, coil_inner_diameter=50e-3),  # Taller + Wider
+    #     em_different_geometries(height=50e-3, diameter=40e-3, coil_inner_diameter=50e-3),  # Shorter + Wider
+    # ]
+    from scipy.stats import qmc
+
+    n_samples = 50
+    lhs_seed = 42
+    geometry_bounds = np.array(
+        [
+            [40e-3, 60e-3],  # coil_inner_diameter
+            [-25e-3, 25e-3],  # y_offset
+            [50e-3, 90e-3],  # height
+            [20e-3, 40e-3],  # diameter
+        ],
+        dtype=np.float64,
+    )
+    sampler = qmc.LatinHypercube(d=geometry_bounds.shape[0], seed=lhs_seed)
+    geometry_samples = qmc.scale(
+        sampler.random(n=n_samples),
+        geometry_bounds[:, 0],
+        geometry_bounds[:, 1],
+    )
+    problems = []
+    for idx, (coil_inner_diameter, y_offset, height, diameter) in enumerate(
+        geometry_samples
+    ):
+        problem = em_different_geometries(
+            coil_inner_diameter=float(coil_inner_diameter),
+            y_offset=float(y_offset),
+            height=float(height),
+            diameter=float(diameter),
+        )
+        problem.problem_id = idx
+        problems.append(problem)
+
+    config = {
+        "epochs": 1,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": "results/physics_informed/em_different_geometries",
+        "enforce_axis_regularity": True,
+        "data_weight": 0.0,
+        "batch_size": 2,  # Number of problems per mini-batch
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_experiment(
+        problems,
+        config,
+        "EM Problem with LHS Geometries",
+        train_indices=list(range(len(problems))),
+    )
+
+def train_different_mu_r_and_sigma_ablation_study(resume_from: str = None, num_training_pnts: int = 2, physics_loss: bool = True):
+    if num_training_pnts == 2:
+        values = [(1, 1.3e6), (100, 15e6)]
+    elif num_training_pnts == 4:
+        values = [
+            (1, 1.3e6),
+            (1, 15e6),
+            (100, 1.3e6),
+            (100, 15e6),
+        ]
+    elif num_training_pnts == 8:
+        values = [
+            (1, 1.3e6),
+            (1, 3e6),
+            (1, 6e6),
+            (1, 15e6),
+            (100, 1.3e6),
+            (100, 15e6),
+            (10, 1.3e6),
+            (50, 1.3e6),
+        ]
+    elif num_training_pnts == 16:
+        mu_r_values = [1, 10, 50, 100]
+        sigma_values = np.array([1.3, 3, 6, 15]) * 1e6
+        values = np.array(np.meshgrid(mu_r_values, sigma_values)).T.reshape(-1, 2)
+    else:
+        raise ValueError("Invalid number of training points. Must be 2, 4, 8, or 16.")
+    problems = []
+    for idx, (mu_r, sigma) in enumerate(values):
+        problem = eddy_current_problem_different_mu_r(
+            mu_r_workpiece=mu_r,
+            sigma_workpiece=sigma,
+        )
+        problem.problem_id = idx
+        problems.append(problem)
+
+    config = {
+        "epochs": 10000,
+        "lr": 1e-3,
+        "generate_ground_truth_for_validation": False,
+        "save_dir": f"results/physics_informed/em_ablation_{num_training_pnts}_pnts_{'physics' if physics_loss else 'data'}",
+        "enforce_axis_regularity": True,
+        "training_mode": "physics" if physics_loss else "data",
+        "data_weight": 0.0 if physics_loss else 1.0,
+        "physics_loss": physics_loss,
+        "batch_size": 2,  # Number of problems per mini-batch
+        "resume_from": resume_from,  # Path to checkpoint to resume from
+    }
+    _run_experiment(
+        problems,
+        config,
+        f"EM Problem with Different mu_r and sigma - Ablation {num_training_pnts} Training Points",
+        train_indices=list(range(len(problems))),
+    )
+
+def ablation_study():
+    # train_different_mu_r_and_sigma_ablation_study(num_training_pnts=2, physics_loss=False)
+    # train_different_mu_r_and_sigma_ablation_study(num_training_pnts=4, physics_loss=False)
+    # train_different_mu_r_and_sigma_ablation_study(num_training_pnts=8, physics_loss=False)
+    # train_different_mu_r_and_sigma_ablation_study(num_training_pnts=16, physics_loss=False)
+    train_different_mu_r_and_sigma_ablation_study(
+        resume_from="results/physics_informed/em_ablation_2_pnts_physics/pimgn_trained_model.pth",
+        num_training_pnts=2,
+        physics_loss=True
+    )
+    # train_different_mu_r_and_sigma_ablation_study(num_training_pnts=4, physics_loss=True)
+    # train_different_mu_r_and_sigma_ablation_study(num_training_pnts=8, physics_loss=True)
+
 # def train_pimgn_em_mixed(resume_from: str = None):
 #     problem = create_em_mixed()
 #     config = {
@@ -1774,4 +2010,6 @@ if __name__ == "__main__":
     # train_em_aluminum(resume_from="results/physics_informed/em_aluminum/pimgn_trained_model.pth")
     # train_different_air_gap()
     # train_different_coil_offset()
-    train_different_aspect_ratios()
+    # train_different_aspect_ratios()
+    # ablation_study()
+    train_different_geometeries()
