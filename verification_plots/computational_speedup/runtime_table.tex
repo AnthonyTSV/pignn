@@ -1,0 +1,17 @@
+\begin{table}[htbp]
+    \centering
+    \begin{tabular}{llcc}
+        \hline
+        Problem & Solver & Runtime [s] & Speed-up vs. FEM CPU \\
+        \hline
+        Electromagnetic & FEM (CPU) & 6.893e-02 $\pm$ 1.7e-03 & 1.00 \\
+        Electromagnetic & PI-GNN (CPU) & 5.754e-01 $\pm$ 4.6e-02 & 0.12 \\
+        Electromagnetic & PI-GNN (CUDA) & 1.663e-01 $\pm$ 2.4e-03 & 0.41 \\
+        Thermal & FEM (CPU) & 1.058e+01 $\pm$ 2.9e-01 & 1.00 \\
+        Thermal & PI-GNN (CPU) & 7.444e+00 $\pm$ 3.9e-01 & 1.42 \\
+        Thermal & PI-GNN (CUDA) & 1.162e+00 $\pm$ 6.3e-03 & 9.10 \\
+        \hline
+    \end{tabular}
+    \caption{Computational runtime of the trained PI-GNN surrogates after training. The reported mean and standard deviation are computed over repeated inference runs after one warm-up run. PI-GNN timings exclude checkpoint loading and include graph construction, data transfer, and neural-network inference. FEM timings are measured on the CPU.}
+    \label{tab:computational_speedup}
+\end{table}

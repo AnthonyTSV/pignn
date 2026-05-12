@@ -104,6 +104,7 @@ def epoch_vs_train_loss(paths: list[Path] = None, save_dir: Path = Path("verific
         else:
             plt.plot(train_loss, label=label, linewidth=1)
     plt.yscale("log")
+    # plt.xscale("log")
     plt.xlabel("Epoch")
     plt.ylabel("Training Loss")
     plt.legend(fancybox=True, frameon=True)

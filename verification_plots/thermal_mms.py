@@ -11,7 +11,7 @@ import scienceplots
 
 from helpers.vtk_extractor import VTKToPlotConverter
 
-plt.style.use(["science", "grid"])
+plt.style.use(["science"])
 
 from helpers.mpl_style import apply_mpl_style
 
@@ -52,7 +52,7 @@ def read_logs_and_plot_l2():
     plt.yscale("log")
     plt.xlabel("Time $t$ [s]")
     plt.ylabel("L2 Error")
-    plt.legend(fancybox=True, frameon=True)
+    plt.legend()
     plt.savefig("verification_plots/thermal_mms/l2_error_comparison.pdf", dpi=300)
 
     plt.figure(figsize=(6, 4))
@@ -61,7 +61,7 @@ def read_logs_and_plot_l2():
     plt.yscale("log")
     plt.xlabel("Epoch")
     plt.ylabel("Training Loss")
-    plt.legend(fancybox=True, frameon=True)
+    plt.legend()
     plt.savefig("verification_plots/thermal_mms/train_loss_comparison.pdf", dpi=300)
 
 def plot_pred_vs_fem():
@@ -112,15 +112,13 @@ def probe_at_center_vs_time():
         label="PI-GNN"
     )
     ax.set_ylabel(r"$T$ at center [$^\circ$C$]$")
-    ax.grid(True)
-    ax.legend(frameon=True, ncols=1)
+    ax.legend(ncols=1)
     ax_err.clear()
     ax_err.plot(time_values, rel_error_fem, linewidth=1, color=ax.get_lines()[0].get_color())
     ax_err.plot(time_values, rel_error_analytical, linewidth=1, color=ax.get_lines()[1].get_color())
     ax_err.set_xlabel("Time $t$ [s]")
     ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
-    ax_err.legend(["vs FEM", "vs Analytical"], frameon=True, ncols=2, fontsize="small")
-    ax_err.grid(True)
+    ax_err.legend(["vs FEM", "vs Analytical"], ncols=2, fontsize="small")
 
     plt.savefig("verification_plots/thermal_mms/center_probe_vs_time.pdf", dpi=300)
 
@@ -140,5 +138,5 @@ if __name__ == "__main__":
         need_maxh_in_label=False,
         time_range=np.arange(0, 1.01, 0.01)
     )
-    plot_pred_vs_fem()
+    # plot_pred_vs_fem()
     probe_at_center_vs_time()

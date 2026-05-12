@@ -1,0 +1,15 @@
+{
+  "python": "3.10.12 (main, Mar  3 2026, 11:56:32) [GCC 11.4.0]",
+  "platform": "Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.35",
+  "torch_version": "2.8.0+cu128",
+  "cuda_available": true,
+  "cuda_device": "NVIDIA GeForce RTX 3050 Laptop GPU",
+  "torch_num_threads": 8,
+  "ngsolve_available": true,
+  "em_checkpoint": "/home/theanty/masters/pinns/pimgn_project/results/physics_informed/em_team_36_problem/pimgn_trained_model.pth",
+  "thermal_checkpoint": "/home/theanty/masters/pinns/pimgn_project/results/physics_informed/thermal_team_36_problem/pimgn_trained_model.pth",
+  "mu_r": 50.0,
+  "sigma": 6000000.0,
+  "repeats": 10,
+  "warmups": 1
+}

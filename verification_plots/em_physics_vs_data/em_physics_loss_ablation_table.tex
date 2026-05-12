@@ -1,0 +1,16 @@
+\begin{table}[htbp]
+    \centering
+    \begin{tabular}{lcccc}
+        \hline
+        $N_{\mathrm{train}}$
+        & Data-only interp. & PI-GNN interp. & Data-only extrap. & PI-GNN extrap. \\
+        \hline
+        2  & 1.963e-01 & 2.420e-01 & 3.564e-01 & 3.454e-01 \\
+        4  & 1.600e-01 & 7.893e-02 & 1.990e-01 & 1.461e-01 \\
+        8  & 5.620e-02 & 5.722e-02 & 9.347e-02 & 9.537e-02 \\
+        16  & 5.415e-03 & 7.326e-03 & 3.969e-02 & 3.466e-02 \\
+        \hline
+    \end{tabular}
+    \caption{Effect of physics loss on electromagnetic surrogate data efficiency. Errors are reported as mean relative \(L_2\) errors of the predicted magnetic vector potential \(A\). The interpolation and extrapolation test sets are identical to those used in the \(\mu_r\)-\(\sigma\) generalisation study in Section~\ref{section:unseen_em}.}
+    \label{tab:em_physics_loss_ablation}
+\end{table}

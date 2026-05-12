@@ -1855,7 +1855,7 @@ def train_different_geometeries(resume_from: str = None):
         problems.append(problem)
 
     config = {
-        "epochs": 1,
+        "epochs": 10000,
         "lr": 1e-3,
         "generate_ground_truth_for_validation": False,
         "save_dir": "results/physics_informed/em_different_geometries",

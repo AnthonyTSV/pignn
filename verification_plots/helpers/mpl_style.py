@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 
 
 def apply_mpl_style():
-    plt.style.use(["science", "grid"])
+    plt.style.use(["science"])
 
     plt.rcParams.update({
         "font.family": "serif",

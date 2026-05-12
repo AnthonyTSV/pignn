@@ -2,6 +2,7 @@ import numpy as np
 import os
 import ngsolve as ng
 from new_pignn.graph_creator import GraphCreator
+from new_pignn.ih_geometry_and_mesh import BilletParams, IHGeometryAndMesh, RectangularInductorParams
 from new_pignn.mesh_utils import (
     create_rectangular_mesh,
     create_gaussian_initial_condition,
@@ -10,8 +11,19 @@ from new_pignn.mesh_utils import (
 )
 
 
+
 def main():
-    mesh = create_ih_mesh()
+    wp = BilletParams(diameter=0.030, height=0.070)
+    ind = RectangularInductorParams(
+        coil_inner_diameter=0.050,
+        coil_height=0.040,
+        winding_count=1,
+        profile_width=0.007,
+        profile_height=0.007,
+    )
+    kw = dict(h_workpiece=5e-3, h_air=60e-3, h_coil=5e-3, workpiece_boundary_layer_thicknesses=[1e-3, 2e-3])
+    builder = IHGeometryAndMesh(wp, ind, **kw)
+    mesh = builder.generate()
     n_points = len(list(mesh.ngmesh.Points()))
     print(f"   Created mesh with {n_points} nodes")
 

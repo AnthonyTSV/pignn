@@ -23,7 +23,7 @@ from new_pignn.containers import MeshProblemEM
 from new_pignn.em_eddy_problems import eddy_current_problem_1, eddy_current_problem_2
 from new_pignn.plotter import load_log
 
-plt.style.use(["science", "grid"])
+plt.style.use(["science"])
 
 from helpers.mpl_style import apply_mpl_style
 
@@ -63,7 +63,7 @@ def get_unscaled_gfa(path_to_results: Path, problem: MeshProblemEM):
     gfA_fem = ng.GridFunction(space)
     gfA_gnn = ng.GridFunction(space)
 
-    npz_filename = path_to_results / "results_data/results.npz"
+    npz_filename = path_to_results / "results_data/results_em.npz"
     data = np.load(npz_filename)
     exact = data["exact"]
     predicted = data["predicted"]
@@ -116,23 +116,45 @@ diff_e_real1 = ng.GridFunction(space)
 diff_e_imag1 = ng.GridFunction(space)
 diff_e_abs1 = ng.GridFunction(space)
 
+diff_a_real1 = ng.GridFunction(space)
+diff_a_imag1 = ng.GridFunction(space)
+diff_a_abs1 = ng.GridFunction(space)
+
 space2 = ng.H1(mesh2, order=1, dirichlet=problem_2.mesh_config.dirichlet_pipe)
 diff_e_real2 = ng.GridFunction(space2)
 diff_e_imag2 = ng.GridFunction(space2)
 diff_e_abs2 = ng.GridFunction(space2)
 
+diff_a_real2 = ng.GridFunction(space2)
+diff_a_imag2 = ng.GridFunction(space2)
+diff_a_abs2 = ng.GridFunction(space2)
+
 diff_e_real1.vec[:].FV().NumPy()[:] = compute_relative_error(data1["exact"].real, data1["predicted"].real)
 diff_e_imag1.vec[:].FV().NumPy()[:] = compute_relative_error(data1["exact"].imag, data1["predicted"].imag)
 diff_e_abs1.vec[:].FV().NumPy()[:] = compute_relative_error(data1["exact"], data1["predicted"])
 
+diff_a_real1.vec[:].FV().NumPy()[:] = compute_relative_error(data1["exact"].real, data1["predicted"].real)
+diff_a_imag1.vec[:].FV().NumPy()[:] = compute_relative_error(data1["exact"].imag, data1["predicted"].imag)
+diff_a_abs1.vec[:].FV().NumPy()[:] = compute_relative_error(data1["exact"], data1["predicted"])
+
 diff_e_real2.vec[:].FV().NumPy()[:] = compute_relative_error(data2["exact"].real, data2["predicted"].real)
 diff_e_imag2.vec[:].FV().NumPy()[:] = compute_relative_error(data2["exact"].imag, data2["predicted"].imag)
 diff_e_abs2.vec[:].FV().NumPy()[:] = compute_relative_error(data2["exact"], data2["predicted"])
+
+diff_a_real2.vec[:].FV().NumPy()[:] = compute_relative_error(data2["exact"].real, data2["predicted"].real)
+diff_a_imag2.vec[:].FV().NumPy()[:] = compute_relative_error(data2["exact"].imag, data2["predicted"].imag)
+diff_a_abs2.vec[:].FV().NumPy()[:] = compute_relative_error(data2["exact"], data2["predicted"])
 # save as vtk
 
 vtk_out = ng.VTKOutput(
     mesh1,
     coefs=[
+        gfA_fem1.real,
+        gfA_fem1.imag,
+        ng.Norm(gfA_fem1),
+        gfA_gnn1.real,
+        gfA_gnn1.imag,
+        ng.Norm(gfA_gnn1),
         E_fem1.real,
         E_fem1.imag,
         ng.Norm(E_fem1),
@@ -146,8 +168,17 @@ vtk_out = ng.VTKOutput(
         diff_e_real1,
         diff_e_imag1,
         diff_e_abs1,
+        diff_a_real1,
+        diff_a_imag1,
+        diff_a_abs1,
     ],
     names=[
+        "A_real_fem",
+        "A_imag_fem",
+        "A_abs_fem",
+        "A_real_gnn",
+        "A_imag_gnn",
+        "A_abs_gnn",
         "E_real_fem",
         "E_imag_fem",
         "E_abs_fem",
@@ -161,6 +192,9 @@ vtk_out = ng.VTKOutput(
         "diff_E_real",
         "diff_E_imag",
         "diff_E_abs",
+        "diff_A_real",
+        "diff_A_imag",
+        "diff_A_abs",
     ],
     filename="verification_plots/eddy_current/fem_gnn_comparison",
     order=1,
@@ -170,6 +204,12 @@ vtk_out.Do()
 vtk_out_2 = ng.VTKOutput(
     mesh2,
     coefs=[
+        gfA_fem2.real,
+        gfA_fem2.imag,
+        ng.Norm(gfA_fem2),
+        gfA_gnn2.real,
+        gfA_gnn2.imag,
+        ng.Norm(gfA_gnn2),
         E_fem2.real,
         E_fem2.imag,
         ng.Norm(E_fem2),
@@ -183,8 +223,17 @@ vtk_out_2 = ng.VTKOutput(
         diff_e_real2,
         diff_e_imag2,
         diff_e_abs2,
+        diff_a_real2,
+        diff_a_imag2,
+        diff_a_abs2,
     ],
     names=[
+        "A_real_fem",
+        "A_imag_fem",
+        "A_abs_fem",
+        "A_real_gnn",
+        "A_imag_gnn",
+        "A_abs_gnn",
         "E_real_fem",
         "E_imag_fem",
         "E_abs_fem",
@@ -198,6 +247,9 @@ vtk_out_2 = ng.VTKOutput(
         "diff_E_real",
         "diff_E_imag",
         "diff_E_abs",
+        "diff_A_real",
+        "diff_A_imag",
+        "diff_A_abs",
     ],
     filename="verification_plots/eddy_current/fem_gnn_comparison_2",
     order=1,
@@ -231,10 +283,10 @@ z_mm = 1e3 * line
 _, predicted_solution_2, fem_solution_2 = do_for_one(vtk_file_2_coil, point1, point2)
 
 abs_err = np.abs(predicted_solution - fem_solution)
-rel_err = abs_err / np.maximum(np.abs(fem_solution), 1e-12) * 100.0
+rel_err = compute_relative_error(fem_solution, predicted_solution)
 
 abs_err_2 = np.abs(predicted_solution_2 - fem_solution_2)
-rel_err_2 = abs_err_2 / np.maximum(np.abs(fem_solution_2), 1e-12) * 100.0
+rel_err_2 = compute_relative_error(fem_solution_2, predicted_solution_2)
 
 fig, (ax, ax_err) = plt.subplots(
     2,
@@ -268,10 +320,9 @@ ax.plot(
 
 ax.set_ylabel(r"$|J|$ [A/m$^2$]")
 # ax.set_yscale("log")
-ax.grid(True)
 # ax.legend(frameon=True, ncols=1)
 # make legend smaller and put it inside the plot
-ax.legend(frameon=True, ncols=1, fontsize="small")
+ax.legend(ncols=1, fontsize="small")
 
 ax_err.clear()
 ax_err.plot(
@@ -282,8 +333,7 @@ ax_err.plot(
 )
 ax_err.set_xlabel("x [mm]")
 ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
-ax_err.grid(True)
-ax_err.legend(frameon=True, ncols=2)
+ax_err.legend(ncols=2, fontsize="small")
 
 plt.savefig(save_dir / "curr_dens_line_plot_coils.pdf", dpi=300)
 
@@ -295,10 +345,10 @@ z_mm = 1e3 * line
 _, predicted_solution_2, fem_solution_2 = do_for_one(vtk_file_2_coil, point1, point2, list_field_names=["Q_fem", "Q_gnn"])
 
 abs_err = np.abs(predicted_solution - fem_solution)
-rel_err = abs_err / np.maximum(np.abs(fem_solution), 1e-12) * 100.0
+rel_err = compute_relative_error(fem_solution, predicted_solution)
 
 abs_err_2 = np.abs(predicted_solution_2 - fem_solution_2)
-rel_err_2 = abs_err_2 / np.maximum(np.abs(fem_solution_2), 1e-12) * 100.0
+rel_err_2 = compute_relative_error(fem_solution_2, predicted_solution_2)
 
 fig, (ax, ax_err) = plt.subplots(
     2,
@@ -332,10 +382,9 @@ ax.plot(
 
 ax.set_ylabel(r"$Q$ [W/m$^2$]")
 # ax.set_yscale("log")
-ax.grid(True)
 # ax.legend(frameon=True, ncols=1)
 # make legend smaller and put it inside the plot
-ax.legend(frameon=True, ncols=1, fontsize="small")
+ax.legend(ncols=1, fontsize="small")
 
 ax_err.clear()
 ax_err.plot(
@@ -346,15 +395,14 @@ ax_err.plot(
 )
 ax_err.set_xlabel("x [mm]")
 ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
-ax_err.grid(True)
-ax_err.legend(frameon=True, ncols=2)
+ax_err.legend(ncols=2, fontsize="small")
 
 plt.savefig(save_dir / "q_line_plot_coils.pdf", dpi=300)
 
 # Plot over line for thickness
 
-point1 = (0, 0.075, 0)
-point2 = (0.0149, 0.075, 0)
+point1 = (0, 0.1, 0)
+point2 = (0.0149, 0.1, 0)
 
 line, predicted_solution, fem_solution = do_for_one(vtk_file_1_coil, point1, point2, axis=0)
 # Unit conversion for readability
@@ -397,10 +445,9 @@ ax.plot(
 
 ax.set_ylabel(r"$|J|$ [A/m$^2$]")
 # ax.set_yscale("log")
-ax.grid(True)
 # ax.legend(frameon=True, ncols=1)
 # make legend smaller and put it inside the plot
-ax.legend(frameon=True, ncols=1, fontsize="small")
+ax.legend(ncols=1, fontsize="small")
 
 ax_err.clear()
 ax_err.plot(
@@ -411,8 +458,7 @@ ax_err.plot(
 )
 ax_err.set_xlabel("x [mm]")
 ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
-ax_err.grid(True)
-ax_err.legend(frameon=True, ncols=2)
+ax_err.legend(ncols=2, fontsize="small")
 
 plt.savefig(save_dir / "curr_dens_line_plot_coils_thickness.pdf", dpi=300)
 
@@ -459,10 +505,9 @@ ax.plot(
 
 ax.set_ylabel(r"$Q$ [W/m$^2$]")
 # ax.set_yscale("log")
-ax.grid(True)
 # ax.legend(frameon=True, ncols=1)
 # make legend smaller and put it inside the plot
-ax.legend(frameon=True, ncols=1, fontsize="small")
+ax.legend(ncols=1, fontsize="small")
 
 ax_err.clear()
 ax_err.plot(
@@ -473,12 +518,48 @@ ax_err.plot(
 )
 ax_err.set_xlabel("x [mm]")
 ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
-ax_err.grid(True)
-ax_err.legend(frameon=True, ncols=2)
+ax_err.legend(ncols=2, fontsize="small")
 
 plt.savefig(save_dir / "q_line_plot_coils_thickness.pdf", dpi=300)
 
 plotter1 = VTKToPlotConverter(vtk_file_1_coil, last_time_step=0, val_range=(0, 2.5), has_time_data=False)
+
+plotter1.plot_steady_state(
+    save_dir / "steady_state_1_coil_a_abs.pdf",
+    exact_field_name="A_abs_fem",
+    predicted_field_name="A_abs_gnn",
+    label=r"$|A| \, [\mathrm{T} \cdot \mathrm{m}]$",
+    contours=True,
+    use_scientific_ticks=True
+)
+plotter1.plot_relative_error(
+    save_dir / "relative_error_1_coil_a_abs.pdf", field_name="diff_A_abs"
+)
+
+plotter1.plot_steady_state(
+    save_dir / "steady_state_1_coil_a_real.pdf",
+    exact_field_name="A_real_fem",
+    predicted_field_name="A_real_gnn",
+    label=r"$\Re{A}$ [T$\cdot$m]",
+    contours=True,
+    use_scientific_ticks=True
+)
+plotter1.plot_relative_error(
+    save_dir / "relative_error_1_coil_a_real.pdf", field_name="diff_A_real"
+)
+
+plotter1.plot_steady_state(
+    save_dir / "steady_state_1_coil_a_imag.pdf",
+    exact_field_name="A_imag_fem",
+    predicted_field_name="A_imag_gnn",
+    label=r"$\Im{A}$ [T$\cdot$m]",
+    contours=True,
+    use_scientific_ticks=True
+)
+plotter1.plot_relative_error(
+    save_dir / "relative_error_1_coil_a_imag.pdf", field_name="diff_A_imag"
+)
+
 plotter1.plot_steady_state(
     save_dir / "steady_state_1_coil_real.pdf",
     exact_field_name="E_real_fem",
@@ -520,6 +601,43 @@ plotter1.plot_steady_state(
 )
 
 plotter2 = VTKToPlotConverter(vtk_file_2_coil, last_time_step=0, val_range=(0, 2.5), has_time_data=False)
+
+plotter2.plot_steady_state(
+    save_dir / "steady_state_2_coil_a_abs.pdf",
+    exact_field_name="A_abs_fem",
+    predicted_field_name="A_abs_gnn",
+    label=r"$|A| \, [\mathrm{T} \cdot \mathrm{m}]$",
+    contours=True,
+    use_scientific_ticks=True
+)
+plotter2.plot_relative_error(
+    save_dir / "relative_error_2_coil_a_abs.pdf", field_name="diff_A_abs"
+)
+
+plotter2.plot_steady_state(
+    save_dir / "steady_state_2_coil_a_real.pdf",
+    exact_field_name="A_real_fem",
+    predicted_field_name="A_real_gnn",
+    label=r"$\Re{A}$ [T$\cdot$m]",
+    contours=True,
+    use_scientific_ticks=True
+)
+plotter2.plot_relative_error(
+    save_dir / "relative_error_2_coil_a_real.pdf", field_name="diff_A_real"
+)
+
+plotter2.plot_steady_state(
+    save_dir / "steady_state_2_coil_a_imag.pdf",
+    exact_field_name="A_imag_fem",
+    predicted_field_name="A_imag_gnn",
+    label=r"$\Im{A}$ [T$\cdot$m]",
+    contours=True,
+    use_scientific_ticks=True
+)
+plotter2.plot_relative_error(
+    save_dir / "relative_error_2_coil_a_imag.pdf", field_name="diff_A_imag"
+)
+
 plotter2.plot_steady_state(
     save_dir / "steady_state_2_coil_real.pdf",
     exact_field_name="E_real_fem",

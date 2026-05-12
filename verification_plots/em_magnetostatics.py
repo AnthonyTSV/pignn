@@ -3,6 +3,7 @@ import sys
 import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import matplotlib.tri as mtri
 import xml.etree.ElementTree as ET
 from vtk.util import numpy_support
@@ -19,6 +20,7 @@ from helpers.plot_helpers import (
     epoch_vs_training_l2,
     _get_run_label,
 )
+from new_pignn.em_magnetostatic_problems import magnetostatic_problem_4
 from new_pignn.plotter import load_log
 
 from helpers.mpl_style import apply_mpl_style
@@ -47,6 +49,9 @@ def get_train_loss(log_path: Path) -> np.ndarray:
     train_loss = log_data["training_history"]["train_loss"]
     return np.abs(train_loss)
 
+sci_fmt = mticker.ScalarFormatter(useMathText=True)
+sci_fmt.set_scientific(True)
+sci_fmt.set_powerlimits((0, 0))
 
 save_dir = Path("verification_plots/magnetostatics")
 save_dir.mkdir(exist_ok=True, parents=True)
@@ -64,6 +69,9 @@ def ema(y, alpha=0.08):
     for i in range(1, len(y)):
         out[i] = alpha * y[i] + (1 - alpha) * out[i - 1]
     return out
+
+problem_1 = magnetostatic_problem_4(winding_count=1)
+problem_2 = magnetostatic_problem_4(winding_count=2)
 
 target_1 = 0.002053
 target_2 = 0.004144
@@ -98,8 +106,8 @@ ax.set_ylabel(r"$|\text{Training Loss}|$")
 
 ax.set_xlabel("Epoch")
 
-ax.legend(frameon=False, loc="upper right")
-plt.legend(fancybox=True, frameon=True)
+ax.legend(loc="upper right")
+plt.legend()
 plt.savefig(save_dir / "epoch_vs_train_loss.pdf", dpi=300)
 
 curves = {}
@@ -131,7 +139,7 @@ plt.xscale("log")
 plt.yscale("log")
 plt.xlabel("Epoch")
 plt.ylabel("L2 Error of A")
-plt.legend(fancybox=True, frameon=True)
+plt.legend()
 plt.savefig(save_dir / "epoch_vs_training_l2.pdf", dpi=300)
 
 vtk_file_1_coil = Path(
@@ -142,14 +150,15 @@ vtk_file_2_coil = Path(
 )
 
 
-def get_line_data(vtk_file: Path, point1: tuple, point2: tuple) -> tuple:
+def get_line_data(vtk_file: Path, point1: tuple, point2: tuple, coil: int = 1) -> tuple:
     extract_data = ExtractDataOverLine(vtk_file, has_time_data=False)
     extract_data.set_points(point1, point2)
     result_data = extract_data.get_data(
         ["PredictedSolution_real", "ExactSolution_real"]
     )
-    predicted_solution = np.array(result_data.results["PredictedSolution_real"])
-    fem_solution = np.array(result_data.results["ExactSolution_real"])
+    a_star = problem_1.A_star if coil == 1 else problem_2.A_star
+    predicted_solution = np.array(result_data.results["PredictedSolution_real"]) * a_star
+    fem_solution = np.array(result_data.results["ExactSolution_real"]) * a_star
     x_line = np.asarray(result_data.point_data)[:, 0]
     return x_line, predicted_solution, fem_solution
 
@@ -157,9 +166,9 @@ def get_line_data(vtk_file: Path, point1: tuple, point2: tuple) -> tuple:
 point1 = (0.0004562261719171998, 0.10469228023861457, 0)
 point2 = (0.1198514935894682, 0.10469228023861457, 0)
 
-coil_1_data = get_line_data(vtk_file_1_coil, point1, point2)
+coil_1_data = get_line_data(vtk_file_1_coil, point1, point2, coil=1)
 x_line1, predicted_solution1, fem_solution1 = coil_1_data
-coil_2_data = get_line_data(vtk_file_2_coil, point1, point2)
+coil_2_data = get_line_data(vtk_file_2_coil, point1, point2, coil=2)
 x_line2, predicted_solution2, fem_solution2 = coil_2_data
 
 rel_err_1 = compute_relative_error(fem_solution1, predicted_solution1)
@@ -198,39 +207,42 @@ ax.plot(
     label="PI-GNN (2 coils)"
 )
 
-ax.set_ylabel(r"$\tilde{A}$")
+ax.set_ylabel(r"${A}$ $[T \cdot m]$")
+ax.yaxis.set_major_formatter(sci_fmt)
 # ax.set_yscale("log")
-ax.grid(True)
 # ax.legend(frameon=True, ncols=1)
 # make legend smaller and put it inside the plot
-ax.legend(frameon=True, ncols=1, fontsize="small")
+ax.legend(ncols=1, fontsize="small")
 
 ax_err.clear()
 ax_err.plot(x_mm, rel_err_1, linewidth=1, label="1 coil", color=ax.get_lines()[2].get_color())
 ax_err.plot(x_mm, rel_err_2, linewidth=1, label="2 coils", color=ax.get_lines()[3].get_color())
 ax_err.set_xlabel("x [mm]")
 ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
-ax_err.grid(True)
-ax_err.legend(frameon=True, ncols=2)
+ax_err.legend(ncols=2)
 
 plt.savefig(save_dir / "line_plot_coils.pdf", dpi=300)
 
-plotter1 = VTKToPlotConverter(vtk_file_1_coil, last_time_step=0, val_range=(0, 2.5), has_time_data=False)
+plotter1 = VTKToPlotConverter(vtk_file_1_coil, last_time_step=0, val_range=(0, 1), has_time_data=False)
 plotter1.plot_steady_state(
     save_dir / "steady_state_1_coil.pdf",
     exact_field_name="ExactSolution_real",
     predicted_field_name="PredictedSolution_real",
-    label=r"Magnetic vector potential $\tilde{A}$",
+    label=r"Magnetic vector potential ${A}$",
     contours=True,
+    use_scientific_ticks=True,
+    a_star=problem_1.A_star
 )
 plotter1.plot_relative_error(save_dir / "relative_error_1_coil.pdf", field_name="RelError")
 
-plotter2 = VTKToPlotConverter(vtk_file_2_coil, last_time_step=0, val_range=(0, 2.5), has_time_data=False)
+plotter2 = VTKToPlotConverter(vtk_file_2_coil, last_time_step=0, val_range=(0, 1), has_time_data=False)
 plotter2.plot_steady_state(
     save_dir / "steady_state_2_coil.pdf",
     exact_field_name="ExactSolution_real",
     predicted_field_name="PredictedSolution_real",
-    label=r"Magnetic vector potential $\tilde{A}$",
+    label=r"Magnetic vector potential ${A}$",
     contours=True,
+    use_scientific_ticks=True,
+    a_star=problem_2.A_star
 )
 plotter2.plot_relative_error(save_dir / "relative_error_2_coil.pdf", field_name="RelError")

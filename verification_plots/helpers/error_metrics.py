@@ -30,5 +30,5 @@ def compute_l2_error(predicted_field: np.ndarray, exact_field: np.ndarray) -> fl
         predicted_field = np.array(predicted_field)
     if isinstance(exact_field, list):
         exact_field = np.array(exact_field)
-    l2_err = np.linalg.norm(predicted_field - exact_field) / (np.linalg.norm(exact_field) + 1e-8)
+    l2_err = np.linalg.norm(predicted_field - exact_field) / (np.linalg.norm(exact_field))
     return l2_err

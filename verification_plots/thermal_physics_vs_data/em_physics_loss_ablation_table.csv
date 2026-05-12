@@ -1,0 +1,5 @@
+N_train,data_only_interp,pi_gnn_interp,data_only_extrap,pi_gnn_extrap
+2,22.3,25.7,38.1,36.4
+4,45.1,35.9,42.4,39.4
+8,35.1,26.0,43.3,47.8
+16,32.2,27.0,39.5,28.6

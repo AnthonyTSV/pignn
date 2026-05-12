@@ -778,6 +778,7 @@ def ablation_study_mu_r_sigma():
     train_ih_mu_r_sigma_ablation(num_training_pnts=2, physics_loss=True)
     train_ih_mu_r_sigma_ablation(num_training_pnts=4, physics_loss=True)
     train_ih_mu_r_sigma_ablation(num_training_pnts=8, physics_loss=True)
+    train_ih_mu_r_sigma_ablation(num_training_pnts=16, physics_loss=True)
     train_ih_mu_r_sigma_ablation(num_training_pnts=2, physics_loss=False)
     train_ih_mu_r_sigma_ablation(num_training_pnts=4, physics_loss=False)
     train_ih_mu_r_sigma_ablation(num_training_pnts=8, physics_loss=False)

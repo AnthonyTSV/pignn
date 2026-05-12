@@ -5,6 +5,7 @@ from vtk.util import numpy_support
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
+import matplotlib.ticker as mticker
 from .error_metrics import compute_relative_error
 
 
@@ -186,6 +187,8 @@ class VTKToPlotConverter(VtuDataExtractor):
         contours: bool = False,
         fraction: float = 0.063,
         time_value: float = 1.0,
+        a_star: float = 1.0,
+        use_scientific_ticks: bool = False,
     ):
         if self.has_time_data:
             self.set_time_value(time_value)
@@ -199,23 +202,31 @@ class VTKToPlotConverter(VtuDataExtractor):
             axes, [(predicted, "a) PI-GNN"), (fem_solution, "b) FEM")]
         ):
             tri = self._plot_mesh(ax, points, triangles)
+            values = values * a_star
             if contours:
                 pcm = ax.tricontourf(tri, values, cmap="coolwarm", levels=10)
             else:
                 pcm = ax.tripcolor(tri, values, cmap="coolwarm", shading='gouraud')
             ax.set_title(title)
             ax.set_axis_off()
-        fig.colorbar(pcm, ax=axes, label=label, orientation="horizontal", fraction=fraction)
+        if use_scientific_ticks:
+            sci_fmt = mticker.ScalarFormatter(useMathText=True)
+            sci_fmt.set_scientific(True)
+            sci_fmt.set_powerlimits((0, 0))
+        else:
+            sci_fmt = None
+        fig.colorbar(pcm, ax=axes, label=label, orientation="horizontal", fraction=fraction, format=sci_fmt)
         fig.subplots_adjust(wspace=0, bottom=0.2)
         # fig.tight_layout()
         fig.savefig(save_path, dpi=600)
         # plt.subplot_tool(fig)
         # plt.show()
 
-    def plot_relative_error(self, save_path: Path, field_name: str = "Difference, %"):
+    def plot_relative_error(self, save_path: Path, field_name: str = "Difference, %", a_star: float = 1.0):
         points, triangles, difference = self._get_triangles_point_field(field_name)
         fig, ax = plt.subplots(figsize=(6, 4))
         tri = self._plot_mesh(ax, points, triangles, linewidth=0.05)
+        difference = difference * a_star
         pcm = ax.tripcolor(tri, difference, cmap="Spectral_r", edgecolors='face', antialiased=True, shading='gouraud')
         fig.colorbar(pcm, ax=ax, label=r"Relative error $\epsilon_{\text{err}}$ [\%]", shrink=0.9)
         ax.set_title("c) Relative error")

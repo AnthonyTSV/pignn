@@ -73,6 +73,7 @@ class IHNNSolver:
         material_properties_em: dict[str, MaterialPropertiesEM],
         source_properties: SourceProperties,
         time_config: TimeConfig,
+        save_dir: Path = Path("results/coupled_physics_informed/test_ih_problem"),
     ):
         self.path_to_thermal_model = path_to_thermal_model
         self.path_to_em_model = path_to_em_model
@@ -85,6 +86,7 @@ class IHNNSolver:
         self.material_properties_em = material_properties_em
         self.source_properties = source_properties
         self.time_config = time_config
+        self.save_dir = save_dir
         self.em_model = None
         self.thermal_model = None
 
@@ -165,20 +167,21 @@ class IHNNSolver:
 
     def _set_thermal_model(self, path_to_model: Path, joule_heating: np.ndarray):
         self._require_model_checkpoint(path_to_model, "Thermal")
-        time_window = 20
+        time_window = 10
 
-        # problem = GenericHeatEquationProblem(
-        #     mesh=self.mesh,
-        #     material_properties=self.material_properties,
-        #     time_config=self.time_config,
-        #     boundary_conditions=self.boundary_conditions_heat,
-        #     source_function=joule_heating,
-        #     thermal_domain_materials=["mat_workpiece"],
-        #     axisymmetric=True,
-        #     mesh_type="ih_mesh",
-        # ).get_problem()
+        problem = GenericHeatEquationProblem(
+            mesh=self.mesh,
+            material_properties=self.material_properties,
+            initial_condition=self.initial_condition,
+            time_config=self.time_config,
+            boundary_conditions=self.boundary_conditions_heat,
+            source_function=joule_heating,
+            thermal_domain_materials=["mat_workpiece"],
+            axisymmetric=True,
+            mesh_type="ih_mesh",
+        ).get_problem()
 
-        problem = create_ih_problem()
+        # problem = create_ih_problem()
 
         self.thermal_problem = problem
 
@@ -187,7 +190,7 @@ class IHNNSolver:
             "lr": 1e-3,
             "time_window": time_window,
             "generate_ground_truth_for_validation": False,
-            "save_dir": "results/coupled_physics_informed/test_ih_problem",
+            "save_dir": str(self.save_dir),
             "resume_from": str(path_to_model),
         }
 
@@ -205,7 +208,7 @@ class IHNNSolver:
             dirichlet_boundaries=dirichlet_boundaries,
             dirichlet_boundaries_dict=dirichlet_boundaries_dict,
             material_properties=self.material_properties_em,
-            A_star=3.4e-3,
+            A_star=2e-3,
         )
         problem = problem_generator.get_problem(
             current=self.source_properties.current,
@@ -229,13 +232,19 @@ class IHNNSolver:
             )
             problem.current_density_field = current_density_field
 
+        # problem = eddy_current_problem_different_mu_r(
+        #     mu_r_workpiece=1,
+        #     sigma_workpiece=37037037,
+        #     a_star=2e-3,
+        # )
+
         self.em_problem = problem
 
         config = {
             "epochs": 1,
             "lr": 1e-3,
             "generate_ground_truth_for_validation": False,
-            "save_dir": "results/coupled_physics_informed/test_ih_problem",
+            "save_dir": str(self.save_dir),
             "enforce_axis_regularity": True,
             "require_checkpoint": True,
             "strict_checkpoint": True,
@@ -318,7 +327,7 @@ class IHNNSolver:
         thermal_gfu = ng.GridFunction(thermal_fes)
         thermal_gfu.vec.data = self.thermal_solution[0] # First time step
 
-        path_to_save = "results/coupled_physics_informed/test_ih_problem/vtk"
+        path_to_save = self.save_dir / "vtk"
         path_to_save = Path(path_to_save)
         path_to_save.mkdir(parents=True, exist_ok=True)
 
@@ -344,7 +353,7 @@ if __name__ == "__main__":
         "results/physics_informed/thermal_ih_problem/pimgn_trained_model.pth"
     )
     path_to_em = Path(
-        "results/physics_informed/em_different_mu_r_sigma/pimgn_trained_model.pth"
+        "results/physics_informed/em_aluminum/pimgn_trained_model.pth"
     )
     # wp = BilletParams(diameter=0.030, height=0.070)
     # ind = RectangularInductorParams(
@@ -357,15 +366,15 @@ if __name__ == "__main__":
     # kw = dict(h_workpiece=1e-3, h_air=60e-3, h_coil=1e-3)
     # builder = IHGeometryAndMesh(wp, ind, **kw)
     # mesh = builder.generate()
-    em_problem = eddy_current_problem_different_mu_r(mu_r_workpiece=1)
+    em_problem = eddy_current_problem_different_mu_r(mu_r_workpiece=1, sigma_workpiece=37037037, a_star=2e-3)
     mesh = em_problem.mesh
     material_properties_heat = MaterialPropertiesHeat(
-        rho=7870,
-        cp=461,
-        k=86,
+        rho=2700,
+        cp=933.3,
+        k=211,
     )
     material_properties_em = {
-        "mat_workpiece": MaterialPropertiesEM(sigma=6289308, mu=1),
+        "mat_workpiece": MaterialPropertiesEM(sigma=37037037, mu=1),
         "mat_air": MaterialPropertiesEM(sigma=0, mu=1),
         "mat_coil": MaterialPropertiesEM(sigma=0, mu=1),
     }
@@ -400,6 +409,7 @@ if __name__ == "__main__":
         material_properties_em,
         source_properties,
         time_config,
+        save_dir=Path("results/coupled_physics_informed/test_ih_problem"),
     )
     thermal_solution = solver.solve_coupled()
     print(len(thermal_solution))
@@ -412,7 +422,7 @@ if __name__ == "__main__":
         array_true=fem_solution,
         array_pred=thermal_solution,
         time_steps=solver.time_config.time_steps_export,
-        filename="results/coupled_physics_informed/test_ih_problem/vtk/fem_solution",
+        filename=str(solver.save_dir / "vtk/fem_solution"),
     )
 
     from fem_em import FEMSolverEM
@@ -421,5 +431,5 @@ if __name__ == "__main__":
     fem_em_solver.export_to_vtk_complex(
         array_true=fem_em_solution*solver.em_problem.A_star,
         array_pred=solver.em_solution*solver.em_problem.A_star,
-        filename="results/coupled_physics_informed/test_ih_problem/vtk/fem_em_solution",
+        filename=str(solver.save_dir / "vtk/fem_em_solution"),
     )

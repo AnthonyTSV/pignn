@@ -14,7 +14,7 @@ from helpers.vtk_extractor import VTKToPlotConverter
 from helpers.error_metrics import compute_relative_error
 from helpers.plot_helpers import epoch_vs_train_loss, time_vs_l2
 
-plt.style.use(["science", "grid"])
+plt.style.use(["science"])
 
 from helpers.mpl_style import apply_mpl_style
 
@@ -118,15 +118,13 @@ def plot_cond_flux():
         label=r"$q_{\mathrm{loss}}$ PI-GNN"
     )
     ax.set_ylabel(r"Heat flux [W/m]")
-    ax.grid(True)
-    ax.legend(frameon=True, ncols=1, fontsize="small")
+    ax.legend(ncols=1, fontsize="small")
     ax_err.clear()
     ax_err.plot(rel_err_cond, linewidth=1, label=r"$\epsilon_{\mathrm{cond}}$", color=ax.get_lines()[1].get_color())
     ax_err.plot(rel_err_loss, linewidth=1, label=r"$\epsilon_{\mathrm{loss}}$", color=ax.get_lines()[3].get_color())
     ax_err.set_xlabel("Time step")
     ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
-    ax_err.grid(True)
-    ax_err.legend(frameon=True, ncols=2, fontsize="small")
+    ax_err.legend(ncols=2, fontsize="small")
 
     plt.savefig("verification_plots/thermal_bc_val/total_flux_comparison.pdf")
     plt.close()
@@ -139,7 +137,7 @@ def plot_pred_vs_fem():
 
 
 if __name__ == "__main__":
-    plot_pred_vs_fem()
+    # plot_pred_vs_fem()
     plot_cond_flux()
     logs = [
         Path("results/physics_informed/thermal_bc_verification/training_log.json"),

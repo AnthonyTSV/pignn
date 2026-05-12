@@ -20,7 +20,7 @@ from helpers.plot_helpers import (
 from new_pignn.plotter import load_log
 from new_pignn.thermal_problems import create_volumetric_heat_source_problem
 
-plt.style.use(["science", "grid"])
+plt.style.use(["science"])
 
 from helpers.mpl_style import apply_mpl_style
 
@@ -96,18 +96,16 @@ ax.plot(
 
 ax.set_ylabel(r"$T$ [$^\circ$C$]$")
 # ax.set_yscale("log")
-ax.grid(True)
 # ax.legend(frameon=True, ncols=1)
 # make legend smaller and put it inside the plot
-ax.legend(frameon=True, ncols=1, fontsize="small")
+ax.legend(ncols=1, fontsize="small")
 
 ax_err.clear()
 ax_err.plot(x_mm, rel_err_1, linewidth=1, label=f"{t_end} s", color=ax.get_lines()[1].get_color())
 ax_err.plot(x_mm, rel_err_2, linewidth=1, label=f"{t_middle} s", color=ax.get_lines()[3].get_color())
 ax_err.set_xlabel("x [mm]")
 ax_err.set_ylabel(r"$\epsilon_{\mathrm{rel}} [\%]$")
-ax_err.grid(True)
-ax_err.legend(frameon=True, ncols=2)
+ax_err.legend(ncols=2)
 
 plt.savefig(save_dir / "sol_line_plot.pdf", dpi=300)
 
@@ -116,21 +114,22 @@ def plot_pred_vs_fem():
     plot_converter = VTKToPlotConverter(vtk_file, last_time_step=100, val_range=(69, 265))
     plot_converter.plot_pred_and_fem(save_path=Path("verification_plots/thermal_source/pred_vs_fem_subplot.pdf"), shrink=0.9, figsize=(9, 7))
 
+if __name__ == "__main__":
 
-epoch_vs_train_loss(
-    paths=[
-        Path("results/physics_informed/thermal_volumetric_heat_source/training_log.json"),
-    ],
-    save_dir=Path("verification_plots/thermal_source"),
-    need_maxh_in_label=False
-)
-time_vs_l2(
-    paths=[
-        Path("results/physics_informed/thermal_volumetric_heat_source/training_log.json"),
-    ],
-    save_dir=Path("verification_plots/thermal_source"),
-    need_maxh_in_label=False,
-    time_range=np.arange(0, 1.01, 0.01)
-)
+    # epoch_vs_train_loss(
+    #     paths=[
+    #         Path("results/physics_informed/thermal_volumetric_heat_source/training_log.json"),
+    #     ],
+    #     save_dir=Path("verification_plots/thermal_source"),
+    #     need_maxh_in_label=False
+    # )
+    # time_vs_l2(
+    #     paths=[
+    #         Path("results/physics_informed/thermal_volumetric_heat_source/training_log.json"),
+    #     ],
+    #     save_dir=Path("verification_plots/thermal_source"),
+    #     need_maxh_in_label=False,
+    #     time_range=np.arange(0, 1.01, 0.01)
+    # )
 
-plot_pred_vs_fem()
+    plot_pred_vs_fem()
