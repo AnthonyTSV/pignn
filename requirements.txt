@@ -16,4 +16,5 @@ scipy>=1.7.0
 matplotlib>=3.4.0
 networkx>=2.8.0
 Pillow>=9.0.0
+vtk>=9.0.0
 

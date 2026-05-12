@@ -1,5 +1,7 @@
 # Short summary
 
+Short overview of the method used in this work. A pedagogical introduction given below.
+
 Start with a Poisson equation:
 $$
 \nabla^2 u = f
@@ -46,38 +48,3 @@ The algorithm for training the GNN to solve the Poisson equation can be summariz
 4. Compute the loss $L$ as the mean squared error of the residuals.
 5. Backpropagate the loss and update the GNN parameters using an optimizer (e.g., Adam).
 6. Repeat steps 3-5 until convergence.
-
-Tasks:
-
-1. Create a graph representation of the computational domain for the Poisson equation.
-2. Using a MeshGraphNet architecture, train a GNN to predict the solution of the Poisson equation based on the graph representation of the domain.
-
-A small script to implement the finite element method for solving the Poisson equation in a 1D domain using ngsolve is as follows:
-
-```python
-import ngsolve as ng
-from ngsolve.meshes import Make1DMesh
-import matplotlib.pyplot as plt
-
-N = 10
-
-mesh = Make1DMesh(N)
-fes = ng.H1(mesh, order=1, dirichlet="left|right")
-u = fes.TrialFunction()
-v = fes.TestFunction()
-
-a = ng.BilinearForm(ng.grad(u)*ng.grad(v)*ng.dx).Assemble()
-f = ng.LinearForm(ng.x*v*ng.dx).Assemble()
-
-u_sol = ng.GridFunction(fes)
-u_sol.vec.data = a.mat.Inverse(freedofs=fes.FreeDofs()) * f.vec
-
-pnts = []
-for i in range(N+1):
-    pnts.append((i/N, u_sol(mesh(i/N))))
-
-plt.plot(*zip(*pnts), marker='o')
-plt.xlabel('x')
-plt.ylabel('u(x)')
-plt.show()
-```
