@@ -73,8 +73,8 @@ def ema(y, alpha=0.08):
 problem_1 = magnetostatic_problem_4(winding_count=1)
 problem_2 = magnetostatic_problem_4(winding_count=2)
 
-target_1 = 0.002053
-target_2 = 0.004144
+target_1 = 0.00039326
+target_2 = 0.00039910
 
 loss_1 = get_train_loss(log_path_1_coil)
 loss_2 = get_train_loss(log_path_2_coil)
